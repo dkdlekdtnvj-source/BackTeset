@@ -121,8 +121,10 @@ def _validate_candidate(candidate: Dict[str, object], space: SpaceSpec) -> Optio
                 validated[name] = normalised in {"true", "1", "yes", "on"}
             else:
                 validated[name] = bool(value)
-        elif dtype == "choice":
-            values = list(spec.get("values") or spec.get("options") or [])
+        elif dtype in {"choice", "str", "string"}:
+            values = list(
+                spec.get("values") or spec.get("options") or spec.get("choices") or []
+            )
             if not values:
                 return None
             if value in values:
