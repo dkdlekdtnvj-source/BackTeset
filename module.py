@@ -34,8 +34,12 @@ from typing import Optional
 
 import pandas as pd
 
-from .datafeed.binance_client import normalize_timeframe  # re-export for convenience
-from .datafeed.cache import DataCache
+try:  # pragma: no cover - exercised via integration tests
+    from .datafeed.binance_client import normalize_timeframe  # re-export for convenience
+    from .datafeed.cache import DataCache
+except ImportError:  # pragma: no cover - fallback for external usage
+    from datafeed.binance_client import normalize_timeframe
+    from datafeed.cache import DataCache
 
 
 def fetch_data(
