@@ -18,6 +18,8 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover - optional dependency
     genai = None
 
+HARDCODED_GEMINI_API_KEY = "AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+
 
 def _extract_text(response: object) -> str:
     if response is None:
@@ -217,7 +219,9 @@ def generate_llm_candidates(
         LOGGER.warning("google-genai is not installed; skipping Gemini-guided proposals.")
         return []
 
-    api_key = config.get("api_key") or os.environ.get(str(config.get("api_key_env", "GEMINI_API_KEY")))
+    api_key = HARDCODED_GEMINI_API_KEY or config.get("api_key") or os.environ.get(
+        str(config.get("api_key_env", "GEMINI_API_KEY"))
+    )
     if not api_key:
         LOGGER.warning("Gemini API 키가 설정되지 않아 LLM 제안을 건너뜁니다.")
         return []

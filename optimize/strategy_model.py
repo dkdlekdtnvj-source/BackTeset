@@ -1700,6 +1700,8 @@ def run_backtest(
         and metrics.get("AvgHoldBars", 0.0) >= min_hold_bars_param
         and metrics.get("MaxConsecutiveLosses", 0.0) <= max_consecutive_losses
     )
+    if metrics.get("LosslessProfitFactor"):
+        metrics["Valid"] = False
     return metrics
 
 

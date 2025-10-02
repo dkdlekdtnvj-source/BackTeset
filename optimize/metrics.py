@@ -1,6 +1,7 @@
 """Performance metric calculations for optimisation."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -9,6 +10,9 @@ import pandas as pd
 
 
 EPS = 1e-12
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -150,6 +154,29 @@ def aggregate_metrics(
 
     fallback_keys = ("ProfitFactor", "Sortino", "Sharpe")
 
+    def _mark_lossless(target: Dict[str, float]) -> None:
+        if not trades or wins <= 0 or losses != 0:
+            return
+        if abs(gross_loss) > EPS:
+            return
+        existing = target.get("AnomalyFlags")
+        if isinstance(existing, str):
+            flags = [token.strip() for token in existing.split(",") if token.strip()]
+        elif isinstance(existing, (list, tuple)):
+            flags = [str(token) for token in existing if str(token)]
+        else:
+            flags = []
+        if "lossless_profit_factor" not in flags:
+            flags.append("lossless_profit_factor")
+            LOGGER.info(
+                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                len(trades),
+                wins,
+            )
+        target["AnomalyFlags"] = flags
+        target["ProfitFactor"] = 0.0
+        target["LosslessProfitFactor"] = True
+
     if simple:
         metrics: Dict[str, float] = {
             "NetProfit": net_profit,
@@ -167,6 +194,7 @@ def aggregate_metrics(
         for key in fallback_keys:
             if key in metrics and not np.isfinite(metrics[key]):
                 metrics[key] = 0.0
+        _mark_lossless(metrics)
         return metrics
 
     weekly = _weekly_returns(returns)
@@ -201,6 +229,7 @@ def aggregate_metrics(
     for key in fallback_keys:
         if key in metrics and not np.isfinite(metrics[key]):
             metrics[key] = 0.0
+    _mark_lossless(metrics)
     return metrics
 
 
