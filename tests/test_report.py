@@ -1,8 +1,14 @@
 from pathlib import Path
 from typing import Optional
 
+import importlib
 import matplotlib
 import pandas as pd
+
+# 일부 테스트 환경에서 pandas 가 경량 스텁으로 로드되는 경우가 있어 DataFrame 생성이 실패할 수 있다.
+# 실제 pandas 구현을 확실히 사용하도록 필요 시 재로딩한다.
+if not hasattr(pd, "DataFrame"):
+    pd = importlib.reload(importlib.import_module("pandas"))
 
 from optimize.report import generate_reports
 
@@ -68,7 +74,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 0,
             "score": 1.0,
-            "params": {"oscLen": 12, "statThreshold": 38.0},
+            "params": {"utKey": 3.8, "stMode": "Bounce"},
             "metrics": {"NetProfit": 0.25, "Sortino": 1.8},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_a),
@@ -78,7 +84,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 1,
             "score": 1.2,
-            "params": {"oscLen": 14, "statThreshold": 42.0},
+            "params": {"utKey": 4.2, "stMode": "Cross"},
             "metrics": {"NetProfit": 0.3, "Sortino": 1.7},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_c),
@@ -87,7 +93,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         },
     ]
 
-    best = {"params": {"oscLen": 12, "statThreshold": 38.0}, "metrics": {"NetProfit": 0.25}, "score": 1.0}
+    best = {"params": {"utKey": 3.8, "stMode": "Bounce"}, "metrics": {"NetProfit": 0.25}, "score": 1.0}
     wf_summary = {}
 
     generate_reports(results, best, wf_summary, ["NetProfit"], tmp_path)

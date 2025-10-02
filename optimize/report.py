@@ -9,7 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 import pandas as pd
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover - optional dependency
+    sns = None
 
 
 def _ensure_dir(path: Path) -> None:
@@ -122,6 +125,8 @@ def export_best(best: Dict[str, object], wf_summary: Dict[str, object], output_d
 
 
 def export_heatmap(metrics_df: pd.DataFrame, params: List[str], metric: str, plots_dir: Path) -> None:
+    if sns is None:
+        return
     if len(params) < 2 or metrics_df.empty or metric not in metrics_df.columns:
         return
     x_param, y_param = params[:2]

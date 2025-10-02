@@ -1,5 +1,8 @@
 from typing import Optional
 
+from datetime import datetime, timedelta, timezone
+import importlib
+
 import pandas as pd
 import pytest
 
@@ -83,27 +86,31 @@ def test_parse_args_exposes_space_flags():
 
 
 def test_basic_factor_filter_toggle():
-    space = {"oscLen": {"type": "int"}, "custom": {"type": "int"}}
+    space = {"utKey": {"type": "float"}, "custom": {"type": "int"}}
 
     restricted = _restrict_to_basic_factors(space)
-    assert restricted == {"oscLen": {"type": "int"}}
+    assert restricted == {"utKey": {"type": "float"}}
 
     restored = _restrict_to_basic_factors(space, enabled=False)
-    assert restored == {"oscLen": {"type": "int"}, "custom": {"type": "int"}}
+    assert restored == {"utKey": {"type": "float"}, "custom": {"type": "int"}}
 
 
 def test_basic_factor_param_filter_toggle():
-    params = {"oscLen": 12, "custom": 7}
+    params = {"utKey": 4.0, "custom": 7}
 
     filtered = _filter_basic_factor_params(params)
-    assert filtered == {"oscLen": 12}
+    assert filtered == {"utKey": 4.0}
 
     unfiltered = _filter_basic_factor_params(params, enabled=False)
     assert unfiltered == params
 
 
 def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
-    idx = pd.date_range("2024-01-01", periods=3, freq="1min")
+    pd_mod = importlib.import_module("pandas")
+    if not hasattr(pd_mod, "DatetimeIndex"):
+        pd_mod = importlib.reload(pd_mod)
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    idx = pd_mod.DatetimeIndex([start + timedelta(minutes=i) for i in range(3)])
     df = pd.DataFrame(
         {
             "open": [1.0, 1.1, 1.2],

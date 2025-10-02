@@ -25,6 +25,11 @@ import yaml
 import multiprocessing
 import ccxt
 
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
+
 from datafeed.cache import DataCache
 from optimize.metrics import (
     EPS,
@@ -101,15 +106,47 @@ def fetch_top_usdt_perp_symbols(
     return [f"BINANCE:{symbol}" for symbol, _ in rows[:limit]]
 
 
+def _detect_cpu_info() -> Dict[str, int]:
+    logical = os.cpu_count() or 1
+    physical = None
+    if psutil is not None:
+        try:
+            physical = psutil.cpu_count(logical=False)
+        except Exception:  # pragma: no cover - psutil edge case
+            physical = None
+    if not physical or physical <= 0:
+        physical = max(1, logical // 2)
+    freq = None
+    if psutil is not None:
+        try:
+            freq = psutil.cpu_freq()
+        except Exception:  # pragma: no cover
+            freq = None
+    ghz = 0.0
+    if freq is not None and getattr(freq, "max", 0):
+        ghz = round(freq.max / 1000.0, 2)
+    return {"logical": int(max(1, logical)), "physical": int(max(1, physical)), "ghz": ghz}
+
+
+CPU_INFO = _detect_cpu_info()
+CPU_COUNT = CPU_INFO["logical"]
+PHYSICAL_CORES = CPU_INFO["physical"]
+
+DEFAULT_DATASET_JOBS = max(1, PHYSICAL_CORES)
+DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT // max(1, DEFAULT_DATASET_JOBS))
+
 LOGGER = logging.getLogger("optimize")
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-CPU_COUNT = os.cpu_count() or 4
-DEFAULT_DATASET_JOBS = max(1, CPU_COUNT // 2)
-DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT // 2)
+LOGGER.info(
+    "CPU 정보: 물리 %d코어 / 논리 %d스레드 (최대 %.2fGHz)",
+    PHYSICAL_CORES,
+    CPU_COUNT,
+    CPU_INFO.get("ghz", 0.0),
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
@@ -123,19 +160,27 @@ simple_metrics_enabled: bool = False
 # 복잡한 보호 장치·부가 필터 대신 핵심 진입 로직과 직접 관련된 항목만 남겨
 # 탐색 공간을 크게 줄이고 수렴 속도를 높입니다.
 BASIC_FACTOR_KEYS = {
-    "bbLen",
-    "bbMult",
-    "kcLen",
-    "kcMultATR",
-    "kcBasis",
-    "momLen",
-    "thr",
-    "requireFlux",
-    "exitOpposite",
-    "useFadeExit",
-    "fadeLevel",
-    "useSL",
-    "slPct",
+    "utKey",
+    "utAtrLen",
+    "useHeikin",
+    "rsiLen",
+    "stochLen",
+    "kLen",
+    "dLen",
+    "obLevel",
+    "osLevel",
+    "stMode",
+    "atrLen",
+    "initStopMult",
+    "trailAtrMult",
+    "trailStartPct",
+    "trailGapPct",
+    "usePercentStop",
+    "stopPct",
+    "takePct",
+    "breakevenPct",
+    "maxHoldBars",
+    "useFlipExit",
     "cooldownBars",
 }
 

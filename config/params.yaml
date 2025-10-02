@@ -17,27 +17,33 @@ constraints:
   max_dd_pct: 70        # MaxDD 70% 초과면 패널티
 
 space:
-  # --- Squeeze (BB vs KC) ---
-  bbLen:        { type: int,   min: 12, max: 30, step: 2 }
-  bbMult:       { type: float, min: 1.5, max: 2.5, step: 0.25 }
-  kcLen:        { type: int,   min: 12, max: 30, step: 2 }
-  kcMultATR:    { type: float, min: 1.0, max: 2.0, step: 0.2 }
-  kcBasis:      { type: str,   choices: ["ema", "sma"] }
+  # --- UT Bot ---
+  utKey:        { type: float, min: 2.0, max: 6.0,  step: 0.2 }
+  utAtrLen:     { type: int,   min: 5,   max: 20,  step: 1 }
+  useHeikin:    { type: bool }
 
-  # --- Momentum (SMD) ---
-  momLen:       { type: int,   min: 8,  max: 48, step: 2 }
-  thr:          { type: float, min: 0.2, max: 2.0, step: 0.1 }
-  requireFlux:  { type: bool }
+  # --- StochRSI ---
+  rsiLen:       { type: int,   min: 8,   max: 28,  step: 2 }
+  stochLen:     { type: int,   min: 8,   max: 28,  step: 2 }
+  kLen:         { type: int,   min: 1,   max: 6,   step: 1 }
+  dLen:         { type: int,   min: 1,   max: 6,   step: 1 }
+  obLevel:      { type: float, min: 70,  max: 90,  step: 1 }
+  osLevel:      { type: float, min: 10,  max: 30,  step: 1 }
+  stMode:       { type: str,   choices: ["Bounce", "Cross"] }
 
   # --- Exits ---
-  exitOpposite: { type: bool }
-  useFadeExit:  { type: bool }
-  fadeLevel:    { type: float, min: -0.2, max: 0.2, step: 0.05 }
-
-  # --- Risk ---
-  useSL:        { type: bool }
-  slPct:        { type: float, min: 0.3, max: 3.0, step: 0.1 }
-  cooldownBars: { type: int,   min: 0,   max: 10,  step: 1 }
+  atrLen:         { type: int,   min: 10,  max: 40,  step: 2 }
+  initStopMult:   { type: float, min: 1.0, max: 3.0, step: 0.1 }
+  trailAtrMult:   { type: float, min: 1.5, max: 4.0, step: 0.1 }
+  trailStartPct:  { type: float, min: 0.5, max: 3.0, step: 0.1 }
+  trailGapPct:    { type: float, min: 0.2, max: 1.0, step: 0.05 }
+  usePercentStop: { type: bool }
+  stopPct:        { type: float, min: 0.5, max: 3.0, step: 0.1 }
+  takePct:        { type: float, min: 1.0, max: 5.0, step: 0.1 }
+  breakevenPct:   { type: float, min: 0.0, max: 1.0, step: 0.05 }
+  maxHoldBars:    { type: int,   min: 0,   max: 480, step: 20 }
+  useFlipExit:    { type: bool }
+  cooldownBars:   { type: int,   min: 0,   max: 30,  step: 1 }
 
 risk:
   leverage: 10
