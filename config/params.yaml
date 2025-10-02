@@ -17,27 +17,39 @@ constraints:
   max_dd_pct: 70        # MaxDD 70% 초과면 패널티
 
 space:
-  # --- Squeeze (BB vs KC) ---
-  bbLen:        { type: int,   min: 12, max: 30, step: 2 }
-  bbMult:       { type: float, min: 1.5, max: 2.5, step: 0.25 }
-  kcLen:        { type: int,   min: 12, max: 30, step: 2 }
-  kcMultATR:    { type: float, min: 1.0, max: 2.0, step: 0.2 }
-  kcBasis:      { type: str,   choices: ["ema", "sma"] }
+  # Optimisation search space tuned for the Squeeze Momentum Deluxe strategy.
+  #
+  # Only the core oscillator, signal, volatility channel and fade‑exit
+  # parameters are swept.  All other features (filters, dynamic thresholds,
+  # alternative exits) remain at their default values.  See `optimize/run.py`
+  # for the basic factor key set used by `--basic-factors-only`.
 
-  # --- Momentum (SMD) ---
-  momLen:       { type: int,   min: 8,  max: 48, step: 2 }
-  thr:          { type: float, min: 0.2, max: 2.0, step: 0.1 }
-  requireFlux:  { type: bool }
+  # --- Oscillator & signal lengths ---
+  oscLen:         { type: int,   min: 8,   max: 48, step: 2 }
+  signalLen:      { type: int,   min: 1,   max: 12, step: 1 }
 
-  # --- Exits ---
-  exitOpposite: { type: bool }
-  useFadeExit:  { type: bool }
-  fadeLevel:    { type: float, min: -0.2, max: 0.2, step: 0.05 }
+  # --- Volatility channels (Bollinger & Keltner) ---
+  bbLen:          { type: int,   min: 12, max: 30, step: 2 }
+  bbMult:         { type: float, min: 1.5, max: 2.5, step: 0.25 }
+  kcLen:          { type: int,   min: 12, max: 30, step: 2 }
+  kcMult:         { type: float, min: 1.0, max: 2.0, step: 0.2 }
 
-  # --- Risk ---
-  useSL:        { type: bool }
-  slPct:        { type: float, min: 0.3, max: 3.0, step: 0.1 }
-  cooldownBars: { type: int,   min: 0,   max: 10,  step: 1 }
+  # --- Directional flux ---
+  fluxLen:        { type: int,   min: 8,   max: 40, step: 2 }
+  fluxSmoothLen:  { type: int,   min: 1,   max: 10, step: 1 }
+  useFluxHeikin:  { type: bool }
+
+  # --- Exit logic ---
+  exitOpposite:   { type: bool }
+  useMomFade:     { type: bool }
+  momFadeRegLen:  { type: int,   min: 10, max: 40, step: 2 }
+  momFadeBbLen:   { type: int,   min: 10, max: 40, step: 2 }
+  momFadeKcLen:   { type: int,   min: 10, max: 40, step: 2 }
+  momFadeBbMult:  { type: float, min: 1.5, max: 3.0, step: 0.25 }
+  momFadeKcMult:  { type: float, min: 1.0, max: 3.0, step: 0.25 }
+
+  # Note: Risk parameters (stop loss, position sizing) are not optimised
+  # here; adjust `risk` block below if you wish to customise leverage/slippage.
 
 risk:
   leverage: 10

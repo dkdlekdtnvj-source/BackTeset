@@ -122,21 +122,33 @@ simple_metrics_enabled: bool = False
 # 기본 팩터 최적화에 사용할 파라미터 키 집합입니다.
 # 복잡한 보호 장치·부가 필터 대신 핵심 진입 로직과 직접 관련된 항목만 남겨
 # 탐색 공간을 크게 줄이고 수렴 속도를 높입니다.
+# Keys used when `--basic-factors-only` is enabled.  This set should mirror
+# the parameters defined in `config/params.yaml` so that only the core
+# oscillator, volatility channel, flux and exit parameters are swept.  If you
+# modify `params.yaml` or add new tuneable inputs, update this set
+# accordingly.  Removing unused or unsupported names from this set prevents
+# accidental sampling of unrelated stop/trail/slippage options.
 BASIC_FACTOR_KEYS = {
+    # Oscillator & signal lengths
+    "oscLen",
+    "signalLen",
+    # Bollinger/Keltner channels
     "bbLen",
     "bbMult",
     "kcLen",
-    "kcMultATR",
-    "kcBasis",
-    "momLen",
-    "thr",
-    "requireFlux",
+    "kcMult",
+    # Directional flux
+    "fluxLen",
+    "fluxSmoothLen",
+    "useFluxHeikin",
+    # Exit logic
     "exitOpposite",
-    "useFadeExit",
-    "fadeLevel",
-    "useSL",
-    "slPct",
-    "cooldownBars",
+    "useMomFade",
+    "momFadeRegLen",
+    "momFadeBbLen",
+    "momFadeKcLen",
+    "momFadeBbMult",
+    "momFadeKcMult",
 }
 
 
