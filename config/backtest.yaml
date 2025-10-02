@@ -1,0 +1,23 @@
+version: 1
+timezone: Asia/Seoul
+
+data:
+  exchange: binanceusdm
+  market: futures
+  cache_dir: data
+
+datasets:
+  - ltf: [1m, 3m, 5m]
+    htf: [5m, 15m, 60m]
+    start: 2024-01-01
+    end:   2025-09-26
+
+walk_forward:
+  train_bars: 100000
+  test_bars:  30000
+  step:       30000
+  min_trades: 12
+
+report:
+  out_dir: reports
+  rank_by: ProfitFactor

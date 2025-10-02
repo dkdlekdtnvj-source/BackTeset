@@ -1,0 +1,64 @@
+version: 1
+
+search:
+  algo: bayes
+  n_trials: 150
+  seed: 42
+  top_k: 5
+  # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
+
+objective:
+  # === 기본룰: ProfitFactor 중심 ===
+  - name: ProfitFactor
+    weight: 1.0
+
+constraints:
+  min_trades_test: 12   # 테스트 구간에서 최소 거래 수 (없으면 강한 패널티)
+  max_dd_pct: 70        # MaxDD 70% 초과면 패널티
+
+space:
+  # --- Squeeze (BB vs KC) ---
+  bbLen:        { type: int,   min: 12, max: 30, step: 2 }
+  bbMult:       { type: float, min: 1.5, max: 2.5, step: 0.25 }
+  kcLen:        { type: int,   min: 12, max: 30, step: 2 }
+  kcMultATR:    { type: float, min: 1.0, max: 2.0, step: 0.2 }
+  kcBasis:      { type: str,   choices: ["ema", "sma"] }
+
+  # --- Momentum (SMD) ---
+  momLen:       { type: int,   min: 8,  max: 48, step: 2 }
+  thr:          { type: float, min: 0.2, max: 2.0, step: 0.1 }
+  requireFlux:  { type: bool }
+
+  # --- Exits ---
+  exitOpposite: { type: bool }
+  useFadeExit:  { type: bool }
+  fadeLevel:    { type: float, min: -0.2, max: 0.2, step: 0.05 }
+
+  # --- Risk ---
+  useSL:        { type: bool }
+  slPct:        { type: float, min: 0.3, max: 3.0, step: 0.1 }
+  cooldownBars: { type: int,   min: 0,   max: 10,  step: 1 }
+
+risk:
+  leverage: 10
+  fee_pct: 0.0006
+  slippage_ticks: 3
+
+# --- LLM assistant configuration ---
+# To enable Gemini‑assisted parameter proposals, set `enabled: true` and provide
+# a valid API key via `api_key` or `api_key_env`. The default model points to
+# the latest Gemini 2.5 Flash preview; override it if Google renames the model
+# after the preview phase. `initial_trials` controls how many Optuna trials are
+# executed before consulting the LLM. `top_n` determines how many top trials
+# are summarised, and `count` sets the number of candidate suggestions to
+# enqueue. `thinking_budget` is optional and applies only to Gemini 2.5 models,
+# tuning the internal reasoning cost (0 disables thinking; higher values allow
+# deeper reasoning but increase latency/cost).
+llm:
+  enabled: false
+  api_key_env: GEMINI_API_KEY
+  model: gemini-2.5-flash-preview-04-17
+  top_n: 10
+  count: 8
+  initial_trials: 20
+  thinking_budget: 1024

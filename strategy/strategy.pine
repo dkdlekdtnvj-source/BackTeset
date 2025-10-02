@@ -1,0 +1,253 @@
+//@version=5
+// 매직1분VN - 경량 최적화 프로파일
+// 필수 신호(스퀴즈 모멘텀·방향성 플럭스)와 기본 필터만 남긴 버전입니다.
+
+strategy(
+     title                   = "매직1분VN (Optimizer Profile)",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 500,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.05,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false
+)
+
+// === Colour Palette ===
+const color colup = #ffcfa6
+const color coldn = #419fec
+const color colpf = #ffd0a6
+const color coldf = #4683b4
+const color colps = #169b5d
+const color colng = #970529
+const color colpo = #11cf77
+const color colno = #d11645
+const color colsh = #ff1100
+const color colsm = #ff5e00
+
+// =================================================================================
+// === 설정 (Inputs) ==============================================================
+// =================================================================================
+
+// --- 1. 스퀴즈 모멘텀 ---
+gOsc  = "1. 스퀴즈 모멘텀"
+showMomentum = input.bool(true , title="모멘텀 히스토그램 표시" , group=gOsc)
+len          = input.int (12   , title="Momentum Length"       , group=gOsc, minval=5 , maxval=100)
+sig          = input.int (3    , title="Signal Length"         , group=gOsc, minval=1 , maxval=20)
+bbLen        = input.int (20   , title="BB Length"             , group=gOsc, minval=5 , maxval=200)
+bbMult       = input.float(1.4 , title="BB Multiplier"         , group=gOsc, minval=0.1, maxval=5.0 , step=0.1)
+kcLen        = input.int (18   , title="KC Length (ATR)"       , group=gOsc, minval=5 , maxval=200)
+kcMult       = input.float(1.0 , title="KC Multiplier"         , group=gOsc, minval=0.1, maxval=5.0 , step=0.1)
+
+// --- 2. 방향성 플럭스 ---
+gDF   = "2. 방향성 플럭스"
+showFlux    = input.bool(true , title="플럭스 시각화"         , group=gDF)
+dfl          = input.int (14  , title="Flux Length"           , group=gDF, minval=5 , maxval=100)
+dfSmoothLen  = input.int (1   , title="플럭스 스무딩"          , group=gDF, minval=1 , maxval=50)
+dfh          = input.bool(true, title="Heikin-Ashi 변환 사용" , group=gDF)
+
+// --- 3. 청산 옵션 ---
+gExit = "3. 청산 옵션"
+exitOpposite = input.bool(true , title="반대 신호 청산"      , group=gExit)
+useMomFade   = input.bool(false, title="모멘텀 페이드 청산"  , group=gExit)
+fadeMode     = input.string("VN", title="페이드 모드", options=["VN", "Legacy"], group=gExit)
+useAtrStop   = input.bool(true , title="ATR 손절 사용"        , group=gExit)
+atrStopMult  = input.float(1.5 , title="ATR 손절 Mult"        , group=gExit, minval=0.1, maxval=5.0, step=0.1)
+useFixedStop = input.bool(false, title="고정 % 손절"          , group=gExit)
+fixedStopPct = input.float(0.8 , title="고정 손절 %"         , group=gExit, minval=0.1, maxval=5.0, step=0.1)
+useStopLoss  = input.bool(false, title="전고/전저 손절"       , group=gExit)
+stopLookback = input.int (5    , title="전고/전저 탐색"      , group=gExit, minval=2, maxval=50)
+usePivotStop = input.bool(false, title="피봇 손절"            , group=gExit)
+pivotLen     = input.int (5    , title="피봇 길이"           , group=gExit, minval=2, maxval=20)
+useAtrTrail  = input.bool(false, title="ATR 트레일"           , group=gExit)
+atrTrailLen  = input.int (14   , title="ATR 트레일 길이"      , group=gExit, minval=1, maxval=200)
+atrTrailMult = input.float(2.0 , title="ATR 트레일 Mult"      , group=gExit, minval=0.1, maxval=5.0, step=0.1)
+useBreakeven = input.bool(false, title="브레이크이븐 스탑"    , group=gExit)
+breakevenMult= input.float(1.0 , title="브레이크이븐 ATR Mult", group=gExit, minval=0.1, maxval=5.0, step=0.1)
+useTimeStop  = input.bool(false, title="시간 손절"            , group=gExit)
+maxHoldBars  = input.int (0    , title="최대 보유 봉 수"      , group=gExit, minval=0, maxval=200)
+
+// --- 4. 필터 ---
+gFilt = "4. 필터"
+useHtfTrend    = input.bool(false, title="상위 타임프레임 추세 필터", group=gFilt)
+htfTrendTf     = input.timeframe("240", title="상위 타임프레임"      , group=gFilt)
+htfMaLen       = input.int (50   , title="상위봉 EMA Length"       , group=gFilt, minval=5, maxval=400)
+useRangeFilter = input.bool(false, title="상위봉 레인지 필터", group=gFilt)
+rangeTf        = input.timeframe("5", title="레인지 측정 TF" , group=gFilt)
+rangeBars      = input.int (20  , title="레인지 측정 봉 수"  , group=gFilt, minval=5, maxval=200)
+rangePercent   = input.float(1.0, title="레인지 한계 (%)"    , group=gFilt, minval=0.1, maxval=10.0, step=0.1)
+
+gMsg = "5. 알림"
+alertLongEntry  = input.string('{"action":"enter_long"}', title="롱 진입", group=gMsg)
+alertShortEntry = input.string('{"action":"enter_short"}', title="숏 진입", group=gMsg)
+alertExitLong   = input.string('{"action":"exit_long"}', title="롱 청산", group=gMsg)
+alertExitShort  = input.string('{"action":"exit_short"}', title="숏 청산", group=gMsg)
+
+// =================================================================================
+// === 보조 계산 ==================================================================
+// =================================================================================
+
+// --- Heikin-Ashi 변환 ---
+float haClose = (open + high + low + close) / 4.0
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+float haHigh = math.max(high, math.max(haOpen, haClose))
+float haLow  = math.min(low,  math.min(haOpen, haClose))
+
+float srcClose = dfh ? haClose : close
+
+// --- 플럭스 계산 (단순 기울기 기반) ---
+float fluxRaw = ta.linreg(srcClose - nz(srcClose[1]), dfl, 0)
+float fluxVal = dfSmoothLen > 1 ? ta.sma(fluxRaw, dfSmoothLen) : fluxRaw
+
+// --- 스퀴즈 모멘텀 계산 ---
+float bbBasis = ta.sma(close, bbLen)
+float bbDev   = ta.stdev(close, bbLen) * bbMult
+float kcRange = ta.atr(kcLen) * kcMult
+bool squeezeOn = bbDev < kcRange
+
+float highestHigh = ta.highest(high, kcLen)
+float lowestLow   = ta.lowest(low, kcLen)
+float mean        = (highestHigh + lowestLow) / 2.0
+float momentum    = ta.linreg(close - mean, len, 0)
+float momSignal   = ta.sma(momentum, sig)
+
+// --- 페이드 감지 ---
+int fadeWindow = 1
+bool fadeMagnitudeDown = ta.falling(math.abs(momentum), fadeWindow)
+bool fadeLongCond_vn  = momentum > 0 and fadeMagnitudeDown
+bool fadeShortCond_vn = momentum < 0 and fadeMagnitudeDown
+bool fadeLongCond_lg  = momentum > 0 and momentum <= nz(momentum[1], momentum)
+bool fadeShortCond_lg = momentum < 0 and momentum >= nz(momentum[1], momentum)
+bool fadeLongCond  = fadeMode == "VN" ? fadeLongCond_vn  : fadeLongCond_lg
+bool fadeShortCond = fadeMode == "VN" ? fadeShortCond_vn : fadeShortCond_lg
+
+// --- 상위봉 필터 ---
+float htfMa = request.security(syminfo.tickerid, htfTrendTf, ta.ema(close, htfMaLen), lookahead=barmerge.lookahead_off)
+bool htfTrendUp   = close > htfMa
+bool htfTrendDown = close < htfMa
+
+// --- 레인지 필터 ---
+float rangeHigh = request.security(syminfo.tickerid, rangeTf, ta.highest(high, rangeBars), lookahead=barmerge.lookahead_off)
+float rangeLow  = request.security(syminfo.tickerid, rangeTf, ta.lowest(low, rangeBars),  lookahead=barmerge.lookahead_off)
+float rangePerc = rangeLow != 0 ? (rangeHigh - rangeLow) / rangeLow * 100.0 : 0.0
+bool inRangeBox  = rangePerc <= rangePercent
+
+float pivotLow = ta.valuewhen(not na(ta.pivotlow(low, pivotLen, pivotLen)), ta.pivotlow(low, pivotLen, pivotLen), 0)
+float pivotHigh = ta.valuewhen(not na(ta.pivothigh(high, pivotLen, pivotLen)), ta.pivothigh(high, pivotLen, pivotLen), 0)
+float swingLow = ta.lowest(low, stopLookback)
+float swingHigh = ta.highest(high, stopLookback)
+float atrBase = ta.atr(len)
+float atrTrailBase = ta.atr(atrTrailLen)
+
+// =================================================================================
+// === 신호 & 실행 =================================================================
+// =================================================================================
+
+bool longSignal  = ta.crossover(momentum, momSignal) and momentum < 0 and fluxVal > 0
+bool shortSignal = ta.crossunder(momentum, momSignal) and momentum > 0 and fluxVal < 0
+
+bool longFilterOk  = (not useHtfTrend or htfTrendUp)   and (not useRangeFilter or not inRangeBox)
+bool shortFilterOk = (not useHtfTrend or htfTrendDown) and (not useRangeFilter or not inRangeBox)
+
+bool enterLong  = longSignal  and longFilterOk
+bool enterShort = shortSignal and shortFilterOk
+
+bool exitLongOpposite  = exitOpposite and shortSignal
+bool exitShortOpposite = exitOpposite and longSignal
+bool exitLongFade      = useMomFade and fadeLongCond
+bool exitShortFade     = useMomFade and fadeShortCond
+
+var float highestSinceEntry = na
+var float lowestSinceEntry  = na
+var int   holdBars          = 0
+
+if barstate.isconfirmed
+    if strategy.position_size == 0
+        holdBars := 0
+        highestSinceEntry := na
+        lowestSinceEntry := na
+        strategy.cancel("LongStop")
+        strategy.cancel("ShortStop")
+        if enterLong
+            strategy.entry("Long", strategy.long, alert_message=alertLongEntry)
+        if enterShort
+            strategy.entry("Short", strategy.short, alert_message=alertShortEntry)
+    else
+        holdBars += 1
+        if strategy.position_size > 0
+            highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
+            float breakevenStop = na
+            if useBreakeven and not na(highestSinceEntry) and not na(atrTrailBase)
+                breakevenStop := (highestSinceEntry - strategy.position_avg_price) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
+            float trailStop = useAtrTrail and not na(highestSinceEntry) and not na(atrTrailBase) ? highestSinceEntry - atrTrailMult * atrTrailBase : na
+            float combinedStop = na
+            if useBreakeven and not na(breakevenStop)
+                combinedStop := breakevenStop
+            if useStopLoss and not na(swingLow)
+                combinedStop := na(combinedStop) ? swingLow : math.max(combinedStop, swingLow)
+            if usePivotStop and not na(pivotLow)
+                combinedStop := na(combinedStop) ? pivotLow : math.max(combinedStop, pivotLow)
+            if useAtrTrail and not na(trailStop)
+                combinedStop := na(combinedStop) ? trailStop : math.max(combinedStop, trailStop)
+            if useFixedStop
+                float fixedStop = strategy.position_avg_price * (1 - fixedStopPct / 100.0)
+                combinedStop := na(combinedStop) ? fixedStop : math.max(combinedStop, fixedStop)
+            if useAtrStop and not na(atrBase)
+                float atrStopVal = strategy.position_avg_price - atrBase * atrStopMult
+                combinedStop := na(combinedStop) ? atrStopVal : math.max(combinedStop, atrStopVal)
+            if not na(combinedStop)
+                strategy.exit("LongStop", from_entry="Long", stop=combinedStop, alert_message=alertExitLong)
+            if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
+                strategy.close("Long", alert_message=alertExitLong)
+            else if exitLongOpposite or (exitLongFade and holdBars >= 1)
+                strategy.close("Long", alert_message=alertExitLong)
+        else if strategy.position_size < 0
+            lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+            float breakevenStop = na
+            if useBreakeven and not na(lowestSinceEntry) and not na(atrTrailBase)
+                breakevenStop := (strategy.position_avg_price - lowestSinceEntry) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
+            float trailStop = useAtrTrail and not na(lowestSinceEntry) and not na(atrTrailBase) ? lowestSinceEntry + atrTrailMult * atrTrailBase : na
+            float combinedStop = na
+            if useBreakeven and not na(breakevenStop)
+                combinedStop := breakevenStop
+            if useStopLoss and not na(swingHigh)
+                combinedStop := na(combinedStop) ? swingHigh : math.min(combinedStop, swingHigh)
+            if usePivotStop and not na(pivotHigh)
+                combinedStop := na(combinedStop) ? pivotHigh : math.min(combinedStop, pivotHigh)
+            if useAtrTrail and not na(trailStop)
+                combinedStop := na(combinedStop) ? trailStop : math.min(combinedStop, trailStop)
+            if useFixedStop
+                float fixedStop = strategy.position_avg_price * (1 + fixedStopPct / 100.0)
+                combinedStop := na(combinedStop) ? fixedStop : math.min(combinedStop, fixedStop)
+            if useAtrStop and not na(atrBase)
+                float atrStopVal = strategy.position_avg_price + atrBase * atrStopMult
+                combinedStop := na(combinedStop) ? atrStopVal : math.min(combinedStop, atrStopVal)
+            if not na(combinedStop)
+                strategy.exit("ShortStop", from_entry="Short", stop=combinedStop, alert_message=alertExitShort)
+            if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
+                strategy.close("Short", alert_message=alertExitShort)
+            else if exitShortOpposite or (exitShortFade and holdBars >= 1)
+                strategy.close("Short", alert_message=alertExitShort)
+
+// =================================================================================
+// === 시각화 =====================================================================
+// =================================================================================
+
+hline(0, title="Zero", color=color.new(color.white, 80), linestyle=hline.style_dashed)
+plot(showMomentum ? momentum : na, title="Momentum", color=momentum >= 0 ? colup : coldn, style=plot.style_columns)
+plot(showMomentum ? momSignal : na, title="Momentum Signal", color=color.new(color.white, 0))
+plot(showFlux ? fluxVal : na, title="Directional Flux", color=fluxVal >= 0 ? colps : colng)
+plotshape(enterLong , title="Long Entry" , style=shape.triangleup  , location=location.belowbar, color=colpo, size=size.tiny)
+plotshape(enterShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=colno, size=size.tiny)
+plotshape(exitLongOpposite or exitLongFade , title="Long Exit" , style=shape.circle, location=location.abovebar, color=colpf, size=size.tiny)
+plotshape(exitShortOpposite or exitShortFade, title="Short Exit", style=shape.circle, location=location.belowbar, color=coldf, size=size.tiny)
+barcolor(squeezeOn ? color.new(colsh, 70) : na)
+
+// --- 얼럿 ---
+alertcondition(enterLong , "Enter Long" , "Enter Long")
+alertcondition(enterShort, "Enter Short", "Enter Short")
+alertcondition(exitLongOpposite or exitLongFade , "Exit Long" , "Exit Long")
+alertcondition(exitShortOpposite or exitShortFade, "Exit Short", "Exit Short")
