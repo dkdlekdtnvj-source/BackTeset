@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import hashlib
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Sequence as AbcSequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -115,6 +117,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
 STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
+PF_ANOMALY_THRESHOLD = 100.0
+TRIAL_PROGRESS_FIELDS = [
+    "number",
+    "state",
+    "value",
+    "score",
+    "profit_factor",
+    "trades",
+    "win_rate",
+    "max_dd",
+    "valid",
+    "timeframe",
+    "htf_timeframe",
+    "pruned",
+    "params",
+    "skipped_datasets",
+    "datetime_complete",
+]
 
 # 단순 메트릭 계산 경로 사용 여부 (CLI 인자/설정으로 갱신됩니다).
 simple_metrics_enabled: bool = False
@@ -141,6 +161,15 @@ BASIC_FACTOR_KEYS = {
     "fluxLen",
     "fluxSmoothLen",
     "useFluxHeikin",
+    # Dynamic threshold & gates
+    "useDynamicThresh",
+    "useSymThreshold",
+    "statThreshold",
+    "buyThreshold",
+    "sellThreshold",
+    "dynLen",
+    "dynMult",
+    "requireMomentumCross",
     # Exit logic
     "exitOpposite",
     "useMomFade",
@@ -543,6 +572,39 @@ def _prompt_bool(label: str, default: Optional[bool] = None) -> Optional[bool]:
         if not raw:
             return default
         print("Please answer 'y' or 'n'.")
+
+
+def _prompt_ltf_selection() -> str:
+    """사용자가 선호하는 LTF(1, 3, 5분봉)를 선택하도록 안내합니다."""
+
+    options = {"1": "1m", "3": "3m", "5": "5m"}
+    if not sys.stdin or not sys.stdin.isatty():
+        LOGGER.info("비대화형 환경이 감지되어 기본 1m LTF를 사용합니다.")
+        return "1m"
+
+    while True:
+        print("\n작업을 시작 하기 전에 LTF를 선택해주세요.")
+        print("  1) 1분봉")
+        print("  3) 3분봉")
+        print("  5) 5분봉")
+        raw = input("선택 (1/3/5): ").strip()
+        if raw in options:
+            selection = options[raw]
+            print(f"{raw}분봉을 선택했습니다.")
+            return selection
+        print("잘못된 입력입니다. 1, 3, 5 중 하나를 입력해주세요.")
+
+
+def _apply_ltf_override_to_datasets(backtest_cfg: Dict[str, object], timeframe: str) -> None:
+    entries = backtest_cfg.get("datasets")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry["ltf"] = [timeframe]
+        entry["ltfs"] = [timeframe]
+        entry["timeframes"] = [timeframe]
 
 
 def _coerce_bool_or_none(value: object) -> Optional[bool]:
@@ -966,6 +1028,35 @@ def combine_metrics(
 
     combined_returns: List[pd.Series] = []
     combined_trades: List[Trade] = [] if not simple_mode else []
+    anomaly_flags: List[str] = []
+    lossless_detected = False
+
+    def _flag_lossless(target: Dict[str, float]) -> None:
+        nonlocal lossless_detected, anomaly_flags
+        try:
+            trades_val = float(target.get("Trades", 0.0) or 0.0)
+            wins_val = float(target.get("Wins", 0.0) or 0.0)
+            losses_val = float(target.get("Losses", 0.0) or 0.0)
+            gross_loss_val = float(target.get("GrossLoss", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if trades_val <= 0 or wins_val <= 0:
+            return
+        if losses_val != 0:
+            return
+        if abs(gross_loss_val) > EPS:
+            return
+        lossless_detected = True
+        already_flagged = "lossless_profit_factor" in anomaly_flags
+        if not already_flagged:
+            anomaly_flags.append("lossless_profit_factor")
+        target["ProfitFactor"] = 0.0
+        if not already_flagged:
+            LOGGER.info(
+                "손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                int(trades_val),
+                int(wins_val),
+            )
 
     def _coerce_float(value: object) -> float:
         try:
@@ -988,6 +1079,17 @@ def combine_metrics(
             combined_returns.append(returns)
 
         valid_flag = valid_flag and bool(metrics.get("Valid", True))
+
+        flags_value = metrics.get("AnomalyFlags")
+        if isinstance(flags_value, str):
+            tokens = [token.strip() for token in flags_value.split(",") if token.strip()]
+        elif isinstance(flags_value, (list, tuple)):
+            tokens = [str(token) for token in flags_value if str(token)]
+        else:
+            tokens = []
+        for token in tokens:
+            if token not in anomaly_flags:
+                anomaly_flags.append(token)
 
         if simple_mode:
             trades_count = int(_coerce_float(metrics.get("Trades")))
@@ -1099,6 +1201,7 @@ def combine_metrics(
             "MaxConsecutiveLosses": float(max_consecutive_losses),
         }
         aggregated["SimpleMetricsOnly"] = True
+        _flag_lossless(aggregated)
     else:
         combined_trades.sort(
             key=lambda trade: (
@@ -1107,6 +1210,7 @@ def combine_metrics(
             )
         )
         aggregated = aggregate_metrics(combined_trades, merged_returns, simple=False)
+        _flag_lossless(aggregated)
 
     aggregated["Trades"] = int(aggregated.get("Trades", 0))
     aggregated["Wins"] = int(aggregated.get("Wins", 0))
@@ -1138,7 +1242,9 @@ def combine_metrics(
             value = abs(value)
         aggregated[key] = float(max(0.0, value))
 
-    aggregated["Valid"] = valid_flag
+    aggregated["Valid"] = valid_flag and not lossless_detected
+    if anomaly_flags:
+        aggregated["AnomalyFlags"] = list(dict.fromkeys(anomaly_flags))
     return aggregated
 
 
@@ -1190,6 +1296,9 @@ def _clean_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     for key, value in metrics.items():
         if isinstance(value, (int, float, bool, str)):
             clean[key] = value
+        elif isinstance(value, (list, tuple)):
+            if all(isinstance(item, (int, float, bool, str)) for item in value):
+                clean[key] = ", ".join(str(item) for item in value)
     return clean
 
 
@@ -1339,12 +1448,14 @@ def optimisation_loop(
     trial_log_path: Optional[Path] = None
     best_yaml_path: Optional[Path] = None
     final_csv_path: Optional[Path] = None
+    trial_csv_path: Optional[Path] = None
     if log_dir_path:
         log_dir_path.mkdir(parents=True, exist_ok=True)
         trial_log_path = log_dir_path / "trials.jsonl"
         best_yaml_path = log_dir_path / "best.yaml"
         final_csv_path = log_dir_path / "trials_final.csv"
-        for candidate in (trial_log_path, best_yaml_path, final_csv_path):
+        trial_csv_path = log_dir_path / "trials_progress.csv"
+        for candidate in (trial_log_path, best_yaml_path, final_csv_path, trial_csv_path):
             if candidate.exists():
                 candidate.unlink()
     non_finite_penalty = float(search_cfg.get("non_finite_penalty", NON_FINITE_PENALTY))
@@ -1511,6 +1622,66 @@ def optimisation_loop(
         with trial_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+        if trial_csv_path is not None:
+            metrics_attr = trial.user_attrs.get("metrics")
+            metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
+
+            def _metric_value(name: str) -> Optional[object]:
+                if name not in metrics:
+                    return None
+                return _to_native(metrics.get(name))
+
+            dataset_key = trial.user_attrs.get("dataset_key")
+            dataset_meta = dataset_key if isinstance(dataset_key, dict) else {}
+            skipped_attr = trial.user_attrs.get("skipped_datasets")
+            if isinstance(skipped_attr, list):
+                skipped_serialisable = skipped_attr
+            else:
+                skipped_serialisable = [skipped_attr] if skipped_attr else []
+
+            max_dd_value = _metric_value("MaxDD")
+            if max_dd_value is None:
+                max_dd_value = _metric_value("MaxDrawdown")
+
+            value_field: object
+            if isinstance(trial_value, list):
+                value_field = json.dumps(trial_value, ensure_ascii=False)
+            else:
+                value_field = trial_value
+
+            params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
+            skipped_json = (
+                json.dumps(skipped_serialisable, ensure_ascii=False)
+                if skipped_serialisable
+                else ""
+            )
+
+            row = {
+                "number": trial.number,
+                "state": str(trial.state),
+                "value": value_field,
+                "score": trial.user_attrs.get("score"),
+                "profit_factor": _metric_value("ProfitFactor"),
+                "trades": _metric_value("Trades"),
+                "win_rate": _metric_value("WinRate"),
+                "max_dd": max_dd_value,
+                "valid": trial.user_attrs.get("valid"),
+                "timeframe": dataset_meta.get("timeframe"),
+                "htf_timeframe": dataset_meta.get("htf_timeframe"),
+                "pruned": trial.user_attrs.get("pruned"),
+                "params": params_json,
+                "skipped_datasets": skipped_json,
+                "datetime_complete": record["datetime_complete"],
+            }
+
+            file_exists = trial_csv_path.exists()
+            trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
+                writer = csv.DictWriter(csv_handle, fieldnames=TRIAL_PROGRESS_FIELDS)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+
         if best_yaml_path is None:
             return
         best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1562,9 +1733,29 @@ def optimisation_loop(
         key, selected_datasets = _select_datasets_for_params(
             params_cfg, dataset_groups, timeframe_groups, default_key, params
         )
+        trial.set_user_attr(
+            "dataset_key",
+            {"timeframe": key[0], "htf_timeframe": key[1]},
+        )
         dataset_metrics: List[Dict[str, object]] = []
         numeric_metrics: List[Dict[str, float]] = []
         dataset_scores: List[float] = []
+        skipped_dataset_records: List[Dict[str, object]] = []
+
+        def _safe_float(value: object) -> Optional[float]:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(numeric):
+                return None
+            return float(numeric)
+
+        def _coerce_int(value: object) -> Optional[int]:
+            numeric = _safe_float(value)
+            if numeric is None:
+                return None
+            return int(round(numeric))
 
         def _sanitise(value: float, stage: str) -> float:
             try:
@@ -1588,14 +1779,38 @@ def optimisation_loop(
             *,
             simple_override: bool = False,
         ) -> None:
+            cleaned_metrics = _clean_metrics(metrics)
+            dataset_entry: Dict[str, object] = {
+                "name": dataset.name,
+                "meta": dataset.meta,
+                "metrics": cleaned_metrics,
+            }
+
+            pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
+            if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
+                dataset_entry["skipped"] = True
+                dataset_entry["skip_reason"] = "profit_factor_threshold"
+                dataset_entry["skip_metric"] = pf_value
+                dataset_entry["skip_threshold"] = PF_ANOMALY_THRESHOLD
+                dataset_metrics.append(dataset_entry)
+                skipped_dataset_records.append(
+                    {
+                        "name": dataset.name,
+                        "timeframe": dataset.timeframe,
+                        "htf_timeframe": dataset.htf_timeframe,
+                        "profit_factor": pf_value,
+                    }
+                )
+                LOGGER.warning(
+                    "데이터셋 %s 의 ProfitFactor %.2f 가 %.2f 이상으로 감지되어 제외합니다.",
+                    dataset.name,
+                    pf_value,
+                    PF_ANOMALY_THRESHOLD,
+                )
+                return
+
             numeric_metrics.append(metrics)
-            dataset_metrics.append(
-                {
-                    "name": dataset.name,
-                    "meta": dataset.meta,
-                    "metrics": _clean_metrics(metrics),
-                }
-            )
+            dataset_metrics.append(dataset_entry)
 
             dataset_score = compute_score_pf_basic(metrics, constraints_cfg)
             dataset_score = _sanitise(dataset_score, f"dataset@{idx}")
@@ -1614,19 +1829,31 @@ def optimisation_loop(
             )
             trial.report(partial_score, step=idx)
             if trial.should_prune():
+                cleaned_partial = _clean_metrics(partial_metrics)
                 pruned_record = {
                     "trial": trial.number,
                     "params": params,
-                    "metrics": _clean_metrics(partial_metrics),
+                    "metrics": cleaned_partial,
                     "datasets": dataset_metrics,
                     "score": partial_score,
-                    "valid": partial_metrics.get("Valid", True),
+                    "valid": cleaned_partial.get("Valid", True),
                     "dataset_key": {"timeframe": key[0], "htf_timeframe": key[1]},
                     "pruned": True,
+                    "skipped_datasets": list(skipped_dataset_records),
                 }
                 if partial_objectives is not None:
                     pruned_record["objective_values"] = list(partial_objectives)
                 results.append(pruned_record)
+                trial.set_user_attr("score", float(partial_score))
+                trial.set_user_attr("metrics", cleaned_partial)
+                trial.set_user_attr(
+                    "profit_factor",
+                    _safe_float(cleaned_partial.get("ProfitFactor")),
+                )
+                trial.set_user_attr("trades", _coerce_int(cleaned_partial.get("Trades")))
+                trial.set_user_attr("valid", bool(cleaned_partial.get("Valid", True)))
+                trial.set_user_attr("pruned", True)
+                trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
                 raise optuna.TrialPruned()
 
         parallel_enabled = dataset_jobs > 1 and len(selected_datasets) > 1
@@ -1703,6 +1930,8 @@ def optimisation_loop(
         aggregated = combine_metrics(
             numeric_metrics, simple_override=simple_metrics_enabled
         )
+        if not aggregated:
+            aggregated = {"Valid": False}
         if dataset_scores:
             score = sum(dataset_scores) / len(dataset_scores)
         else:
@@ -1714,19 +1943,33 @@ def optimisation_loop(
             else None
         )
 
+        cleaned_aggregated = _clean_metrics(aggregated)
+        valid_status = bool(aggregated.get("Valid", bool(numeric_metrics)))
+
         record = {
             "trial": trial.number,
             "params": params,
-            "metrics": _clean_metrics(aggregated),
+            "metrics": cleaned_aggregated,
             "datasets": dataset_metrics,
             "score": score,
-            "valid": aggregated.get("Valid", True),
+            "valid": valid_status,
             "dataset_key": {"timeframe": key[0], "htf_timeframe": key[1]},
             "pruned": False,
+            "skipped_datasets": list(skipped_dataset_records),
         }
         if objective_values is not None:
             record["objective_values"] = list(objective_values)
         results.append(record)
+        trial.set_user_attr("score", float(score))
+        trial.set_user_attr("metrics", cleaned_aggregated)
+        trial.set_user_attr(
+            "profit_factor",
+            _safe_float(cleaned_aggregated.get("ProfitFactor")),
+        )
+        trial.set_user_attr("trades", _coerce_int(cleaned_aggregated.get("Trades")))
+        trial.set_user_attr("valid", valid_status)
+        trial.set_user_attr("pruned", False)
+        trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
         if multi_objective and objective_values is not None:
             return objective_values
         return score
@@ -1853,21 +2096,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leverage", type=float, help="Override leverage setting")
     parser.add_argument("--qty-pct", type=float, help="Override quantity percent")
     parser.add_argument(
-        "--simple-metrics",
-        action="store_true",
-        help="간단 메트릭만 계산해 빠르게 탐색",
-    )
-    parser.add_argument(
-        "--simple-profit",
-        action="store_true",
-        help="--simple-metrics 와 동일하게 ProfitFactor 전용 지표 경로를 사용합니다",
-    )
-    parser.add_argument(
-        "--no-simple-metrics",
-        action="store_true",
-        help="단순 ProfitFactor 경로 강제 설정을 비활성화합니다",
-    )
-    parser.add_argument(
         "--full-space",
         action="store_true",
         help="기본 팩터 필터를 비활성화하고 원본 탐색 공간을 그대로 사용합니다",
@@ -1941,11 +2169,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     args = build_parser().parse_args(argv)
     global simple_metrics_enabled
-    simple_metrics_enabled = bool(
-        getattr(args, "simple_metrics", False) or getattr(args, "simple_profit", False)
-    )
-    if getattr(args, "no_simple_metrics", False):
-        simple_metrics_enabled = False
+    simple_metrics_enabled = False
     return args
 
 
@@ -2077,6 +2301,14 @@ def _execute_single(
     timeframe_overridden = args.timeframe is not None
     htf_overridden = args.htf is not None
 
+    if (
+        not timeframe_overridden
+        and not getattr(args, "timeframe_grid", None)
+        and batch_ctx is None
+    ):
+        selected_timeframe = _prompt_ltf_selection()
+        timeframe_overridden = True
+
     if args.interactive and symbol_choices:
         selected_symbol = _prompt_choice("Select symbol", symbol_choices, selected_symbol)
 
@@ -2086,6 +2318,7 @@ def _execute_single(
     if timeframe_overridden and selected_timeframe:
         params_cfg["timeframe"] = selected_timeframe
         backtest_cfg["timeframes"] = [selected_timeframe]
+        _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
     if htf_overridden and selected_htf is not None:
         params_cfg["htf_timeframes"] = [selected_htf]
         backtest_cfg["htf_timeframes"] = [selected_htf]
@@ -2125,21 +2358,6 @@ def _execute_single(
         risk_cfg["qty_pct"] = args.qty_pct
         backtest_risk["qty_pct"] = args.qty_pct
 
-    def _apply_simple_metrics(decision: bool) -> None:
-        forced_params["simpleMetricsOnly"] = decision
-        forced_params["simpleProfitOnly"] = decision
-        risk_cfg["simpleMetricsOnly"] = decision
-        risk_cfg["simpleProfitOnly"] = decision
-        backtest_risk["simpleMetricsOnly"] = decision
-        backtest_risk["simpleProfitOnly"] = decision
-
-    # 기본 모드는 ProfitFactor 중심 단순 지표 경로를 강제해 계산량을 줄입니다.
-    _apply_simple_metrics(True)
-    if getattr(args, "no_simple_metrics", False):
-        _apply_simple_metrics(False)
-    elif getattr(args, "simple_metrics", False) or getattr(args, "simple_profit", False):
-        _apply_simple_metrics(True)
-
     if args.interactive:
         leverage_default = risk_cfg.get("leverage")
         qty_default = risk_cfg.get("qty_pct")
@@ -2167,7 +2385,7 @@ def _execute_single(
             if decision is not None:
                 forced_params[name] = decision
 
-        simple_default: Optional[bool] = None
+    def _resolve_simple_metrics_flag() -> bool:
         for candidate in (
             forced_params.get("simpleMetricsOnly"),
             forced_params.get("simpleProfitOnly"),
@@ -2178,20 +2396,21 @@ def _execute_single(
         ):
             coerced = _coerce_bool_or_none(candidate)
             if coerced is not None:
-                simple_default = coerced
-                break
-        decision = _prompt_bool(
-            "단순 ProfitFactor 전용 지표 경로 사용", simple_default
-        )
-        if decision is not None:
-            _apply_simple_metrics(decision)
+                return coerced
+        return False
+
+    simple_metrics_state = _resolve_simple_metrics_flag()
+    if simple_metrics_state:
+        LOGGER.info("단순 ProfitFactor 기반 계산 경로가 구성에서 활성화되어 있습니다.")
+    else:
+        for key in ("simpleMetricsOnly", "simpleProfitOnly"):
+            forced_params.pop(key, None)
+            risk_cfg.pop(key, None)
+            backtest_risk.pop(key, None)
+        LOGGER.info("전체 지표 계산 경로를 사용합니다.")
 
     global simple_metrics_enabled
-    simple_metrics_enabled = bool(forced_params.get("simpleMetricsOnly", False))
-    if simple_metrics_enabled:
-        LOGGER.info("단순 ProfitFactor 기반 계산 경로를 강제 활성화합니다.")
-    else:
-        LOGGER.info("전체 지표 계산 경로를 사용합니다.")
+    simple_metrics_enabled = simple_metrics_state
 
     params_cfg["overrides"] = forced_params
 
