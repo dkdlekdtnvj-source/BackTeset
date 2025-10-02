@@ -99,20 +99,28 @@ def mutate_around(
             width = max(int((spec["max"] - spec["min"]) * scale), int(spec.get("step", 1)))
             low = int(spec["min"])
             high = int(spec["max"])
-            step = int(spec.get("step", 1))
+            step = int(spec.get("step", 1)) or 1
             jitter = rng.integers(-width, width + 1)
             candidate = int(value) + jitter
+            offset = candidate - low
+            candidate = low + int(round(offset / step)) * step
             candidate = max(low, min(high, candidate))
-            candidate = int(round(candidate / step) * step)
             mutated[name] = candidate
         elif dtype == "float":
             span = float(spec["max"] - spec["min"]) * scale
+            low = float(spec["min"])
+            high = float(spec["max"])
             step = float(spec.get("step", 0.0))
             jitter = rng.normal(0.0, span or 1e-6)
             candidate = float(value) + jitter
-            candidate = max(float(spec["min"]), min(float(spec["max"]), candidate))
+            offset = candidate - low
             if step:
-                candidate = round(candidate / step) * step
+                candidate = low + round(offset / step) * step
+            candidate = max(low, min(high, candidate))
+            precision = int(spec.get("precision", 0)) if "precision" in spec else None
+            if precision is not None and precision >= 0:
+                candidate = round(candidate, precision)
+                candidate = max(low, min(high, candidate))
             mutated[name] = float(candidate)
         elif dtype in {"bool", "choice", "str", "string"}:
             if rng.random() < 0.2:
