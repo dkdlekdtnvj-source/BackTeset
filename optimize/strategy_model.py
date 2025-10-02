@@ -75,16 +75,51 @@ def _timeframe_to_offset(timeframe: str) -> Optional[str]:
     tf = str(timeframe).strip()
     if not tf:
         return None
-    if tf.endswith("m"):
-        return f"{int(tf[:-1])}min"
-    if tf.endswith("h"):
-        return f"{int(tf[:-1])}H"
-    if tf.endswith("D"):
-        return f"{int(tf[:-1])}D"
-    if tf.endswith("W"):
-        return f"{int(tf[:-1])}W"
+
+    def _parse_multiplier(value: str) -> Optional[int]:
+        if not value:
+            return 1
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    tf_upper = tf.upper()
+    tf_lower = tf.lower()
+
+    if tf_upper.endswith("MS"):
+        multiplier = _parse_multiplier(tf[:-2])
+        if multiplier is not None:
+            return f"{multiplier}MS"
+
+    if tf.endswith("M"):
+        multiplier = _parse_multiplier(tf[:-1])
+        if multiplier is not None:
+            return f"{multiplier}MS"
+
+    if tf_lower.endswith("m"):
+        multiplier = _parse_multiplier(tf_lower[:-1])
+        if multiplier is not None:
+            return f"{multiplier}min"
+
+    if tf_lower.endswith("h"):
+        multiplier = _parse_multiplier(tf_lower[:-1])
+        if multiplier is not None:
+            return f"{multiplier}H"
+
+    if tf_lower.endswith("d"):
+        multiplier = _parse_multiplier(tf_lower[:-1])
+        if multiplier is not None:
+            return f"{multiplier}D"
+
+    if tf_lower.endswith("w"):
+        multiplier = _parse_multiplier(tf_lower[:-1])
+        if multiplier is not None:
+            return f"{multiplier}W"
+
     if tf.isdigit():
         return f"{int(tf)}min"
+
     return None
 
 

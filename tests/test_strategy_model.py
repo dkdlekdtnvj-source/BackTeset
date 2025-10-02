@@ -1,6 +1,6 @@
 import pandas as pd
 
-from optimize.strategy_model import run_backtest
+from optimize.strategy_model import _security_series, run_backtest
 
 
 def _make_ohlcv(prices):
@@ -132,3 +132,32 @@ def test_short_stop_handles_missing_candidates():
     metrics = run_backtest(df, params, FEES, RISK)
 
     assert metrics["Trades"] >= 1
+
+
+def test_security_series_resamples_monthly_timeframe():
+    index = pd.date_range("2025-01-01", periods=65, freq="D", tz="UTC")
+    close = pd.Series(range(len(index)), index=index)
+    df = pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 1,
+            "low": close - 1,
+            "close": close,
+            "volume": 1.0,
+        }
+    )
+
+    captured = {}
+
+    def _compute(resampled: pd.DataFrame) -> pd.Series:
+        captured["index"] = resampled.index
+        return resampled["close"]
+
+    result = _security_series(df, "1M", _compute)
+
+    assert "index" in captured
+    assert captured["index"].freqstr in {"MS", "M"}
+
+    period_index = result.index.tz_localize(None).to_period("M")
+    unique_per_month = result.groupby(period_index).nunique()
+    assert (unique_per_month == 1).all()
