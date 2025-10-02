@@ -1483,6 +1483,7 @@ def optimisation_loop(
     def _log_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if trial_log_path is None:
             return
+        trial_log_path.parent.mkdir(parents=True, exist_ok=True)
         def _normalise_value(value: object) -> Optional[object]:
             if value is None:
                 return None
@@ -1512,6 +1513,7 @@ def optimisation_loop(
 
         if best_yaml_path is None:
             return
+        best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
 
         selected_trial: Optional[optuna.trial.FrozenTrial]
         if multi_objective:
@@ -1772,6 +1774,7 @@ def optimisation_loop(
             except Exception:
                 df = None
             if df is not None:
+                final_csv_path.parent.mkdir(parents=True, exist_ok=True)
                 df.to_csv(final_csv_path, index=False)
 
     if not results:
