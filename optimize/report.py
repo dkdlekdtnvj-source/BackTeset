@@ -157,7 +157,9 @@ def export_timeframe_summary(dataset_df: pd.DataFrame, output_dir: Path) -> None
 
     df = dataset_df.copy()
     df["timeframe"] = df["timeframe"].astype(str)
-    df["htf_timeframe"] = df["htf_timeframe"].replace({"": "None"}).astype(str)
+    df["htf_timeframe"] = (
+        df["htf_timeframe"].fillna("None").replace({"": "None"}).astype(str)
+    )
 
     metrics = [
         "NetProfit",
