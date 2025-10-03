@@ -10,6 +10,14 @@ search:
   dataset_executor: process
   allow_sqlite_parallel: false   # true=병렬 허용을 명시, false=병렬 유지하되 잠금 충돌 시 자동 재시도(경고 출력)
   # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
+  storage_url_env: OPTUNA_STORAGE_URL   # 외부 RDB URL을 환경변수로 전달하면 SQLite 대신 사용합니다.
+  storage_pool_size: 8                  # PostgreSQL 풀 커넥션 수 (기본 8)
+  storage_max_overflow: 16              # 풀 초과 시 임시 커넥션 수
+  storage_pool_timeout: 30              # 풀에서 커넥션을 기다리는 최대 초 (0=무제한)
+  storage_pool_recycle: 1800            # 커넥션 재생성 주기(초)
+  storage_connect_timeout: 10           # DB 커넥션 시도 타임아웃(초)
+  storage_statement_timeout_ms: 300000  # 쿼리 타임아웃(밀리초). 0 또는 비우면 비활성화
+  storage_isolation_level: READ COMMITTED  # PostgreSQL 권장 격리 수준
 
 # === 엔진/성능 옵션 ===
 useNumba: true          # Numba JIT 사용 (없으면 기본 false)
