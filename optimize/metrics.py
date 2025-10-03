@@ -10,9 +10,76 @@ import pandas as pd
 
 
 EPS = 1e-12
+LOSSLESS_GROSS_LOSS_PCT = 1e-3
+LOSSLESS_ANOMALY_FLAG = "lossless_profit_factor"
+MICRO_LOSS_ANOMALY_FLAG = "micro_loss_profit_factor"
+_INITIAL_BALANCE_KEYS = (
+    "InitialCapital",
+    "InitialEquity",
+    "InitialBalance",
+    "StartingBalance",
+)
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_initial_balance(target: Dict[str, float], default: float = 1.0) -> float:
+    for key in _INITIAL_BALANCE_KEYS:
+        value = target.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric) and numeric != 0:
+            return abs(numeric)
+    return abs(default)
+
+
+def lossless_gross_loss_threshold(target: Dict[str, float], *, default_initial: float = 1.0) -> float:
+    override = target.get("LosslessGrossLossThreshold")
+    if override is not None:
+        try:
+            numeric = abs(float(override))
+        except (TypeError, ValueError):
+            numeric = float("nan")
+        else:
+            if np.isfinite(numeric) and numeric > 0:
+                return max(numeric, EPS)
+
+    base = _resolve_initial_balance(target, default=default_initial)
+    threshold = abs(base) * LOSSLESS_GROSS_LOSS_PCT
+    return max(threshold, EPS)
+
+
+def detect_lossless_profit_factor(
+    *,
+    trades: float,
+    wins: float,
+    losses: float,
+    gross_loss: float,
+    threshold: float,
+) -> str | None:
+    try:
+        trades = float(trades)
+        wins = float(wins)
+        losses = float(losses)
+        gross_loss = float(gross_loss)
+        threshold = max(float(threshold), EPS)
+    except (TypeError, ValueError):
+        return None
+
+    if trades <= 0 or wins <= 0:
+        return None
+
+    abs_loss = abs(gross_loss)
+    if abs_loss <= EPS and losses <= 0:
+        return LOSSLESS_ANOMALY_FLAG
+    if abs_loss <= threshold:
+        return MICRO_LOSS_ANOMALY_FLAG
+    return None
 
 
 @dataclass
@@ -154,11 +221,21 @@ def aggregate_metrics(
 
     fallback_keys = ("ProfitFactor", "Sortino", "Sharpe")
 
+    # Nested helper declared below within aggregate_metrics.
+
     def _mark_lossless(target: Dict[str, float]) -> None:
-        if not trades or wins <= 0 or losses != 0:
+        threshold = lossless_gross_loss_threshold(target)
+        target.setdefault("LosslessGrossLossThreshold", threshold)
+        flag = detect_lossless_profit_factor(
+            trades=len(trades),
+            wins=wins,
+            losses=losses,
+            gross_loss=gross_loss,
+            threshold=threshold,
+        )
+        if not flag:
             return
-        if abs(gross_loss) > EPS:
-            return
+
         existing = target.get("AnomalyFlags")
         if isinstance(existing, str):
             flags = [token.strip() for token in existing.split(",") if token.strip()]
@@ -166,13 +243,22 @@ def aggregate_metrics(
             flags = [str(token) for token in existing if str(token)]
         else:
             flags = []
-        if "lossless_profit_factor" not in flags:
-            flags.append("lossless_profit_factor")
-            LOGGER.info(
-                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
-                len(trades),
-                wins,
-            )
+        if flag not in flags:
+            flags.append(flag)
+            if flag == LOSSLESS_ANOMALY_FLAG:
+                LOGGER.info(
+                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                    len(trades),
+                    wins,
+                )
+            else:
+                LOGGER.warning(
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                    abs(gross_loss),
+                    threshold,
+                    len(trades),
+                    wins,
+                )
         target["AnomalyFlags"] = flags
         target["ProfitFactor"] = 0.0
         target["LosslessProfitFactor"] = True
@@ -360,4 +446,9 @@ __all__ = [
     "max_drawdown",
     "normalise_objectives",
     "score_metrics",
+    "LOSSLESS_GROSS_LOSS_PCT",
+    "LOSSLESS_ANOMALY_FLAG",
+    "MICRO_LOSS_ANOMALY_FLAG",
+    "lossless_gross_loss_threshold",
+    "detect_lossless_profit_factor",
 ]

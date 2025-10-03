@@ -33,11 +33,15 @@ from sqlalchemy.engine import make_url
 from datafeed.cache import DataCache
 from optimize.metrics import (
     EPS,
+    LOSSLESS_ANOMALY_FLAG,
+    MICRO_LOSS_ANOMALY_FLAG,
     ObjectiveSpec,
     Trade,
     aggregate_metrics,
+    detect_lossless_profit_factor,
     equity_curve_from_returns,
     evaluate_objective_values,
+    lossless_gross_loss_threshold,
     normalise_objectives,
 )
 from optimize.report import generate_reports, write_bank_file, write_trials_dataframe
@@ -198,6 +202,43 @@ def _safe_sample_parameters(
 
 # 단순 메트릭 계산 경로 사용 여부 (CLI 인자/설정으로 갱신됩니다).
 simple_metrics_enabled: bool = False
+
+
+def _apply_lossless_anomaly(target: Dict[str, float]) -> Optional[Tuple[str, float, float, float, float]]:
+    try:
+        trades_val = float(target.get("Trades", 0.0) or 0.0)
+        wins_val = float(target.get("Wins", 0.0) or 0.0)
+        losses_val = float(target.get("Losses", 0.0) or 0.0)
+        gross_loss_val = float(target.get("GrossLoss", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+    threshold = lossless_gross_loss_threshold(target)
+    target.setdefault("LosslessGrossLossThreshold", threshold)
+
+    flag = detect_lossless_profit_factor(
+        trades=trades_val,
+        wins=wins_val,
+        losses=losses_val,
+        gross_loss=gross_loss_val,
+        threshold=threshold,
+    )
+    if not flag:
+        return None
+
+    existing = target.get("AnomalyFlags")
+    if isinstance(existing, str):
+        flags = [token.strip() for token in existing.split(",") if token.strip()]
+    elif isinstance(existing, (list, tuple)):
+        flags = [str(token) for token in existing if str(token)]
+    else:
+        flags = []
+    if flag not in flags:
+        flags.append(flag)
+    target["AnomalyFlags"] = flags
+    target["ProfitFactor"] = 0.0
+    target["LosslessProfitFactor"] = True
+    return flag, trades_val, wins_val, abs(gross_loss_val), threshold
 
 # 기본 팩터 최적화에 사용할 파라미터 키 집합입니다.
 # 복잡한 보호 장치·부가 필터 대신 핵심 진입 로직과 직접 관련된 항목만 남겨
@@ -1262,30 +1303,35 @@ def combine_metrics(
 
     def _flag_lossless(target: Dict[str, float]) -> None:
         nonlocal lossless_detected, anomaly_flags
-        try:
-            trades_val = float(target.get("Trades", 0.0) or 0.0)
-            wins_val = float(target.get("Wins", 0.0) or 0.0)
-            losses_val = float(target.get("Losses", 0.0) or 0.0)
-            gross_loss_val = float(target.get("GrossLoss", 0.0) or 0.0)
-        except (TypeError, ValueError):
+        result = _apply_lossless_anomaly(target)
+        if not result:
             return
-        if trades_val <= 0 or wins_val <= 0:
-            return
-        if losses_val != 0:
-            return
-        if abs(gross_loss_val) > EPS:
-            return
+
+        flag, trades_val, wins_val, abs_loss, threshold = result
         lossless_detected = True
-        already_flagged = "lossless_profit_factor" in anomaly_flags
-        if not already_flagged:
-            anomaly_flags.append("lossless_profit_factor")
-        target["ProfitFactor"] = 0.0
-        if not already_flagged:
-            LOGGER.info(
-                "손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
-                int(trades_val),
-                int(wins_val),
-            )
+        if flag not in anomaly_flags:
+            anomaly_flags.append(flag)
+            if flag == LOSSLESS_ANOMALY_FLAG:
+                LOGGER.info(
+                    "손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                    int(trades_val),
+                    int(wins_val),
+                )
+            elif flag == MICRO_LOSS_ANOMALY_FLAG:
+                LOGGER.warning(
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                    abs_loss,
+                    threshold,
+                    int(trades_val),
+                    int(wins_val),
+                )
+            else:
+                LOGGER.warning(
+                    "ProfitFactor를 0으로 재조정하는 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                    flag,
+                    int(trades_val),
+                    int(wins_val),
+                )
 
     def _coerce_float(value: object) -> float:
         try:
@@ -2061,6 +2107,35 @@ def optimisation_loop(
                 "meta": dataset.meta,
                 "metrics": cleaned_metrics,
             }
+
+            lossless_info = _apply_lossless_anomaly(metrics)
+            if lossless_info:
+                _apply_lossless_anomaly(cleaned_metrics)
+                flag, trades_val, wins_val, abs_loss, threshold = lossless_info
+                if flag == LOSSLESS_ANOMALY_FLAG:
+                    LOGGER.info(
+                        "데이터셋 %s 에서 손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                        dataset.name,
+                        int(trades_val),
+                        int(wins_val),
+                    )
+                elif flag == MICRO_LOSS_ANOMALY_FLAG:
+                    LOGGER.warning(
+                        "데이터셋 %s 에서 미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                        dataset.name,
+                        abs_loss,
+                        threshold,
+                        int(trades_val),
+                        int(wins_val),
+                    )
+                else:
+                    LOGGER.warning(
+                        "데이터셋 %s 에서 ProfitFactor 0 재조정 플래그(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                        dataset.name,
+                        flag,
+                        int(trades_val),
+                        int(wins_val),
+                    )
 
             pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
             if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
