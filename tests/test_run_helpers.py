@@ -12,6 +12,7 @@ from optimize.run import (
     _normalise_periods,
     _resolve_symbol_entry,
     _restrict_to_basic_factors,
+    _run_dataset_backtest_task,
     _select_datasets_for_params,
     parse_args,
 )
@@ -176,3 +177,28 @@ def test_select_datasets_falls_back_when_htf_disabled():
 
     assert key[0] == "1m"
     assert all(dataset.timeframe == "1m" for dataset in selection)
+
+
+def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch):
+    dataset = _make_dataset("1m", None)
+    sentinel = {"called": False}
+
+    def fake_native(df, params, fees, risk, htf_df=None, min_trades=None):
+        sentinel["called"] = True
+        return {"Valid": True, "Trades": 0.0}
+
+    def fake_alt(*args, **kwargs):
+        raise ImportError("vectorbt 미설치")
+
+    monkeypatch.setattr("optimize.run.run_backtest", fake_native)
+    monkeypatch.setattr("optimize.alternative_engine.run_backtest_alternative", fake_alt)
+
+    metrics = _run_dataset_backtest_task(
+        dataset,
+        {"altEngine": "vectorbt"},
+        {"commission_pct": 0.0006},
+        {},
+    )
+
+    assert metrics["Valid"] is True
+    assert sentinel["called"] is True

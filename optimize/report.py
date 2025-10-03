@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -9,7 +10,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 import pandas as pd
-import seaborn as sns
 
 
 def _ensure_dir(path: Path) -> None:
@@ -17,6 +17,29 @@ def _ensure_dir(path: Path) -> None:
 
 
 from optimize.metrics import normalise_objectives
+
+
+LOGGER = logging.getLogger(__name__)
+
+_SEABORN: Optional[object] = None
+_SEABORN_IMPORT_ERROR: Optional[Exception] = None
+
+
+def _get_seaborn():
+    """Lazy seaborn importer to avoid hard dependency at module import."""
+
+    global _SEABORN, _SEABORN_IMPORT_ERROR
+    if _SEABORN is not None:
+        return _SEABORN
+    if _SEABORN_IMPORT_ERROR is not None:
+        raise ImportError("seaborn import previously failed") from _SEABORN_IMPORT_ERROR
+    try:
+        import seaborn as sns  # type: ignore
+    except Exception as exc:  # pragma: no cover - 환경 의존
+        _SEABORN_IMPORT_ERROR = exc
+        raise ImportError("seaborn is required for heatmap export") from exc
+    _SEABORN = sns
+    return sns
 
 
 def _objective_iterator(objectives: Iterable[object]) -> Iterable[Tuple[str, float]]:
@@ -132,6 +155,12 @@ def export_heatmap(metrics_df: pd.DataFrame, params: List[str], metric: str, plo
         return
     _ensure_dir(plots_dir)
     plt.figure(figsize=(10, 6))
+    try:
+        sns = _get_seaborn()
+    except ImportError as exc:
+        LOGGER.warning("seaborn 사용이 불가능하여 heatmap 생성을 건너뜁니다: %s", exc)
+        plt.close()
+        return
     sns.heatmap(pivot, annot=False, cmap="viridis")
     plt.title(f"{metric} heatmap ({y_param} vs {x_param})")
     plt.tight_layout()
