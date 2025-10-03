@@ -5,7 +5,9 @@ import pytest
 
 from optimize.run import (
     DatasetSpec,
+    _dataset_total_volume,
     _filter_basic_factor_params,
+    _has_sufficient_volume,
     _group_datasets,
     _normalise_periods,
     _resolve_symbol_entry,
@@ -124,6 +126,32 @@ def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
         htf_timeframe=htf,
         source_symbol="BINANCE:TESTUSDT",
     )
+
+
+def test_dataset_total_volume_sums_numeric_values():
+    dataset = _make_dataset("1m", None)
+
+    total = _dataset_total_volume(dataset)
+
+    assert total == pytest.approx(33.0)
+
+
+def test_dataset_total_volume_handles_missing_volume_column():
+    dataset = _make_dataset("1m", None)
+    dataset.df = dataset.df.drop(columns=["volume"])
+
+    total = _dataset_total_volume(dataset)
+
+    assert total == 0.0
+
+
+def test_has_sufficient_volume_detects_shortfall():
+    dataset = _make_dataset("1m", None)
+
+    meets, total = _has_sufficient_volume(dataset, 100.0)
+
+    assert meets is False
+    assert total == pytest.approx(33.0)
 
 
 def test_select_datasets_respects_timeframe_and_htf_choice():

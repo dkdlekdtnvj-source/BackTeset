@@ -118,6 +118,7 @@ DEFAULT_REPORT_ROOT = Path("reports")
 STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
 PF_ANOMALY_THRESHOLD = 100.0
+MIN_VOLUME_THRESHOLD = 100.0
 TRIAL_PROGRESS_FIELDS = [
     "number",
     "state",
@@ -674,6 +675,26 @@ class DatasetSpec:
             "to": self.end,
             "htf_timeframe": self.htf_timeframe or "",
         }
+
+
+def _dataset_total_volume(dataset: "DatasetSpec") -> float:
+    """Return a finite total volume for the given dataset."""
+
+    if dataset.df is None or "volume" not in dataset.df.columns:
+        return 0.0
+
+    volume_series = pd.to_numeric(dataset.df["volume"], errors="coerce")
+    total = float(np.nansum(volume_series.to_numpy(dtype=float)))
+    if not np.isfinite(total):
+        return 0.0
+    return total
+
+
+def _has_sufficient_volume(dataset: "DatasetSpec", threshold: float) -> Tuple[bool, float]:
+    """Return whether the dataset meets the minimum volume requirement."""
+
+    total = _dataset_total_volume(dataset)
+    return total >= threshold, total
 
 
 def _normalise_timeframe_value(value: Optional[object]) -> Optional[str]:
@@ -1757,6 +1778,22 @@ def optimisation_loop(
                 return None
             return int(round(numeric))
 
+        def _resolve_min_volume_threshold() -> float:
+            candidates: List[object] = [
+                params.get("min_volume"),
+                params.get("minVolume"),
+            ]
+            if isinstance(risk, dict):
+                candidates.extend([risk.get("min_volume"), risk.get("minVolume")])
+            candidates.append(constraints_cfg.get("min_volume"))
+
+            for candidate in candidates:
+                numeric = _safe_float(candidate)
+                if numeric is None or numeric < 0:
+                    continue
+                return float(numeric)
+            return MIN_VOLUME_THRESHOLD
+
         def _sanitise(value: float, stage: str) -> float:
             try:
                 numeric = float(value)
@@ -1855,6 +1892,42 @@ def optimisation_loop(
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
                 raise optuna.TrialPruned()
+
+        min_volume_threshold = _resolve_min_volume_threshold()
+        eligible_datasets: List[DatasetSpec] = []
+        for dataset in selected_datasets:
+            meets_volume, total_volume = _has_sufficient_volume(dataset, min_volume_threshold)
+            if meets_volume:
+                eligible_datasets.append(dataset)
+                continue
+
+            dataset_entry: Dict[str, object] = {
+                "name": dataset.name,
+                "meta": dataset.meta,
+                "metrics": {},
+                "skipped": True,
+                "skip_reason": "volume_threshold",
+                "skip_metric": total_volume,
+                "skip_threshold": min_volume_threshold,
+            }
+            dataset_metrics.append(dataset_entry)
+            skipped_dataset_records.append(
+                {
+                    "name": dataset.name,
+                    "timeframe": dataset.timeframe,
+                    "htf_timeframe": dataset.htf_timeframe,
+                    "total_volume": total_volume,
+                    "min_volume": min_volume_threshold,
+                }
+            )
+            LOGGER.warning(
+                "데이터셋 %s 의 총 거래량 %.2f 이 최소 요구치 %.2f 미만이라 제외합니다.",
+                dataset.name,
+                total_volume,
+                min_volume_threshold,
+            )
+
+        selected_datasets = eligible_datasets
 
         parallel_enabled = dataset_jobs > 1 and len(selected_datasets) > 1
         if parallel_enabled:
