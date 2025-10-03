@@ -12,16 +12,16 @@
 
 1. 데이터베이스 준비 (예: PostgreSQL)
    ```bash
-   createdb pine_optuna
-   psql pine_optuna -c "CREATE USER pine_optuna WITH PASSWORD 'pine_optuna';"
-   psql pine_optuna -c "GRANT ALL PRIVILEGES ON DATABASE pine_optuna TO pine_optuna;"
+   createdb optuna
+   psql optuna -c "ALTER USER postgres WITH PASSWORD '5432';"
    ```
 2. 접속 URL을 환경 변수로 등록합니다.
    ```bash
-   export OPTUNA_STORAGE_URL="postgresql+psycopg://pine_optuna:pine_optuna@localhost:5432/pine_optuna"
+   export OPTUNA_STORAGE="postgresql://postgres:5432@127.0.0.1:5432/optuna"
    ```
-3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE_URL`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`, `storage_connect_timeout`, `storage_statement_timeout_ms`, `storage_isolation_level` 항목으로 PostgreSQL 풀과 타임아웃 정책을 조절할 수 있습니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>_<htf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql+psycopg://...` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
-4. 동일한 스터디 이름(`search.study_name` 또는 CLI `--study-name`)을 공유하는 여러 프로세스를 실행하면 Optuna가 트라이얼 분배를 조율합니다.
+3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`, `storage_connect_timeout`, `storage_statement_timeout_ms`, `storage_isolation_level` 항목으로 PostgreSQL 풀과 타임아웃 정책을 조절할 수 있습니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>_<htf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql://postgres:5432@127.0.0.1:5432/optuna` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
+4. 심볼/타임프레임/필터를 차례대로 고르고 싶다면 리포지토리 루트에서 `./시작` 명령을 실행하세요. 내부적으로 `python -m optimize.run --interactive`를 호출하므로 동일한 플래그를 그대로 전달할 수 있습니다.
+5. 동일한 스터디 이름(`search.study_name` 또는 CLI `--study-name`)을 공유하는 여러 프로세스를 실행하면 Optuna가 트라이얼 분배를 조율합니다.
 
 ## 2. 타임프레임 조합 × 1,000회 실행 전략
 

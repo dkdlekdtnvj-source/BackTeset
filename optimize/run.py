@@ -52,7 +52,7 @@ from optimize.search_spaces import build_space, grid_choices, mutate_around, sam
 from optimize.strategy_model import run_backtest
 from optimize.wf import run_purged_kfold, run_walk_forward
 from optimize.regime import detect_regime_label, summarise_regime_performance
-from optimize.llm import generate_llm_candidates
+from optimize.llm import LLMSuggestions, generate_llm_candidates
 from optuna.exceptions import StorageInternalError
 from tenacity import (
     retry,
@@ -127,8 +127,14 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 CPU_COUNT = os.cpu_count() or 4
-DEFAULT_DATASET_JOBS = max(1, CPU_COUNT // 2)
-DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT // 2)
+DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT)
+DEFAULT_DATASET_JOBS = max(1, CPU_COUNT)
+SQLITE_SAFE_OPTUNA_JOBS = max(1, CPU_COUNT // 2)
+SQLITE_SAFE_DATASET_JOBS = max(1, CPU_COUNT // 2)
+DEFAULT_STORAGE_ENV_KEY = "OPTUNA_STORAGE"
+DEFAULT_POSTGRES_STORAGE_URL = (
+    "postgresql://postgres:5432@127.0.0.1:5432/optuna"
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
@@ -2825,12 +2831,14 @@ def optimisation_loop(
     llm_count = int(llm_cfg.get("count", 0)) if use_llm else 0
     llm_initial = int(llm_cfg.get("initial_trials", max(10, n_trials // 2))) if use_llm else 0
     llm_initial = max(0, min(llm_initial, n_trials))
+    llm_insights: List[str] = []
 
     try:
         if use_llm and llm_count > 0 and 0 < llm_initial < n_trials:
             _run_optuna(llm_initial)
-            candidates = generate_llm_candidates(space, study.trials, llm_cfg)
-            for candidate in candidates[:llm_count]:
+            llm_bundle: LLMSuggestions = generate_llm_candidates(space, study.trials, llm_cfg)
+            llm_insights = list(llm_bundle.insights)
+            for candidate in llm_bundle.candidates[:llm_count]:
                 trial_params = _filter_basic_factor_params(
                     dict(candidate), enabled=use_basic_factors
                 )
@@ -2884,6 +2892,7 @@ def optimisation_loop(
         "multi_objective": multi_objective,
         "storage": storage_meta,
         "basic_factor_profile": use_basic_factors,
+        "llm_insights": llm_insights,
     }
 
 
@@ -2940,6 +2949,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="기본 팩터 필터를 강제로 활성화합니다",
     )
+    parser.add_argument(
+        "--llm",
+        dest="llm",
+        action="store_true",
+        help="Gemini 기반 LLM 후보 제안과 전략 인사이트를 활성화합니다",
+    )
+    parser.add_argument(
+        "--no-llm",
+        dest="llm",
+        action="store_false",
+        help="Gemini 기반 제안을 비활성화합니다",
+    )
+    parser.set_defaults(llm=None)
     parser.add_argument("--interactive", action="store_true", help="Prompt for dataset and toggle selections")
     parser.add_argument("--enable", action="append", default=[], help="Force-enable boolean parameters (comma separated)")
     parser.add_argument("--disable", action="append", default=[], help="Force-disable boolean parameters (comma separated)")
@@ -3037,8 +3059,7 @@ def _execute_single(
         return any(token == flag or token.startswith(f"{flag}=") for token in cli_tokens)
 
     search_cfg = _ensure_dict(params_cfg, "search")
-    search_cfg.setdefault("n_jobs", DEFAULT_OPTUNA_JOBS)
-    search_cfg.setdefault("dataset_jobs", DEFAULT_DATASET_JOBS)
+
     search_cfg.setdefault("dataset_executor", "process")
     search_cfg.setdefault("allow_sqlite_parallel", False)
 
@@ -3239,6 +3260,25 @@ def _execute_single(
             if decision is not None:
                 forced_params[name] = decision
 
+    llm_cfg = _ensure_dict(params_cfg, "llm")
+    if args.llm is not None:
+        llm_cfg["enabled"] = bool(args.llm)
+    elif args.interactive:
+        llm_default = _coerce_bool_or_none(llm_cfg.get("enabled"))
+        llm_choice = _prompt_bool(
+            "Gemini 후보/전략 인사이트를 사용할까요?", llm_default
+        )
+        if llm_choice is not None:
+            llm_cfg["enabled"] = llm_choice
+
+    if llm_cfg.get("enabled"):
+        api_key_env = str(llm_cfg.get("api_key_env", "GEMINI_API_KEY"))
+        if not llm_cfg.get("api_key") and not os.environ.get(api_key_env):
+            LOGGER.warning(
+                "Gemini 활성화 상태지만 API 키가 설정되지 않았습니다. %s 환경 변수를 확인하세요.",
+                api_key_env,
+            )
+
     def _resolve_simple_metrics_flag() -> bool:
         for candidate in (
             forced_params.get("simpleMetricsOnly"),
@@ -3352,6 +3392,35 @@ def _execute_single(
     study_storage = _resolve_study_storage(params_cfg, datasets)
     _apply_study_registry_defaults(search_cfg, study_storage)
 
+    storage_env_key = str(search_cfg.get("storage_url_env") or DEFAULT_STORAGE_ENV_KEY)
+    if not storage_env_key:
+        storage_env_key = DEFAULT_STORAGE_ENV_KEY
+    search_cfg["storage_url_env"] = storage_env_key
+
+    if not search_cfg.get("storage_url"):
+        search_cfg["storage_url"] = DEFAULT_POSTGRES_STORAGE_URL
+
+    storage_env_value = os.getenv(storage_env_key) if storage_env_key else None
+    effective_storage_url = str(
+        storage_env_value or search_cfg.get("storage_url") or ""
+    )
+    using_sqlite = effective_storage_url.startswith("sqlite:///")
+
+    default_optuna_jobs = (
+        SQLITE_SAFE_OPTUNA_JOBS if using_sqlite else DEFAULT_OPTUNA_JOBS
+    )
+    default_dataset_jobs = (
+        SQLITE_SAFE_DATASET_JOBS if using_sqlite else DEFAULT_DATASET_JOBS
+    )
+
+    if not search_cfg.get("n_jobs"):
+        search_cfg["n_jobs"] = default_optuna_jobs
+    if not search_cfg.get("dataset_jobs"):
+        search_cfg["dataset_jobs"] = default_dataset_jobs
+
+    if using_sqlite and not search_cfg.get("allow_sqlite_parallel"):
+        search_cfg.setdefault("force_sqlite_serial", True)
+
     trials_log_dir = output_dir / "trials"
 
     optimisation = optimisation_loop(
@@ -3366,6 +3435,23 @@ def _execute_single(
         seed_trials=seed_trials,
         log_dir=trials_log_dir,
     )
+
+    llm_insights_logged: List[str] = []
+    raw_llm_insights = optimisation.get("llm_insights")
+    if isinstance(raw_llm_insights, (list, tuple)):
+        llm_insights_logged = [str(item) for item in raw_llm_insights if str(item).strip()]
+    if llm_insights_logged:
+        logs_dir = output_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        insight_file = logs_dir / "gemini_insights.md"
+        timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S %Z")
+        with insight_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"## {timestamp}\n")
+            for insight in llm_insights_logged:
+                handle.write(f"- {insight}\n")
+            handle.write("\n")
+        for insight in llm_insights_logged:
+            LOGGER.info("[Gemini Insight] %s", insight)
 
     study = optimisation.get("study")
     if study is not None:
@@ -3748,8 +3834,24 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Entry point for ``python -m optimize.run``."""
 
-    args = parse_args(argv)
-    execute(args, argv)
+    if argv is None:
+        original_argv: List[str] = list(sys.argv[1:])
+    else:
+        original_argv = list(argv)
+
+    parsed_argv = list(original_argv)
+    replaced_interactive = False
+    for index, token in enumerate(parsed_argv):
+        if token == "시작":
+            parsed_argv[index] = "--interactive"
+            replaced_interactive = True
+            break
+
+    if replaced_interactive and "--interactive" not in parsed_argv:
+        parsed_argv.append("--interactive")
+
+    args = parse_args(parsed_argv)
+    execute(args, original_argv)
 
 
 if __name__ == "__main__":

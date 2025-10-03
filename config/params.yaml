@@ -5,12 +5,10 @@ search:
   n_trials: 1000
   seed: 42
   top_k: 5
-  n_jobs: 4
-  dataset_jobs: 2
   dataset_executor: process
   allow_sqlite_parallel: false   # true=병렬 허용을 명시, false=병렬 유지하되 잠금 충돌 시 자동 재시도(경고 출력)
-  # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
-  storage_url_env: OPTUNA_STORAGE_URL   # 외부 RDB URL을 환경변수로 전달하면 SQLite 대신 사용합니다.
+  # 기본 병렬: 스토리지 타입에 맞춰 run.py에서 CPU 코어 수 기반으로 자동 설정됩니다.
+  storage_url_env: OPTUNA_STORAGE   # 외부 RDB URL을 환경변수로 전달하면 SQLite 대신 사용합니다.
   storage_pool_size: 8                  # PostgreSQL 풀 커넥션 수 (기본 8)
   storage_max_overflow: 16              # 풀 초과 시 임시 커넥션 수
   storage_pool_timeout: 30              # 풀에서 커넥션을 기다리는 최대 초 (0=무제한)
@@ -95,7 +93,7 @@ risk:
 # tuning the internal reasoning cost (0 disables thinking; higher values allow
 # deeper reasoning but increase latency/cost).
 llm:
-  enabled: false
+  enabled: true
   api_key_env: GEMINI_API_KEY
   model: gemini-2.5-flash-preview-04-17
   top_n: 10
