@@ -76,6 +76,7 @@ pip install -r requirements.txt
    - `--top-k 10` to re-rank the best Optuna trials by walk-forward out-of-sample
      performance.
    - `--storage-url-env OPTUNA_STORAGE_URL` 로 YAML 설정 없이도 Optuna 스토리지 환경 변수를 바꿔 외부 RDB를 가리킬 수 있습니다.
+  - 실행이 한 번 끝나면 `studies/<심볼>_<ltf>_<htf>/storage.json` 파일에 사용된 스토리지 백엔드가 기록됩니다. 이후에는 YAML에 따로 URL을 넣지 않아도 동일한 심볼/타임프레임 조합으로 실행할 때 자동으로 PostgreSQL 설정을 불러옵니다.
 
   Outputs are written to `reports/` (`results.csv`, `results_datasets.csv`,
   `results_timeframe_summary.csv`, `results_timeframe_rankings.csv`, `best.json`,
@@ -153,6 +154,7 @@ python -m optimize.run --params config/params.yaml --backtest config/backtest.ya
 
 - `config/params.yaml` 의 `search.study_name` 으로 스터디 이름을 고정하면 여러 프로세스가 같은 스터디를 공유할 수 있습니다. 이름을 지정하지 않으면 자동으로 `심볼_LTF_HTF_해시` 형태가 생성돼 배치 실행 시 충돌을 방지합니다.
 - `search.storage_url_env`(기본값 `OPTUNA_STORAGE_URL`), CLI `--storage-url-env`, `--storage-url` 로 RDB 접속 정보를 지정하면 Optuna가 프로세스/노드 병렬을 지원합니다. 환경 변수가 없으면 자동으로 `studies/` 아래 SQLite 파일을 사용합니다.
+- 스터디를 처음 생성하면 `studies/<slug>/storage.json` 포인터가 같이 생성됩니다. 여기에는 최근 실행 시 사용된 스토리지 URL(비밀번호는 마스킹), 환경 변수 이름, 풀 설정이 기록되며, 다음 실행에서 `search.storage_url`/`storage_url_env` 값이 비어 있을 경우 자동으로 재사용됩니다.
 - CLI `--study-name`/`--storage-url` 플래그는 YAML 설정을 일시적으로 덮어쓰는 용도로 사용할 수 있습니다.
 - `--timeframe-grid` 를 사용하면 여러 타임프레임 조합을 한 번에 실행하면서 각 조합마다 독립된 리포트/스터디가 생성되며, 필요 시 `--study-template`, `--run-tag-template` 로 이름 규칙을 조정할 수 있습니다.
 - 기본 프로필은 다목표(`NetProfit`, `Sortino`, `ProfitFactor`, `MaxDD`) 최적화를 활성화하고 Optuna NSGA-II 샘플러(population 120, crossover 0.9)를 자동 선택합니다. 파라미터는 `search.nsga_params` 로 세부 조정 가능합니다.

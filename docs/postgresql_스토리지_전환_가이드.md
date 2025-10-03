@@ -46,6 +46,7 @@ psql postgresql://optuna:optuna@localhost:5432/optuna -c "SELECT current_databas
    - `search.storage_connect_timeout`: DB 연결 시도 제한(초). 네트워크 지연이 긴 환경이면 값을 늘리세요.
    - `search.storage_statement_timeout_ms`: PostgreSQL의 `statement_timeout`을 밀리초 단위로 지정합니다. 기본 300000(5분)이며, 장기 실행이 필요하면 0으로 비워 비활성화할 수 있습니다.
    - `search.storage_isolation_level`: Optuna 트랜잭션 격리 수준. 기본은 `READ COMMITTED`로 설정되어 있습니다.
+   - 실행 후에는 `studies/<slug>/storage.json` 파일이 생성되어 마지막 실행에서 사용한 URL/환경 변수 이름이 기록됩니다. 같은 심볼/타임프레임 조합으로 다시 실행할 때 YAML에서 스토리지 항목이 비어 있으면 이 포인터를 자동으로 읽어옵니다.
 
 환경 변수를 비워 두면 코드가 자동으로 SQLite(`studies/<이름>.db`)로 되돌아갑니다.
 
