@@ -103,6 +103,49 @@ def test_aggregate_metrics_no_losses_is_finite():
     assert math.isfinite(metrics["Sharpe"])
 
 
+def test_aggregate_metrics_micro_loss_flagged():
+    trades = [
+        Trade(
+            pd.Timestamp("2023-01-01"),
+            pd.Timestamp("2023-01-02"),
+            "long",
+            1.0,
+            100,
+            102,
+            0.02,
+            0.02,
+            0.03,
+            -0.01,
+            3,
+        ),
+        Trade(
+            pd.Timestamp("2023-01-05"),
+            pd.Timestamp("2023-01-06"),
+            "short",
+            1.0,
+            110,
+            109.95,
+            -0.0005,
+            -0.0005,
+            0.0,
+            -0.0005,
+            2,
+        ),
+    ]
+    returns = pd.Series([0.02, -0.0005], index=pd.date_range("2023-01-01", periods=2, freq="D"))
+
+    metrics = aggregate_metrics(trades, returns)
+
+    assert metrics["ProfitFactor"] == pytest.approx(0.0)
+    assert metrics.get("LosslessProfitFactor") is True
+
+    flags = metrics.get("AnomalyFlags") or []
+    if isinstance(flags, str):
+        flags = [token.strip() for token in flags.split(",") if token.strip()]
+
+    assert "micro_loss_profit_factor" in flags
+
+
 def test_run_backtest_deterministic():
     data = pd.read_csv("tests/tests_data/sample_ohlcv.csv", parse_dates=["timestamp"], index_col="timestamp")
     params = _base_params(oscLen=10, signalLen=3)
