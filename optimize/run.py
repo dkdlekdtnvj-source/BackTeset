@@ -350,11 +350,153 @@ def _build_run_tag(
     return timestamp, symbol_slug, timeframe_slug, "_".join(filter(None, parts))
 
 
+def _coerce_min_trades_value(value: object) -> Optional[int]:
+    """Convert ``value`` to a non-negative integer if possible."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"nan", "none", "null", "na"}:
+            return None
+        value = text
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(numeric):
+        return None
+
+    return max(0, int(round(numeric)))
+
+
+def _timeframe_lookup_keys(timeframe: Optional[str], htf: Optional[str]) -> List[str]:
+    """Return candidate keys for matching timeframe-specific constraints."""
+
+    keys: List[str] = []
+
+    def _normalise(token: str) -> List[str]:
+        variants = [token]
+        variants.append(token.lower())
+        variants.append(token.upper())
+        compact = token.replace("/", "").replace(" ", "")
+        if compact and compact not in variants:
+            variants.append(compact)
+            variants.append(compact.lower())
+            variants.append(compact.upper())
+        return list(dict.fromkeys(variants))
+
+    if timeframe:
+        keys.extend(_normalise(timeframe))
+
+    if timeframe and htf:
+        keys.extend(_normalise(f"{timeframe}@{htf}"))
+
+    return list(dict.fromkeys(keys))
+
+
+def _extract_min_trades_from_mapping(entry: object) -> Optional[int]:
+    """Extract ``min_trades`` requirement from an arbitrary mapping entry."""
+
+    if entry is None:
+        return None
+
+    if isinstance(entry, (int, float, str)):
+        return _coerce_min_trades_value(entry)
+
+    if not isinstance(entry, dict):
+        return None
+
+    priority_keys = [
+        "min_trades_test",
+        "minTradesTest",
+        "min_trades",
+        "minTrades",
+        "oos",
+        "OOS",
+        "test",
+        "Test",
+        "value",
+        "Value",
+        "default",
+        "Default",
+    ]
+
+    for key in priority_keys:
+        if key not in entry:
+            continue
+        candidate = entry[key]
+        if isinstance(candidate, dict):
+            resolved = _extract_min_trades_from_mapping(candidate)
+        else:
+            resolved = _coerce_min_trades_value(candidate)
+        if resolved is not None:
+            return resolved
+
+    # Fallback: inspect nested mappings for a usable value.
+    for candidate in entry.values():
+        resolved = _extract_min_trades_from_mapping(candidate)
+        if resolved is not None:
+            return resolved
+
+    return None
+
+
+def _resolve_dataset_min_trades(
+    dataset: "DatasetSpec",
+    *,
+    constraints: Optional[Dict[str, object]] = None,
+    risk: Optional[Dict[str, object]] = None,
+    explicit: Optional[object] = None,
+) -> Optional[int]:
+    """Resolve the minimum trade requirement for a dataset."""
+
+    constraints = constraints or {}
+    candidates: List[Optional[int]] = []
+
+    candidates.append(_coerce_min_trades_value(explicit))
+
+    lookup_keys = _timeframe_lookup_keys(dataset.timeframe, dataset.htf_timeframe)
+    timeframe_rule_keys = [
+        "timeframes",
+        "per_timeframe",
+        "perTimeframe",
+        "timeframe_rules",
+        "timeframeRules",
+        "min_trades_by_timeframe",
+        "minTradesByTimeframe",
+    ]
+
+    for container_key in timeframe_rule_keys:
+        rules = constraints.get(container_key)
+        if not isinstance(rules, dict):
+            continue
+        for key in lookup_keys:
+            if key in rules:
+                candidates.append(_extract_min_trades_from_mapping(rules[key]))
+                break
+
+    candidates.append(_coerce_min_trades_value(constraints.get("min_trades_test")))
+
+    if isinstance(risk, dict):
+        candidates.append(_coerce_min_trades_value(risk.get("min_trades")))
+
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate
+
+    return None
+
+
 def _run_dataset_backtest_task(
     dataset: "DatasetSpec",
     params: Dict[str, object],
     fees: Dict[str, float],
     risk: Dict[str, float],
+    min_trades: Optional[int] = None,
 ) -> Dict[str, float]:
     """Execute ``run_backtest`` for a single dataset.
 
@@ -362,7 +504,14 @@ def _run_dataset_backtest_task(
     is used for parallel evaluation.
     """
 
-    return run_backtest(dataset.df, params, fees, risk, htf_df=dataset.htf)
+    return run_backtest(
+        dataset.df,
+        params,
+        fees,
+        risk,
+        htf_df=dataset.htf,
+        min_trades=min_trades,
+    )
 
 
 def _resolve_output_directory(
@@ -2043,6 +2192,11 @@ def optimisation_loop(
             futures = []
             with executor_cls(**executor_kwargs) as executor:
                 for dataset in selected_datasets:
+                    min_trades_requirement = _resolve_dataset_min_trades(
+                        dataset,
+                        constraints=constraints_cfg,
+                        risk=risk,
+                    )
                     futures.append(
                         executor.submit(
                             _run_dataset_backtest_task,
@@ -2050,6 +2204,7 @@ def optimisation_loop(
                             params,
                             fees,
                             risk,
+                            min_trades_requirement,
                         )
                     )
 
@@ -2077,7 +2232,19 @@ def optimisation_loop(
         else:
             for idx, dataset in enumerate(selected_datasets, start=1):
                 try:
-                    metrics = run_backtest(dataset.df, params, fees, risk, htf_df=dataset.htf)
+                    min_trades_requirement = _resolve_dataset_min_trades(
+                        dataset,
+                        constraints=constraints_cfg,
+                        risk=risk,
+                    )
+                    metrics = run_backtest(
+                        dataset.df,
+                        params,
+                        fees,
+                        risk,
+                        htf_df=dataset.htf,
+                        min_trades=min_trades_requirement,
+                    )
                 except Exception:
                     LOGGER.exception(
                         "백테스트 실행 중 오류 발생 (dataset=%s, timeframe=%s, htf=%s)",
@@ -2733,6 +2900,18 @@ def _execute_single(
     best_key, best_group = _resolve_record_dataset(best_record)
     primary_dataset = _pick_primary_dataset(best_group)
 
+    wf_min_trades_override = _coerce_min_trades_value(walk_cfg.get("min_trades"))
+
+    def _min_trades_for_dataset(dataset: DatasetSpec) -> Optional[int]:
+        return _resolve_dataset_min_trades(
+            dataset,
+            constraints=constraints_cfg,
+            risk=risk,
+            explicit=wf_min_trades_override,
+        )
+
+    primary_min_trades = _min_trades_for_dataset(primary_dataset)
+
     wf_summary = run_walk_forward(
         primary_dataset.df,
         best_record["params"],
@@ -2742,6 +2921,7 @@ def _execute_single(
         test_bars=int(walk_cfg.get("test_bars", 2000)),
         step=int(walk_cfg.get("step", 2000)),
         htf_df=primary_dataset.htf,
+        min_trades=primary_min_trades,
     )
 
     cv_summary = None
@@ -2758,6 +2938,7 @@ def _execute_single(
             k=cv_k,
             embargo=cv_embargo,
             htf_df=primary_dataset.htf,
+            min_trades=primary_min_trades,
         )
         wf_summary["purged_kfold"] = cv_summary
         cv_manifest = {"type": "purged-kfold", "k": cv_k, "embargo": cv_embargo}
@@ -2797,6 +2978,8 @@ def _execute_single(
                 continue
             candidate_key, candidate_group = _resolve_record_dataset(record)
             candidate_dataset = _pick_primary_dataset(candidate_group)
+            candidate_min_trades = _min_trades_for_dataset(candidate_dataset)
+
             candidate_wf = run_walk_forward(
                 candidate_dataset.df,
                 record["params"],
@@ -2806,6 +2989,7 @@ def _execute_single(
                 test_bars=int(walk_cfg.get("test_bars", 2000)),
                 step=int(walk_cfg.get("step", 2000)),
                 htf_df=candidate_dataset.htf,
+                min_trades=candidate_min_trades,
             )
             wf_cache[record["trial"]] = candidate_wf
             candidate_summaries.append(

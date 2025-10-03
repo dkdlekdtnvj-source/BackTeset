@@ -61,7 +61,8 @@ def test_aggregate_metrics_basic():
     assert metrics["NetProfit"] != 0
     assert metrics["Trades"] == pytest.approx(2.0)
     assert metrics["WinRate"] == 1.0
-    assert metrics["ProfitFactor"] > 0
+    assert metrics["ProfitFactor"] >= 0
+    assert metrics.get("LosslessProfitFactor")
     assert "WeeklyNetProfit" in metrics
     assert "Expectancy" in metrics
 
@@ -123,6 +124,11 @@ def test_run_backtest_deterministic():
     assert first["Trades"] == second["Trades"]
     assert first["NetProfit"] == second["NetProfit"]
     assert first["Valid"] == second["Valid"]
+
+    strict = run_backtest(data, params, fees, risk, min_trades=5)
+    assert strict["Trades"] == first["Trades"]
+    assert strict["MinTrades"] == pytest.approx(5.0)
+    assert not strict["Valid"]
 
 
 def test_run_backtest_injects_penalty_settings():
