@@ -17,6 +17,7 @@ from optimize.metrics import (
     evaluate_objective_values,
     max_drawdown,
     normalise_objectives,
+    profit_factor,
     score_metrics,
 )
 from optimize.run import combine_metrics
@@ -65,6 +66,19 @@ def test_aggregate_metrics_basic():
     assert metrics.get("LosslessProfitFactor")
     assert "WeeklyNetProfit" in metrics
     assert "Expectancy" in metrics
+
+
+def test_profit_factor_supports_generators():
+    trades = [
+        Trade(pd.Timestamp("2023-01-01"), pd.Timestamp("2023-01-02"), "long", 1.0, 100, 101, 2.0, 0.02, 0.03, -0.01, 5),
+        Trade(pd.Timestamp("2023-01-03"), pd.Timestamp("2023-01-04"), "short", 1.0, 105, 104, -1.0, -0.01, 0.02, -0.02, 4),
+        Trade(pd.Timestamp("2023-01-05"), pd.Timestamp("2023-01-06"), "long", 1.0, 102, 103, 1.5, 0.015, 0.01, -0.005, 3),
+    ]
+
+    generator = (trade for trade in trades)
+    expected = (2.0 + 1.5) / abs(-1.0)
+
+    assert profit_factor(generator) == pytest.approx(expected)
 
 
 def test_aggregate_metrics_no_losses_is_finite():

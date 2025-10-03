@@ -163,8 +163,16 @@ def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0) -> float:
 
 
 def profit_factor(trades: Iterable[Trade]) -> float:
-    gross_profit = sum(max(trade.profit, 0.0) for trade in trades)
-    gross_loss = sum(min(trade.profit, 0.0) for trade in trades)
+    gross_profit = 0.0
+    gross_loss = 0.0
+
+    for trade in trades:
+        profit = float(trade.profit)
+        if profit > 0:
+            gross_profit += profit
+        else:
+            gross_loss += profit
+
     denominator = max(abs(gross_loss), EPS)
     return float(gross_profit / denominator)
 
