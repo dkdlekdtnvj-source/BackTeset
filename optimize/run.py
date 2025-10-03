@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -150,6 +151,9 @@ TRIAL_PROGRESS_FIELDS = [
     "skipped_datasets",
     "datetime_complete",
 ]
+
+
+TRIAL_LOG_WRITE_LOCK = Lock()
 
 
 def _make_sqlite_storage(
@@ -1679,6 +1683,15 @@ def optimisation_loop(
         basic_profile_flag = _coerce_bool_or_none(search_cfg.get("use_basic_factors"))
     use_basic_factors = True if basic_profile_flag is None else basic_profile_flag
 
+    allow_sqlite_parallel_flag = _coerce_bool_or_none(
+        search_cfg.get("allow_sqlite_parallel")
+    )
+    allow_sqlite_parallel = (
+        bool(allow_sqlite_parallel_flag)
+        if allow_sqlite_parallel_flag is not None
+        else False
+    )
+
     space = _restrict_to_basic_factors(original_space, enabled=use_basic_factors)
     if use_basic_factors:
         if len(space) != len(original_space):
@@ -1709,11 +1722,16 @@ def optimisation_loop(
     except (TypeError, ValueError):
         LOGGER.warning("search.n_jobs 값 '%s' 을 해석할 수 없어 1로 대체합니다.", raw_n_jobs)
         n_jobs = 1
+    force_sqlite_serial = bool(search_cfg.get("force_sqlite_serial"))
+    if force_sqlite_serial and n_jobs != 1:
+        LOGGER.info("SQLite 직렬 강제 옵션으로 Optuna worker %d→1개 조정", n_jobs)
+        n_jobs = 1
+        search_cfg["n_jobs"] = n_jobs
     if n_trials := int(search_cfg.get("n_trials", 0) or 0):
         auto_jobs = max(1, min(available_cpu, n_trials))
     else:
         auto_jobs = max(1, available_cpu)
-    if n_jobs <= 1 and auto_jobs > n_jobs:
+    if not force_sqlite_serial and n_jobs <= 1 and auto_jobs > n_jobs:
         n_jobs = auto_jobs
         search_cfg["n_jobs"] = n_jobs
         LOGGER.info("기본 팩터 프로파일: Optuna worker %d개 자동 할당", n_jobs)
@@ -1893,6 +1911,7 @@ def optimisation_loop(
             )
             storage_meta["backend"] = "sqlite"
             storage_meta["url"] = storage_url
+            storage_meta["allow_parallel"] = allow_sqlite_parallel
             try:
                 storage_path = make_url(storage_url).database
             except Exception:
@@ -1902,13 +1921,17 @@ def optimisation_loop(
             elif study_storage is not None:
                 storage_meta["path"] = str(study_storage)
             if n_jobs > 1:
-                LOGGER.warning(
-                    "SQLite 스토리지는 동시에 쓰기를 지원하지 않아 Optuna n_jobs를 %d→1로 강제합니다.",
-                    n_jobs,
-                )
-                n_jobs = 1
-                search_cfg["n_jobs"] = n_jobs
-                LOGGER.info("SQLite 스토리지 사용: Optuna 병렬 worker를 1개로 제한합니다.")
+                if allow_sqlite_parallel:
+                    LOGGER.warning(
+                        "SQLite 병렬 허용 옵션이 활성화되었습니다. Optuna worker %d개를 유지하지만 잠금"
+                        " 충돌이 발생할 수 있습니다.",
+                        n_jobs,
+                    )
+                else:
+                    LOGGER.warning(
+                        "SQLite 스토리지에서 Optuna worker %d개를 병렬로 실행합니다. 잠금 충돌 시 자동 재시도로 복구를 시도하니 모니터링하세요.",
+                        n_jobs,
+                    )
         else:
             engine_kwargs = {"pool_pre_ping": True}
             storage = optuna.storages.RDBStorage(
@@ -1946,6 +1969,7 @@ def optimisation_loop(
             continue
 
     results: List[Dict[str, object]] = []
+    results_lock = Lock()
 
     def _to_native(value: object) -> object:
         if isinstance(value, np.generic):
@@ -1955,135 +1979,137 @@ def optimisation_loop(
     def _log_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if trial_log_path is None:
             return
-        trial_log_path.parent.mkdir(parents=True, exist_ok=True)
-        def _normalise_value(value: object) -> Optional[object]:
-            if value is None:
-                return None
-            if isinstance(value, AbcSequence) and not isinstance(value, (str, bytes, bytearray)):
-                normalised: List[float] = []
-                for item in value:
-                    try:
-                        normalised.append(float(item))
-                    except Exception:
-                        return None
-                return normalised
-            try:
-                return float(value)
-            except Exception:
-                return None
 
-        trial_value = _normalise_value(trial.value)
-        record = {
-            "number": trial.number,
-            "value": trial_value,
-            "state": str(trial.state),
-            "params": {key: _to_native(val) for key, val in trial.params.items()},
-            "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None,
-        }
-        with trial_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with TRIAL_LOG_WRITE_LOCK:
+            trial_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if trial_csv_path is not None:
-            metrics_attr = trial.user_attrs.get("metrics")
-            metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
-
-            def _metric_value(name: str) -> Optional[object]:
-                if name not in metrics:
+            def _normalise_value(value: object) -> Optional[object]:
+                if value is None:
                     return None
-                return _to_native(metrics.get(name))
+                if isinstance(value, AbcSequence) and not isinstance(value, (str, bytes, bytearray)):
+                    normalised: List[float] = []
+                    for item in value:
+                        try:
+                            normalised.append(float(item))
+                        except Exception:
+                            return None
+                    return normalised
+                try:
+                    return float(value)
+                except Exception:
+                    return None
 
-            dataset_key = trial.user_attrs.get("dataset_key")
-            dataset_meta = dataset_key if isinstance(dataset_key, dict) else {}
-            skipped_attr = trial.user_attrs.get("skipped_datasets")
-            if isinstance(skipped_attr, list):
-                skipped_serialisable = skipped_attr
-            else:
-                skipped_serialisable = [skipped_attr] if skipped_attr else []
-
-            max_dd_value = _metric_value("MaxDD")
-            if max_dd_value is None:
-                max_dd_value = _metric_value("MaxDrawdown")
-
-            value_field: object
-            if isinstance(trial_value, list):
-                value_field = json.dumps(trial_value, ensure_ascii=False)
-            else:
-                value_field = trial_value
-
-            params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
-            skipped_json = (
-                json.dumps(skipped_serialisable, ensure_ascii=False)
-                if skipped_serialisable
-                else ""
-            )
-
-            row = {
+            trial_value = _normalise_value(trial.value)
+            record = {
                 "number": trial.number,
+                "value": trial_value,
                 "state": str(trial.state),
-                "value": value_field,
-                "score": trial.user_attrs.get("score"),
-                "profit_factor": _metric_value("ProfitFactor"),
-                "trades": _metric_value("Trades"),
-                "win_rate": _metric_value("WinRate"),
-                "max_dd": max_dd_value,
-                "valid": trial.user_attrs.get("valid"),
-                "timeframe": dataset_meta.get("timeframe"),
-                "htf_timeframe": dataset_meta.get("htf_timeframe"),
-                "pruned": trial.user_attrs.get("pruned"),
-                "params": params_json,
-                "skipped_datasets": skipped_json,
-                "datetime_complete": record["datetime_complete"],
+                "params": {key: _to_native(val) for key, val in trial.params.items()},
+                "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None,
             }
+            with trial_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            file_exists = trial_csv_path.exists()
-            trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
-                writer = csv.DictWriter(csv_handle, fieldnames=TRIAL_PROGRESS_FIELDS)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(row)
+            if trial_csv_path is not None:
+                metrics_attr = trial.user_attrs.get("metrics")
+                metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
 
-        if best_yaml_path is None:
-            return
-        best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+                def _metric_value(name: str) -> Optional[object]:
+                    if name not in metrics:
+                        return None
+                    return _to_native(metrics.get(name))
 
-        selected_trial: Optional[optuna.trial.FrozenTrial]
-        if multi_objective:
-            try:
-                pareto_trials = list(study.best_trials)
-            except ValueError:
-                return
-            if not pareto_trials:
-                return
-            selected_trial = next(
-                (best_trial for best_trial in pareto_trials if best_trial.number == trial.number),
-                None,
-            )
-            if selected_trial is None:
-                return
-        else:
-            try:
-                selected_trial = study.best_trial
-            except ValueError:
-                return
-            if selected_trial.number != trial.number:
-                return
+                dataset_key = trial.user_attrs.get("dataset_key")
+                dataset_meta = dataset_key if isinstance(dataset_key, dict) else {}
+                skipped_attr = trial.user_attrs.get("skipped_datasets")
+                if isinstance(skipped_attr, list):
+                    skipped_serialisable = skipped_attr
+                else:
+                    skipped_serialisable = [skipped_attr] if skipped_attr else []
 
-        best_value = _normalise_value(selected_trial.value)
-        best_params_full = {key: _to_native(val) for key, val in selected_trial.params.items()}
-        snapshot = {
-            "best_value": best_value,
-            "best_params": best_params_full,
-        }
-        if use_basic_factors:
-            snapshot["basic_params"] = {
-                key: value for key, value in best_params_full.items() if key in BASIC_FACTOR_KEYS
+                max_dd_value = _metric_value("MaxDD")
+                if max_dd_value is None:
+                    max_dd_value = _metric_value("MaxDrawdown")
+
+                value_field: object
+                if isinstance(trial_value, list):
+                    value_field = json.dumps(trial_value, ensure_ascii=False)
+                else:
+                    value_field = trial_value
+
+                params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
+                skipped_json = (
+                    json.dumps(skipped_serialisable, ensure_ascii=False)
+                    if skipped_serialisable
+                    else ""
+                )
+
+                row = {
+                    "number": trial.number,
+                    "state": str(trial.state),
+                    "value": value_field,
+                    "score": trial.user_attrs.get("score"),
+                    "profit_factor": _metric_value("ProfitFactor"),
+                    "trades": _metric_value("Trades"),
+                    "win_rate": _metric_value("WinRate"),
+                    "max_dd": max_dd_value,
+                    "valid": trial.user_attrs.get("valid"),
+                    "timeframe": dataset_meta.get("timeframe"),
+                    "htf_timeframe": dataset_meta.get("htf_timeframe"),
+                    "pruned": trial.user_attrs.get("pruned"),
+                    "params": params_json,
+                    "skipped_datasets": skipped_json,
+                    "datetime_complete": record["datetime_complete"],
+                }
+
+                file_exists = trial_csv_path.exists()
+                trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
+                with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
+                    writer = csv.DictWriter(csv_handle, fieldnames=TRIAL_PROGRESS_FIELDS)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(row)
+
+            if best_yaml_path is None:
+                return
+            best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+
+            selected_trial: Optional[optuna.trial.FrozenTrial]
+            if multi_objective:
+                try:
+                    pareto_trials = list(study.best_trials)
+                except ValueError:
+                    return
+                if not pareto_trials:
+                    return
+                selected_trial = next(
+                    (best_trial for best_trial in pareto_trials if best_trial.number == trial.number),
+                    None,
+                )
+                if selected_trial is None:
+                    return
+            else:
+                try:
+                    selected_trial = study.best_trial
+                except ValueError:
+                    return
+                if selected_trial.number != trial.number:
+                    return
+
+            best_value = _normalise_value(selected_trial.value)
+            best_params_full = {key: _to_native(val) for key, val in selected_trial.params.items()}
+            snapshot = {
+                "best_value": best_value,
+                "best_params": best_params_full,
             }
-        else:
-            snapshot["basic_params"] = dict(best_params_full)
-        with best_yaml_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
-
+            if use_basic_factors:
+                snapshot["basic_params"] = {
+                    key: value for key, value in best_params_full.items() if key in BASIC_FACTOR_KEYS
+                }
+            else:
+                snapshot["basic_params"] = dict(best_params_full)
+            with best_yaml_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
     callbacks: List = []
     if trial_log_path is not None:
         callbacks.append(_log_trial)
@@ -2249,7 +2275,8 @@ def optimisation_loop(
                 }
                 if partial_objectives is not None:
                     pruned_record["objective_values"] = list(partial_objectives)
-                results.append(pruned_record)
+                with results_lock:
+                    results.append(pruned_record)
                 trial.set_user_attr("score", float(partial_score))
                 trial.set_user_attr("metrics", cleaned_partial)
                 trial.set_user_attr(
@@ -2443,7 +2470,8 @@ def optimisation_loop(
             record["anomaly"] = anomaly_info
         if objective_values is not None:
             record["objective_values"] = list(objective_values)
-        results.append(record)
+        with results_lock:
+            results.append(record)
         trial.set_user_attr("score", float(score))
         trial.set_user_attr("metrics", cleaned_aggregated)
         trial.set_user_attr(
@@ -2471,6 +2499,7 @@ def optimisation_loop(
             show_progress_bar=False,
             callbacks=callbacks,
             gc_after_trial=True,
+            catch=(sqlalchemy.exc.OperationalError, StorageInternalError),
         )
 
     use_llm = bool(llm_cfg.get("enabled"))
@@ -2637,6 +2666,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         help="Optuna 스토리지 URL을 읽어올 환경 변수 이름을 덮어씁니다",
     )
+    parser.add_argument(
+        "--allow-sqlite-parallel",
+        action="store_true",
+        help="SQLite 스토리지에서도 Optuna 병렬 worker를 유지합니다 (잠금 충돌 가능)",
+    )
+    parser.add_argument(
+        "--force-sqlite-serial",
+        action="store_true",
+        help="SQLite 스토리지 사용 시 Optuna worker를 1개로 강제합니다",
+    )
     parser.add_argument("--run-tag", type=str, help="Additional suffix for the output directory name")
     parser.add_argument(
         "--run-tag-template",
@@ -2682,6 +2721,7 @@ def _execute_single(
     search_cfg.setdefault("n_jobs", DEFAULT_OPTUNA_JOBS)
     search_cfg.setdefault("dataset_jobs", DEFAULT_DATASET_JOBS)
     search_cfg.setdefault("dataset_executor", "process")
+    search_cfg.setdefault("allow_sqlite_parallel", False)
 
     batch_ctx = getattr(args, "_batch_context", None)
     if batch_ctx:
@@ -2757,6 +2797,14 @@ def _execute_single(
 
     if args.storage_url_env:
         search_cfg["storage_url_env"] = args.storage_url_env
+
+    if getattr(args, "allow_sqlite_parallel", False):
+        search_cfg["allow_sqlite_parallel"] = True
+
+    if getattr(args, "force_sqlite_serial", False):
+        search_cfg["allow_sqlite_parallel"] = False
+        search_cfg["force_sqlite_serial"] = True
+        LOGGER.info("CLI --force-sqlite-serial 지정: Optuna worker를 1개로 강제합니다.")
 
     if args.pruner:
         search_cfg["pruner"] = args.pruner
