@@ -1,16 +1,22 @@
 from typing import Optional
 
+from typing import Dict
+
 import pandas as pd
 import pytest
 
 from optimize.run import (
     DatasetSpec,
+    _apply_study_registry_defaults,
     _dataset_total_volume,
     _filter_basic_factor_params,
     _has_sufficient_volume,
     _group_datasets,
     _normalise_periods,
+    _register_study_reference,
     _resolve_symbol_entry,
+    _sanitise_storage_meta,
+    _study_registry_dir,
     _restrict_to_basic_factors,
     _run_dataset_backtest_task,
     _select_datasets_for_params,
@@ -202,3 +208,38 @@ def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch)
 
     assert metrics["Valid"] is True
     assert sentinel["called"] is True
+
+
+def test_study_registry_round_trip_for_rdb(tmp_path):
+    study_path = tmp_path / "studies" / "demo.db"
+    storage_meta = {
+        "backend": "rdb",
+        "url": "postgresql+psycopg://user:secret@localhost:5432/optuna",
+        "env_key": "OPTUNA_STORAGE_URL",
+        "env_value_present": True,
+        "pool": {"size": 8},
+    }
+
+    _register_study_reference(study_path, storage_meta=storage_meta, study_name="demo")
+
+    pointer_path = _study_registry_dir(study_path) / "storage.json"
+    assert pointer_path.exists()
+
+    search_cfg: Dict[str, object] = {}
+    _apply_study_registry_defaults(search_cfg, study_path)
+
+    assert search_cfg["storage_url"] == storage_meta["url"]
+    assert search_cfg["storage_url_env"] == "OPTUNA_STORAGE_URL"
+
+
+def test_sanitise_storage_meta_masks_password():
+    raw = {
+        "backend": "rdb",
+        "url": "postgresql+psycopg://user:secret@localhost:5432/optuna",
+    }
+
+    masked = _sanitise_storage_meta(raw)
+
+    assert masked["url"].startswith("postgresql+psycopg://user:***@localhost")
+    # 원본 딕셔너리는 변경하지 않습니다.
+    assert raw["url"].endswith("/optuna")

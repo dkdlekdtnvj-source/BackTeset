@@ -360,6 +360,74 @@ def _utcnow_isoformat() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _register_study_reference(
+    study_storage: Optional[Path],
+    *,
+    storage_meta: Dict[str, object],
+    study_name: Optional[str] = None,
+) -> None:
+    """Persist study storage metadata for later reuse."""
+
+    if study_storage is None:
+        return
+
+    backend = str(storage_meta.get("backend") or "none").lower()
+    if backend in {"", "none"}:
+        return
+
+    registry_dir = _study_registry_dir(study_storage)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    pointer_path = registry_dir / "storage.json"
+
+    payload: Dict[str, object] = {
+        "updated_at": _utcnow_isoformat(),
+        "backend": backend,
+        "study_name": study_name,
+        "storage_url_env": storage_meta.get("env_key"),
+        "env_value_present": storage_meta.get("env_value_present"),
+    }
+
+    url_value = storage_meta.get("url")
+    if isinstance(url_value, str) and url_value:
+        payload["storage_url"] = url_value
+        try:
+            payload["storage_url_masked"] = make_url(url_value).render_as_string(
+                hide_password=True
+            )
+        except Exception:
+            payload["storage_url_masked"] = url_value
+
+    if backend == "sqlite":
+        payload["sqlite_path"] = storage_meta.get("path") or str(study_storage)
+        payload["allow_parallel"] = storage_meta.get("allow_parallel")
+    else:
+        pool_meta = storage_meta.get("pool")
+        if isinstance(pool_meta, dict) and pool_meta:
+            payload["pool"] = pool_meta
+        if storage_meta.get("connect_timeout") is not None:
+            payload["connect_timeout"] = storage_meta.get("connect_timeout")
+        if storage_meta.get("isolation_level"):
+            payload["isolation_level"] = storage_meta.get("isolation_level")
+        if storage_meta.get("statement_timeout_ms") is not None:
+            payload["statement_timeout_ms"] = storage_meta.get("statement_timeout_ms")
+
+    pointer_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def _sanitise_storage_meta(storage_meta: Dict[str, object]) -> Dict[str, object]:
+    if not storage_meta:
+        return {}
+
+    cleaned = copy.deepcopy(storage_meta)
+    url_value = cleaned.get("url")
+    if isinstance(url_value, str) and url_value:
+        try:
+            cleaned["url"] = make_url(url_value).render_as_string(hide_password=True)
+        except Exception:
+            cleaned["url"] = "***invalid-url***"
+    return cleaned
+
+
 def _slugify_symbol(symbol: str) -> str:
     text = symbol.split(":")[-1]
     return text.replace("/", "").replace(" ", "")
@@ -786,6 +854,69 @@ def _resolve_study_storage(
     )
     htf_slug = str(htf or "nohtf").replace("/", "_")
     return STUDY_ROOT / f"{symbol_slug}_{timeframe_slug}_{htf_slug}.db"
+
+
+def _study_registry_dir(storage_path: Path) -> Path:
+    """Return the directory that holds study registry metadata."""
+
+    if storage_path.suffix:
+        return storage_path.with_suffix("")
+    return storage_path
+
+
+def _study_registry_payload_path(storage_path: Path) -> Path:
+    return _study_registry_dir(storage_path) / "storage.json"
+
+
+def _load_study_registry(
+    study_storage: Optional[Path],
+) -> Tuple[Dict[str, object], Optional[Path]]:
+    if study_storage is None:
+        return {}, None
+
+    pointer_path = _study_registry_payload_path(study_storage)
+    if not pointer_path.exists():
+        return {}, pointer_path
+
+    return _load_json(pointer_path), pointer_path
+
+
+def _apply_study_registry_defaults(
+    search_cfg: Dict[str, object], study_storage: Optional[Path]
+) -> None:
+    """Apply stored storage settings when explicit configuration is missing."""
+
+    payload, pointer_path = _load_study_registry(study_storage)
+    if not payload:
+        return
+
+    backend = str(payload.get("backend") or "none").lower()
+    if backend in {"", "none"}:
+        return
+
+    applied: List[str] = []
+
+    if backend == "sqlite":
+        stored_url = payload.get("storage_url") or payload.get("sqlite_url")
+        if stored_url and not search_cfg.get("storage_url"):
+            search_cfg["storage_url"] = stored_url
+            applied.append("storage_url")
+    else:
+        env_key = payload.get("storage_url_env")
+        if env_key and not search_cfg.get("storage_url_env"):
+            search_cfg["storage_url_env"] = env_key
+            applied.append("storage_url_env")
+        stored_url = payload.get("storage_url")
+        if stored_url and not search_cfg.get("storage_url"):
+            search_cfg["storage_url"] = stored_url
+            applied.append("storage_url")
+
+    if applied and pointer_path is not None:
+        LOGGER.info(
+            "스터디 레지스트리(%s)에서 %s 설정을 불러왔습니다.",
+            pointer_path,
+            ", ".join(applied),
+        )
 
 
 def _extract_primary_htf(
@@ -3219,6 +3350,7 @@ def _execute_single(
     )
 
     study_storage = _resolve_study_storage(params_cfg, datasets)
+    _apply_study_registry_defaults(search_cfg, study_storage)
 
     trials_log_dir = output_dir / "trials"
 
@@ -3424,6 +3556,16 @@ def _execute_single(
         validation_manifest["summary"] = cv_summary
 
     storage_meta = optimisation.get("storage", {}) or {}
+    _register_study_reference(
+        study_storage,
+        storage_meta=storage_meta,
+        study_name=str(search_cfg.get("study_name")) if search_cfg.get("study_name") else None,
+    )
+    sanitised_storage_meta = _sanitise_storage_meta(storage_meta)
+    registry_dir = _study_registry_dir(study_storage) if study_storage else None
+    registry_dir_str = (
+        str(registry_dir) if registry_dir and registry_dir.exists() else None
+    )
     search_manifest = copy.deepcopy(params_cfg.get("search", {}))
     if "storage_url" in search_manifest:
         url_value = search_manifest.get("storage_url")
@@ -3442,11 +3584,12 @@ def _execute_single(
         "basic_factor_profile": optimisation.get("basic_factor_profile", True),
         "resume_bank": str(resume_bank_path) if resume_bank_path else None,
         "study_storage": storage_meta.get("path") if storage_meta.get("backend") == "sqlite" else None,
+        "study_registry": registry_dir_str,
         "regime": regime_summary.__dict__,
         "cli": list(argv or []),
     }
-    if storage_meta:
-        manifest["storage"] = storage_meta
+    if sanitised_storage_meta:
+        manifest["storage"] = sanitised_storage_meta
     if validation_manifest:
         manifest["validation"] = validation_manifest
 

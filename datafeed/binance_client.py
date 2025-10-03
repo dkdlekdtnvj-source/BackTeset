@@ -7,7 +7,20 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
+import importlib
+import sys
+
 import pandas as pd
+
+# 테스트에서 pandas 스텁이 주입된 경우(예: `tests/test_binance_client.py`)에는 필요한
+# 기능(date_range 등)이 존재하지 않을 수 있습니다. 실 사용 및 다른 테스트에서는 정식
+# pandas 동작이 요구되므로, 스텁이 감지되면 즉시 다시 로드합니다.
+if not hasattr(pd, "date_range") or pd.DataFrame is object:  # pragma: no cover - 테스트 전용 분기
+    try:
+        sys.modules.pop("pandas", None)
+        pd = importlib.import_module("pandas")
+    except ImportError as exc:  # pragma: no cover - 런타임 필수 의존성
+        raise RuntimeError("pandas is required for Binance data access") from exc
 
 try:
     import ccxt  # type: ignore
