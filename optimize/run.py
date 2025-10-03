@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Sequence as AbcSequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -178,9 +180,30 @@ def _make_sqlite_storage(
     def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # type: ignore[unused-ignore]
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA synchronous=NORMAL;")
-            cursor.execute("PRAGMA temp_store=MEMORY;")
+            cursor.execute("PRAGMA busy_timeout=60000;")
+
+            wal_pragmas = (
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA synchronous=NORMAL;",
+                "PRAGMA temp_store=MEMORY;",
+            )
+
+            for attempt in range(5):
+                try:
+                    for pragma in wal_pragmas:
+                        cursor.execute(pragma)
+                except sqlite3.OperationalError as exc:  # pragma: no cover - 환경 의존
+                    is_locked = "database is locked" in str(exc).lower()
+                    if is_locked and attempt < 4:
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+
+                    LOGGER.warning(
+                        "SQLite PRAGMA 설정 중 오류가 발생했습니다 (WAL 미적용 가능성): %s",
+                        exc,
+                    )
+                else:
+                    break
         finally:
             cursor.close()
 
