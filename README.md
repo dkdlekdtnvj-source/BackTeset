@@ -104,6 +104,25 @@ boolean filter toggles, and trial count. Once the questions are answered it
 forwards the selections to `optimize.run` and the
 reports appear under `reports/` just like the direct CLI entry point.
 
+### vectorbt 기반 고속 백테스트 (선택)
+
+PostgreSQL 등 외부 RDB 스토리지를 연결하고 멀티코어 환경을 충분히 활용하고
+싶다면 `vectorbt` 엔진으로 백테스트를 실행할 수 있습니다. `params` 프로필에
+`altEngine: vectorbt` 값을 추가하거나 Optuna 트라이얼 파라미터로 동일한 키를
+전달하면, 기본 파이썬 구현 대신 vectorbt 포트폴리오 시뮬레이터가 호출됩니다.
+
+```yaml
+overrides:
+  altEngine: vectorbt
+```
+
+- vectorbt는 선택적 의존성이므로 직접 설치해야 합니다. (`pip install vectorbt`)
+- 현재 호환 레이어는 기본 모멘텀·플럭스·동적 임계값·`exitOpposite` 규칙을 빠르게
+  재현하는 데 집중했습니다. `useStopLoss`, `useAtrTrail`, `useMomFade`,
+  `useStructureGate` 등 고급 기능이 활성화된 경우에는 아직 기본 엔진으로 자동
+  폴백됩니다.
+- PyBroker 호환 경로는 향후 버전에서 제공될 예정입니다.
+
 ## LLM 보조(선택)
 
 `config/params.yaml` 의 `llm` 블록을 활성화하면 일정 수(`initial_trials`) 만큼의
