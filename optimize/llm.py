@@ -6,7 +6,8 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
 import optuna
 
@@ -18,8 +19,6 @@ try:  # pragma: no cover - optional dependency
     from google import genai  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     genai = None
-
-HARDCODED_GEMINI_API_KEY = "AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
 
 
 @dataclass
@@ -88,6 +87,87 @@ def _coerce_numeric(value: object, *, to_int: bool = False) -> Optional[float]:
     if to_int:
         return float(int(round(numeric)))
     return numeric
+
+
+def _strip_quotes(text: str) -> str:
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1]
+    return text
+
+
+def _load_env_file_variables(path: Path) -> Dict[str, str]:
+    variables: Dict[str, str] = {}
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return variables
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = _strip_quotes(value.strip())
+        variables[key] = value
+    return variables
+
+
+def _load_gemini_api_key(config: Dict[str, object]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve the Gemini API key from config, env vars or helper files.
+
+    Returns a tuple of (api_key, source_description).
+    """
+
+    # 1) Direct inline key in the YAML config.
+    direct = config.get("api_key") if config else None
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip(), "llm.api_key"
+
+    # 2) Optional file path (api_key_file / api_key_path).
+    file_field = None
+    if isinstance(config, dict):
+        file_field = config.get("api_key_file") or config.get("api_key_path")
+    if isinstance(file_field, str) and file_field.strip():
+        candidate = Path(file_field).expanduser()
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            LOGGER.debug("Gemini API 키 파일 %s을(를) 열 수 없습니다.", candidate)
+        else:
+            if content:
+                return content, f"file:{candidate}"
+
+    # 3) Environment variable lookup (default GEMINI_API_KEY).
+    env_name = str(config.get("api_key_env", "GEMINI_API_KEY")) if config else "GEMINI_API_KEY"
+    env_value = os.environ.get(env_name)
+    if isinstance(env_value, str) and env_value.strip():
+        return env_value.strip(), f"env:{env_name}"
+
+    # 4) Look for .env style files in common locations.
+    repo_root = Path(__file__).resolve().parents[1]
+    cwd = Path.cwd()
+    env_candidates = [
+        cwd / ".env",
+        repo_root / ".env",
+        repo_root / "config" / ".env",
+    ]
+    seen: Set[Path] = set()
+    for candidate in env_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not candidate.is_file():
+            continue
+        variables = _load_env_file_variables(candidate)
+        value = variables.get(env_name)
+        if value and value.strip():
+            return value.strip(), f"env_file:{candidate}"
+
+    return None, None
 
 
 def _validate_candidate(candidate: Dict[str, object], space: SpaceSpec) -> Optional[Dict[str, object]]:
@@ -228,12 +308,12 @@ def generate_llm_candidates(
         LOGGER.warning("google-genai is not installed; skipping Gemini-guided proposals.")
         return LLMSuggestions([], [])
 
-    api_key = HARDCODED_GEMINI_API_KEY or config.get("api_key") or os.environ.get(
-        str(config.get("api_key_env", "GEMINI_API_KEY"))
-    )
+    api_key, api_key_source = _load_gemini_api_key(config)
     if not api_key:
         LOGGER.warning("Gemini API 키가 설정되지 않아 LLM 제안을 건너뜁니다.")
         return LLMSuggestions([], [])
+    if api_key_source:
+        LOGGER.debug("Gemini API 키를 %s에서 로드했습니다.", api_key_source)
 
     finished_trials: List[optuna.trial.FrozenTrial] = [
         trial
