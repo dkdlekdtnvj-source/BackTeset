@@ -214,8 +214,8 @@ def test_study_registry_round_trip_for_rdb(tmp_path):
     study_path = tmp_path / "studies" / "demo.db"
     storage_meta = {
         "backend": "rdb",
-        "url": "postgresql+psycopg://user:secret@localhost:5432/optuna",
-        "env_key": "OPTUNA_STORAGE_URL",
+        "url": "postgresql://postgres:5432@127.0.0.1:5432/optuna",
+        "env_key": "OPTUNA_STORAGE",
         "env_value_present": True,
         "pool": {"size": 8},
     }
@@ -229,17 +229,17 @@ def test_study_registry_round_trip_for_rdb(tmp_path):
     _apply_study_registry_defaults(search_cfg, study_path)
 
     assert search_cfg["storage_url"] == storage_meta["url"]
-    assert search_cfg["storage_url_env"] == "OPTUNA_STORAGE_URL"
+    assert search_cfg["storage_url_env"] == "OPTUNA_STORAGE"
 
 
 def test_sanitise_storage_meta_masks_password():
     raw = {
         "backend": "rdb",
-        "url": "postgresql+psycopg://user:secret@localhost:5432/optuna",
+        "url": "postgresql://postgres:5432@127.0.0.1:5432/optuna",
     }
 
     masked = _sanitise_storage_meta(raw)
 
-    assert masked["url"].startswith("postgresql+psycopg://user:***@localhost")
+    assert masked["url"].startswith("postgresql://postgres:***@127.0.0.1")
     # 원본 딕셔너리는 변경하지 않습니다.
     assert raw["url"].endswith("/optuna")

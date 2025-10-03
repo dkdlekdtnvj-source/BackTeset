@@ -79,17 +79,17 @@ python -m optimize.run --pick-top50 1 `
   --dataset-start-method spawn `
   --no-simple-metrics
 
-6) LLM(Gemini 2.5) 후보 생성 사용
-- params.yaml 내부 llm 블록:
-  llm:
-    enabled: true
-    api_key_env: GOOGLE_API_KEY
-    model: gemini-2.5-flash-preview-04-17
-    n_candidates: 6
-    prewarm_trials: 24
-    thinking_budget: 80
+6) LLM(Gemini 2.5) 후보/인사이트 활용
+- `config/params.yaml` > `llm` 기본값이 `enabled: true` 입니다. 핵심 필드:
+  - `count`: 큐에 넣을 후보 수 (기본 8)
+  - `initial_trials`: LLM 호출 전 사전 학습 트라이얼 수 (기본 20)
+  - `top_n`: LLM이 참고할 상위 트라이얼 개수 (기본 10)
+  - `thinking_budget`: Gemini 2.5 reasoning 예산 (기본 1024)
 - PowerShell에서 키 설정:
-  $env:GOOGLE_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+  $env:GEMINI_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+- 실행 시 인터랙티브 질문 또는 CLI `--llm`/`--no-llm` 으로 즉시 전환 가능
+- Gemini 응답은 `candidates` 와 `insights` 를 포함한 JSON 객체 형식입니다.
+  인사이트 텍스트는 `reports/<timestamp>/logs/gemini_insights.md` 파일과 로그에서 확인할 수 있습니다.
 
 7) 리포트/로그 디렉터리 안내
 - 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<tf>_<htf>\...

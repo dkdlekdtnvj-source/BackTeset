@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import optuna
@@ -19,6 +20,14 @@ except ImportError:  # pragma: no cover - optional dependency
     genai = None
 
 HARDCODED_GEMINI_API_KEY = "AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+
+
+@dataclass
+class LLMSuggestions:
+    """Gemini가 반환한 후보 파라미터와 전략 인사이트 번들을 보관합니다."""
+
+    candidates: List[Dict[str, object]]
+    insights: List[str]
 
 
 def _extract_text(response: object) -> str:
@@ -212,19 +221,19 @@ def generate_llm_candidates(
     space: SpaceSpec,
     trials: Iterable[optuna.trial.FrozenTrial],
     config: Dict[str, object],
-) -> List[Dict[str, object]]:
+) -> LLMSuggestions:
     if not config or not config.get("enabled"):
-        return []
+        return LLMSuggestions([], [])
     if genai is None:
         LOGGER.warning("google-genai is not installed; skipping Gemini-guided proposals.")
-        return []
+        return LLMSuggestions([], [])
 
     api_key = HARDCODED_GEMINI_API_KEY or config.get("api_key") or os.environ.get(
         str(config.get("api_key_env", "GEMINI_API_KEY"))
     )
     if not api_key:
         LOGGER.warning("Gemini API 키가 설정되지 않아 LLM 제안을 건너뜁니다.")
-        return []
+        return LLMSuggestions([], [])
 
     finished_trials: List[optuna.trial.FrozenTrial] = [
         trial
@@ -233,7 +242,7 @@ def generate_llm_candidates(
     ]
     if not finished_trials:
         LOGGER.info("아직 완료된 트라이얼이 없어 LLM 제안을 생략합니다.")
-        return []
+        return LLMSuggestions([], [])
 
     top_n = max(int(config.get("top_n", 10)), 1)
     count = max(int(config.get("count", 8)), 1)
@@ -263,8 +272,9 @@ def generate_llm_candidates(
         f"{json.dumps(space, indent=2)}\n\n"
         "Here are the top completed trials with their objective values (higher is better):\n"
         f"{json.dumps(top_trials, indent=2)}\n\n"
-        f"Propose {count} new parameter sets strictly within the given bounds."
-        " Return only a JSON array of objects with keys matching the parameter names."
+        f"Propose {count} new parameter sets strictly within the given bounds as a JSON array under the key 'candidates'."
+        " Also return 2-3 short tactical insights or strategy adjustments derived from the trials as a string array under the key 'insights'."
+        " Respond with a single JSON object containing both 'candidates' and 'insights'."
     )
 
     # Optional thinking budget / generation config support for Gemini 2.5+ models.
@@ -306,16 +316,33 @@ def generate_llm_candidates(
             response = client.models.generate_content(model=model, contents=prompt)
     except Exception as exc:  # pragma: no cover - network side effects
         LOGGER.warning("Gemini 호출에 실패했습니다: %s", exc)
-        return []
+        return LLMSuggestions([], [])
 
     raw_text = _extract_text(response)
     payload = _extract_json_payload(raw_text)
-    if not isinstance(payload, list):
-        LOGGER.warning("Gemini 응답에서 유효한 JSON 배열을 찾지 못했습니다.")
-        return []
+
+    insights: List[str] = []
+    candidate_payload = payload
+    if isinstance(payload, dict):
+        candidate_payload = payload.get("candidates")
+        raw_insights = payload.get("insights")
+        if isinstance(raw_insights, str):
+            text = raw_insights.strip()
+            if text:
+                insights.append(text)
+        elif isinstance(raw_insights, Sequence):
+            for entry in raw_insights:
+                if isinstance(entry, str):
+                    text = entry.strip()
+                    if text:
+                        insights.append(text)
+
+    if not isinstance(candidate_payload, list):
+        LOGGER.warning("Gemini 응답에서 후보 파라미터 배열을 찾지 못했습니다.")
+        return LLMSuggestions([], insights)
 
     accepted: List[Dict[str, object]] = []
-    for entry in payload:
+    for entry in candidate_payload:
         if not isinstance(entry, dict):
             continue
         validated = _validate_candidate(entry, space)
@@ -329,4 +356,6 @@ def generate_llm_candidates(
         LOGGER.info("Gemini가 제안한 %d개의 후보를 큐에 추가합니다.", len(accepted))
     else:
         LOGGER.info("Gemini 제안 중 조건을 만족하는 후보가 없었습니다.")
-    return accepted
+    if insights:
+        LOGGER.info("Gemini 전략 인사이트 %d건 수신", len(insights))
+    return LLMSuggestions(accepted, insights)

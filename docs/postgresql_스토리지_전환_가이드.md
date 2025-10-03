@@ -21,8 +21,8 @@ pip install -r requirements.txt  # psycopg2-binary가 함께 설치됩니다.
 ```bash
 docker run -d \
   --name optuna-postgres \
-  -e POSTGRES_USER=optuna \
-  -e POSTGRES_PASSWORD=optuna \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=5432 \
   -e POSTGRES_DB=optuna \
   -p 5432:5432 \
   postgres:15
@@ -31,24 +31,24 @@ docker run -d \
 컨테이너가 올라가면 psql로 접속해 권한을 확인합니다.
 
 ```bash
-psql postgresql://optuna:optuna@localhost:5432/optuna -c "SELECT current_database(), current_user;"
+psql postgresql://postgres:5432@localhost:5432/optuna -c "SELECT current_database(), current_user;"
 ```
 
 ## 3. 프로젝트 설정 변경
 
 1. `.env` 또는 쉘 프로필에 접속 URL을 등록합니다.
    ```bash
-   export OPTUNA_STORAGE_URL="postgresql+psycopg://optuna:optuna@localhost:5432/optuna"
+   export OPTUNA_STORAGE="postgresql://postgres:5432@127.0.0.1:5432/optuna"
    ```
 2. `config/params.yaml`의 주요 항목:
-   - `search.storage_url_env`: 기본값이 `OPTUNA_STORAGE_URL`이므로 추가 수정 없이 위 환경 변수를 읽어옵니다.
+   - `search.storage_url_env`: 기본값이 `OPTUNA_STORAGE`이므로 추가 수정 없이 위 환경 변수를 읽어옵니다.
    - `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`: 커넥션 풀 크기와 재생성 주기를 제어합니다. 기본값(8/16/30/1800초)을 유지해도 무방합니다.
    - `search.storage_connect_timeout`: DB 연결 시도 제한(초). 네트워크 지연이 긴 환경이면 값을 늘리세요.
    - `search.storage_statement_timeout_ms`: PostgreSQL의 `statement_timeout`을 밀리초 단위로 지정합니다. 기본 300000(5분)이며, 장기 실행이 필요하면 0으로 비워 비활성화할 수 있습니다.
    - `search.storage_isolation_level`: Optuna 트랜잭션 격리 수준. 기본은 `READ COMMITTED`로 설정되어 있습니다.
    - 실행 후에는 `studies/<slug>/storage.json` 파일이 생성되어 마지막 실행에서 사용한 URL/환경 변수 이름이 기록됩니다. 같은 심볼/타임프레임 조합으로 다시 실행할 때 YAML에서 스토리지 항목이 비어 있으면 이 포인터를 자동으로 읽어옵니다.
 
-환경 변수를 비워 두면 코드가 자동으로 SQLite(`studies/<이름>.db`)로 되돌아갑니다.
+환경 변수를 비워 두면 코드가 자동으로 SQLite(`studies/<이름>.db`)로 되돌아갑니다. 다만 기본값은 이제 PostgreSQL URL이므로, 별도 설정이 없어도 `postgresql://postgres:5432@127.0.0.1:5432/optuna` 스토리지를 사용합니다.
 
 ## 4. 실행 명령 예시
 
@@ -58,15 +58,17 @@ python -m optimize.run \
   --symbol BINANCE:BTCUSDT \
   --timeframe-grid "1m@15m,1m@1h" \
   --n-trials 500 \
-  --storage-url-env OPTUNA_STORAGE_URL
+  --storage-url-env OPTUNA_STORAGE
 ```
+
+또는 대화형 안내가 필요하면 리포지토리 루트에서 `./시작` 명령을 실행하면 됩니다. 입력한 선택지는 자동으로 Optuna 실행 인자로 전달됩니다.
 
 또는 URL을 직접 지정할 수도 있습니다.
 
 ```bash
 python -m optimize.run \
   --config config/params.yaml \
-  --storage-url "postgresql+psycopg://optuna:optuna@localhost:5432/optuna"
+  --storage-url "postgresql://postgres:5432@127.0.0.1:5432/optuna"
 ```
 
 ## 5. 기존 SQLite 스터디 마이그레이션 (선택)
@@ -80,7 +82,7 @@ optuna studies --storage sqlite:///studies/기존스터디.db
 # SQLite → PostgreSQL 복제
 optuna copy \
   --from sqlite:///studies/기존스터디.db \
-  --to postgresql+psycopg://optuna:optuna@localhost:5432/optuna \
+  --to postgresql://postgres:5432@127.0.0.1:5432/optuna \
   --study 기존스터디이름
 ```
 
