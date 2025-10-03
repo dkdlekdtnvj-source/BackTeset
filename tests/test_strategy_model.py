@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from optimize.strategy_model import _security_series, run_backtest
 
@@ -63,6 +64,23 @@ def test_daily_loss_guard_freezes_after_loss():
 
     assert metrics["Trades"] == 1
     assert metrics["GuardFrozen"] == 1.0
+
+
+def test_min_trades_argument_marks_invalid_when_threshold_not_met():
+    prices = [100, 99, 98, 97, 96, 95, 94, 93]
+    df = _make_ohlcv(prices)
+    params = _base_params(
+        useTimeStop=True,
+        maxHoldBars=1,
+        useDailyLossGuard=True,
+        dailyLossLimit=0.5,
+    )
+
+    metrics = run_backtest(df, params, FEES, RISK, min_trades=2)
+
+    assert metrics["Trades"] == pytest.approx(1.0)
+    assert metrics["MinTrades"] == pytest.approx(2.0)
+    assert not metrics["Valid"]
 
 
 def test_squeeze_gate_blocks_without_release():

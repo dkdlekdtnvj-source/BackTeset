@@ -37,6 +37,7 @@ def run_walk_forward(
     test_bars: int,
     step: int,
     htf_df: Optional[pd.DataFrame] = None,
+    min_trades: Optional[int] = None,
 ) -> Dict[str, object]:
     segments: List[SegmentResult] = []
     total = len(df)
@@ -51,7 +52,14 @@ def run_walk_forward(
     if train_bars <= 0 or train_bars >= total:
         train_bars = total
     if test_bars <= 0 or train_bars + test_bars > total:
-        metrics = run_backtest(df, params, fees, risk, htf_df=htf_df)
+        metrics = run_backtest(
+            df,
+            params,
+            fees,
+            risk,
+            htf_df=htf_df,
+            min_trades=min_trades,
+        )
         clean = _clean_metrics(metrics)
         return {
             "segments": segments,
@@ -75,8 +83,22 @@ def run_walk_forward(
         train_htf = htf_df.loc[: train_df.index[-1]] if htf_df is not None else None
         test_htf = htf_df.loc[: test_df.index[-1]] if htf_df is not None else None
 
-        train_metrics = run_backtest(train_df, params, fees, risk, htf_df=train_htf)
-        test_metrics = run_backtest(test_df, params, fees, risk, htf_df=test_htf)
+        train_metrics = run_backtest(
+            train_df,
+            params,
+            fees,
+            risk,
+            htf_df=train_htf,
+            min_trades=min_trades,
+        )
+        test_metrics = run_backtest(
+            test_df,
+            params,
+            fees,
+            risk,
+            htf_df=test_htf,
+            min_trades=min_trades,
+        )
 
         segments.append(
             SegmentResult(
@@ -110,6 +132,7 @@ def run_purged_kfold(
     k: int = 5,
     embargo: float = 0.01,
     htf_df: Optional[pd.DataFrame] = None,
+    min_trades: Optional[int] = None,
 ) -> Dict[str, object]:
     k = max(int(k), 2)
     total = len(df)
@@ -140,8 +163,22 @@ def run_purged_kfold(
         train_htf = htf_df if htf_df is None else htf_df.loc[train_df.index]
         test_htf = htf_df if htf_df is None else htf_df.loc[test_df.index]
 
-        train_metrics = run_backtest(train_df, params, fees, risk, htf_df=train_htf)
-        test_metrics = run_backtest(test_df, params, fees, risk, htf_df=test_htf)
+        train_metrics = run_backtest(
+            train_df,
+            params,
+            fees,
+            risk,
+            htf_df=train_htf,
+            min_trades=min_trades,
+        )
+        test_metrics = run_backtest(
+            test_df,
+            params,
+            fees,
+            risk,
+            htf_df=test_htf,
+            min_trades=min_trades,
+        )
 
         folds.append(
             {

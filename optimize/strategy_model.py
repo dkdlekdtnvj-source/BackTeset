@@ -624,19 +624,21 @@ def run_backtest(
     par_cold_mult = float_param("parColdRiskMult", 0.35, enabled=use_perf_adaptive_risk)
     par_pause_on_cold = bool_param("parPauseOnCold", True, enabled=use_perf_adaptive_risk)
 
-    min_trades_default = (
-        _coerce_float_value(min_trades, 0.0)
-        if min_trades is not None
-        else _coerce_float_value(params.get("minTrades"), 0.0)
-    )
+    if min_trades is not None:
+        min_trades_default = _coerce_float_value(min_trades, 0.0)
+    else:
+        min_trades_default = _coerce_float_value(params.get("minTrades"), 0.0)
     if not np.isfinite(min_trades_default):
         min_trades_default = 0.0
-    min_trades_value = _resolve_requirement_value(
-        "min_trades",
-        "minTrades",
-        "minTradesReq",
-        default=min_trades_default,
-    )
+    if min_trades is not None:
+        min_trades_value = min_trades_default
+    else:
+        min_trades_value = _resolve_requirement_value(
+            "min_trades",
+            "minTrades",
+            "minTradesReq",
+            default=min_trades_default,
+        )
     try:
         min_trades_req = max(0, int(float(min_trades_value)))
     except (TypeError, ValueError, OverflowError):
