@@ -210,6 +210,76 @@ def _make_sqlite_storage(
     return storage
 
 
+def _make_rdb_storage(
+    url: str,
+    *,
+    heartbeat_interval: Optional[int] = None,
+    grace_period: Optional[int] = None,
+    pool_size: Optional[int] = None,
+    max_overflow: Optional[int] = None,
+    pool_timeout: Optional[int] = None,
+    pool_recycle: Optional[int] = None,
+    isolation_level: Optional[str] = None,
+    connect_timeout: Optional[int] = None,
+    statement_timeout_ms: Optional[int] = None,
+) -> optuna.storages.RDBStorage:
+    """PostgreSQL 등 외부 RDB 용도의 Optuna 스토리지를 생성합니다."""
+
+    engine_kwargs: Dict[str, object] = {"pool_pre_ping": True}
+
+    if pool_size is not None:
+        engine_kwargs["pool_size"] = pool_size
+    if max_overflow is not None:
+        engine_kwargs["max_overflow"] = max_overflow
+    if pool_timeout is not None:
+        engine_kwargs["pool_timeout"] = pool_timeout
+    if pool_recycle is not None:
+        engine_kwargs["pool_recycle"] = pool_recycle
+    if isolation_level:
+        engine_kwargs["isolation_level"] = isolation_level
+
+    connect_args: Dict[str, object] = {}
+    if connect_timeout is not None:
+        connect_args["connect_timeout"] = connect_timeout
+
+    options_parts: List[str] = []
+    if statement_timeout_ms is not None:
+        options_parts.append(f"-c statement_timeout={statement_timeout_ms}")
+
+    url_info = None
+    try:
+        url_info = make_url(url)
+    except Exception:
+        url_info = None
+
+    is_postgres = bool(url_info and url_info.drivername.startswith("postgresql"))
+    if is_postgres:
+        engine_kwargs.setdefault("pool_size", 5)
+        engine_kwargs.setdefault("max_overflow", 10)
+        engine_kwargs.setdefault("pool_recycle", 1800)
+        if connect_timeout is None:
+            connect_args.setdefault("connect_timeout", 10)
+        options_parts.append("-c timezone=UTC")
+
+    if options_parts:
+        existing_options = str(connect_args.get("options", "")).strip()
+        if existing_options:
+            options_parts.insert(0, existing_options)
+        connect_args["options"] = " ".join(part for part in options_parts if part)
+
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
+
+    storage = optuna.storages.RDBStorage(
+        url=url,
+        engine_kwargs=engine_kwargs,
+        heartbeat_interval=heartbeat_interval or None,
+        grace_period=grace_period or None,
+    )
+
+    return storage
+
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(5),
@@ -414,6 +484,41 @@ def _coerce_min_trades_value(value: object) -> Optional[int]:
         return None
 
     return max(0, int(round(numeric)))
+
+
+def _coerce_config_int(value: object, *, minimum: int, name: str) -> Optional[int]:
+    """설정값을 정수로 강제 변환하며 하한선을 검증합니다."""
+
+    if value is None:
+        return None
+
+    raw_value = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        raw_value = text
+
+    try:
+        numeric = int(float(raw_value))
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "%s 값 '%s' 을(를) 정수로 변환할 수 없어 무시합니다.",
+            name,
+            raw_value,
+        )
+        return None
+
+    if numeric < minimum:
+        LOGGER.warning(
+            "%s 값 %d 이(가) %d 보다 작아 무시합니다.",
+            name,
+            numeric,
+            minimum,
+        )
+        return None
+
+    return numeric
 
 
 def _timeframe_lookup_keys(timeframe: Optional[str], htf: Optional[str]) -> List[str]:
@@ -1956,15 +2061,75 @@ def optimisation_loop(
                         n_jobs,
                     )
         else:
-            engine_kwargs = {"pool_pre_ping": True}
-            storage = optuna.storages.RDBStorage(
-                url=storage_url,
-                engine_kwargs=engine_kwargs,
+            pool_size = _coerce_config_int(
+                search_cfg.get("storage_pool_size"),
+                minimum=1,
+                name="storage_pool_size",
+            )
+            max_overflow = _coerce_config_int(
+                search_cfg.get("storage_max_overflow"),
+                minimum=0,
+                name="storage_max_overflow",
+            )
+            pool_timeout = _coerce_config_int(
+                search_cfg.get("storage_pool_timeout"),
+                minimum=0,
+                name="storage_pool_timeout",
+            )
+            pool_recycle = _coerce_config_int(
+                search_cfg.get("storage_pool_recycle"),
+                minimum=0,
+                name="storage_pool_recycle",
+            )
+            connect_timeout = _coerce_config_int(
+                search_cfg.get("storage_connect_timeout"),
+                minimum=1,
+                name="storage_connect_timeout",
+            )
+            statement_timeout_ms = _coerce_config_int(
+                search_cfg.get("storage_statement_timeout_ms"),
+                minimum=1,
+                name="storage_statement_timeout_ms",
+            )
+
+            isolation_level_raw = search_cfg.get("storage_isolation_level")
+            isolation_level = None
+            if isinstance(isolation_level_raw, str):
+                isolation_level = isolation_level_raw.strip() or None
+            elif isolation_level_raw is not None:
+                isolation_level = str(isolation_level_raw).strip() or None
+
+            storage = _make_rdb_storage(
+                storage_url,
                 heartbeat_interval=heartbeat_interval or None,
                 grace_period=heartbeat_grace or None,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+                pool_recycle=pool_recycle,
+                isolation_level=isolation_level,
+                connect_timeout=connect_timeout,
+                statement_timeout_ms=statement_timeout_ms,
             )
             storage_meta["backend"] = "rdb"
             storage_meta["url"] = storage_url
+            pool_meta = {}
+            if pool_size is not None:
+                pool_meta["size"] = pool_size
+            if max_overflow is not None:
+                pool_meta["max_overflow"] = max_overflow
+            if pool_timeout is not None:
+                pool_meta["timeout"] = pool_timeout
+            if pool_recycle is not None:
+                pool_meta["recycle"] = pool_recycle
+            if pool_meta:
+                storage_meta["pool"] = pool_meta
+            if connect_timeout is not None:
+                storage_meta["connect_timeout"] = connect_timeout
+            if isolation_level:
+                storage_meta["isolation_level"] = isolation_level
+            if statement_timeout_ms is not None:
+                storage_meta["statement_timeout_ms"] = statement_timeout_ms
     else:
         storage_meta["backend"] = "none"
     storage_arg = storage if storage is not None else storage_url
