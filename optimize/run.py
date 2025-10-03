@@ -26,6 +26,9 @@ import pandas as pd
 import yaml
 import multiprocessing
 import ccxt
+import sqlalchemy
+from sqlalchemy import event
+from sqlalchemy.engine import make_url
 
 from datafeed.cache import DataCache
 from optimize.metrics import (
@@ -43,6 +46,13 @@ from optimize.strategy_model import run_backtest
 from optimize.wf import run_purged_kfold, run_walk_forward
 from optimize.regime import detect_regime_label, summarise_regime_performance
 from optimize.llm import generate_llm_candidates
+from optuna.exceptions import StorageInternalError
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 def fetch_top_usdt_perp_symbols(
     limit: int = 50,
@@ -117,7 +127,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
 STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
-PF_ANOMALY_THRESHOLD = 100.0
+PF_ANOMALY_THRESHOLD = 50.0
 MIN_VOLUME_THRESHOLD = 100.0
 TRIAL_PROGRESS_FIELDS = [
     "number",
@@ -136,6 +146,55 @@ TRIAL_PROGRESS_FIELDS = [
     "skipped_datasets",
     "datetime_complete",
 ]
+
+
+def _make_sqlite_storage(
+    url: str,
+    *,
+    timeout_sec: int = 120,
+    heartbeat_interval: Optional[int] = None,
+    grace_period: Optional[int] = None,
+) -> optuna.storages.RDBStorage:
+    """SQLite 스토리지에 WAL 모드와 타임아웃을 적용해 생성합니다."""
+
+    connect_args = {"timeout": timeout_sec, "check_same_thread": False}
+    engine_kwargs = {"connect_args": connect_args, "pool_pre_ping": True}
+    storage = optuna.storages.RDBStorage(
+        url=url,
+        engine_kwargs=engine_kwargs,
+        heartbeat_interval=heartbeat_interval or None,
+        grace_period=grace_period or None,
+    )
+
+    @event.listens_for(storage.engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # type: ignore[unused-ignore]
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.execute("PRAGMA temp_store=MEMORY;")
+        finally:
+            cursor.close()
+
+    return storage
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.2, min=0.2, max=3),
+    retry=(
+        retry_if_exception_type(sqlalchemy.exc.OperationalError)
+        | retry_if_exception_type(StorageInternalError)
+    ),
+)
+def _safe_sample_parameters(
+    trial: optuna.trial.Trial, space: Sequence[Dict[str, object]]
+) -> Dict[str, object]:
+    """SQLite 잠금 오류 발생 시 짧게 재시도하며 파라미터를 샘플링합니다."""
+
+    return sample_parameters(trial, space)
+
 
 # 단순 메트릭 계산 경로 사용 여부 (CLI 인자/설정으로 갱신됩니다).
 simple_metrics_enabled: bool = False
@@ -1566,19 +1625,50 @@ def optimisation_loop(
     if storage_url:
         heartbeat_interval = max(int(search_cfg.get("heartbeat_interval", 60)), 0)
         heartbeat_grace = max(int(search_cfg.get("heartbeat_grace_period", 120)), 0)
-        engine_kwargs = {}
         if storage_url.startswith("sqlite:///"):
-            engine_kwargs["connect_args"] = {"check_same_thread": False}
-        storage = optuna.storages.RDBStorage(
-            url=storage_url,
-            engine_kwargs=engine_kwargs or None,
-            heartbeat_interval=heartbeat_interval or None,
-            grace_period=heartbeat_grace or None,
-        )
-        storage_meta["backend"] = "sqlite" if storage_url.startswith("sqlite:///") else "rdb"
-        if storage_url.startswith("sqlite:///"):
+            timeout_raw = search_cfg.get("sqlite_timeout", 120)
+            try:
+                sqlite_timeout = max(1, int(timeout_raw))
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "sqlite_timeout 값 '%s' 을 정수로 변환할 수 없어 120초로 대체합니다.",
+                    timeout_raw,
+                )
+                sqlite_timeout = 120
+            storage = _make_sqlite_storage(
+                storage_url,
+                timeout_sec=sqlite_timeout,
+                heartbeat_interval=heartbeat_interval or None,
+                grace_period=heartbeat_grace or None,
+            )
+            storage_meta["backend"] = "sqlite"
             storage_meta["url"] = storage_url
-            storage_meta["path"] = str(study_storage) if study_storage else storage_url[10:]
+            try:
+                storage_path = make_url(storage_url).database
+            except Exception:
+                storage_path = None
+            if storage_path:
+                storage_meta["path"] = storage_path
+            elif study_storage is not None:
+                storage_meta["path"] = str(study_storage)
+            if n_jobs > 1:
+                LOGGER.warning(
+                    "SQLite 스토리지는 동시에 쓰기를 지원하지 않아 Optuna n_jobs를 %d→1로 강제합니다.",
+                    n_jobs,
+                )
+                n_jobs = 1
+                search_cfg["n_jobs"] = n_jobs
+                LOGGER.info("SQLite 스토리지 사용: Optuna 병렬 worker를 1개로 제한합니다.")
+        else:
+            engine_kwargs = {"pool_pre_ping": True}
+            storage = optuna.storages.RDBStorage(
+                url=storage_url,
+                engine_kwargs=engine_kwargs,
+                heartbeat_interval=heartbeat_interval or None,
+                grace_period=heartbeat_grace or None,
+            )
+            storage_meta["backend"] = "rdb"
+            storage_meta["url"] = storage_url
     else:
         storage_meta["backend"] = "none"
     storage_arg = storage if storage is not None else storage_url
@@ -1749,7 +1839,7 @@ def optimisation_loop(
         callbacks.append(_log_trial)
 
     def objective(trial: optuna.Trial) -> float:
-        params = sample_parameters(trial, space)
+        params = _safe_sample_parameters(trial, space)
         params.update(forced_params)
         key, selected_datasets = _select_datasets_for_params(
             params_cfg, dataset_groups, timeframe_groups, default_key, params
@@ -2019,6 +2109,28 @@ def optimisation_loop(
         cleaned_aggregated = _clean_metrics(aggregated)
         valid_status = bool(aggregated.get("Valid", bool(numeric_metrics)))
 
+        pf_anomaly = False
+        anomaly_info: Optional[Dict[str, object]] = None
+        final_pf = _safe_float(cleaned_aggregated.get("ProfitFactor"))
+        if final_pf is not None and final_pf >= PF_ANOMALY_THRESHOLD:
+            pf_anomaly = True
+            anomaly_info = {
+                "type": "profit_factor_threshold",
+                "value": final_pf,
+                "threshold": PF_ANOMALY_THRESHOLD,
+            }
+            LOGGER.warning(
+                "트라이얼 %d ProfitFactor %.2f 가 %.2f 이상으로 감지되어 패널티를 적용합니다.",
+                trial.number,
+                final_pf,
+                PF_ANOMALY_THRESHOLD,
+            )
+            score = non_finite_penalty
+            valid_status = False
+            cleaned_aggregated["Valid"] = False
+            if multi_objective and objective_values is not None:
+                objective_values = tuple(non_finite_penalty for _ in objective_values)
+
         record = {
             "trial": trial.number,
             "params": params,
@@ -2030,6 +2142,8 @@ def optimisation_loop(
             "pruned": False,
             "skipped_datasets": list(skipped_dataset_records),
         }
+        if anomaly_info is not None:
+            record["anomaly"] = anomaly_info
         if objective_values is not None:
             record["objective_values"] = list(objective_values)
         results.append(record)
@@ -2043,6 +2157,9 @@ def optimisation_loop(
         trial.set_user_attr("valid", valid_status)
         trial.set_user_attr("pruned", False)
         trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
+        trial.set_user_attr("profit_factor_anomaly", pf_anomaly)
+        if pf_anomaly and anomaly_info is not None:
+            trial.set_user_attr("anomaly_reason", anomaly_info.get("type"))
         if multi_objective and objective_values is not None:
             return objective_values
         return score

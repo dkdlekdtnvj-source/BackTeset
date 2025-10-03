@@ -7,3 +7,5 @@ PyYAML>=6.0
 seaborn>=0.13
 pytest>=7.4
 google-genai>=0.3
+SQLAlchemy>=1.4
+tenacity>=8.2
