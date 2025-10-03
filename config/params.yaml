@@ -2,13 +2,19 @@ version: 1
 
 search:
   algo: bayes
-  n_trials: 150
+  n_trials: 1000
   seed: 42
   top_k: 5
   n_jobs: 4
   dataset_jobs: 2
   dataset_executor: process
   # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
+
+# === 엔진/성능 옵션 ===
+useNumba: true          # Numba JIT 사용 (없으면 기본 false)
+vectorizedCross: true   # 모멘텀 교차 사전계산(이미 기본 true 권장)
+strictStartDate: false  # 데이터 시작으로 자동 보정 ON
+logNoTradeReasons: false
 
 objective:
   # === 기본룰: ProfitFactor 중심 ===
