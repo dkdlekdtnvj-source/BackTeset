@@ -13,6 +13,8 @@ from optimize.metrics import (
     ObjectiveSpec,
     Trade,
     aggregate_metrics,
+    apply_lossless_anomaly,
+    LOSSLESS_GROSS_LOSS_PCT,
     equity_curve_from_returns,
     evaluate_objective_values,
     max_drawdown,
@@ -145,6 +147,53 @@ def test_aggregate_metrics_micro_loss_flagged():
         flags = [token.strip() for token in flags.split(",") if token.strip()]
 
     assert "micro_loss_profit_factor" in flags
+
+
+def test_lossless_threshold_respects_initial_capital():
+    trades = [
+        Trade(
+            pd.Timestamp("2023-01-01"),
+            pd.Timestamp("2023-01-02"),
+            "long",
+            1.0,
+            100.0,
+            110.0,
+            10.0,
+            0.1,
+            0.0,
+            -0.1,
+            1,
+        ),
+        Trade(
+            pd.Timestamp("2023-01-03"),
+            pd.Timestamp("2023-01-04"),
+            "long",
+            1.0,
+            105.0,
+            104.5,
+            -0.5,
+            -0.0047619,
+            0.0,
+            -0.5,
+            1,
+        ),
+    ]
+    returns = pd.Series([0.1, -0.0047619], index=pd.date_range("2023-01-01", periods=2, freq="D"))
+
+    metrics = aggregate_metrics(trades, returns)
+    assert metrics["ProfitFactor"] > 0.0
+    assert not metrics.get("LosslessProfitFactor")
+
+    metrics["InitialCapital"] = 1_000_000_000.0
+    metrics["InitialEquity"] = 1_000_000_000.0
+
+    base_threshold = abs(metrics["InitialCapital"]) * LOSSLESS_GROSS_LOSS_PCT
+    result = apply_lossless_anomaly(metrics, threshold=base_threshold)
+
+    assert result is not None
+    assert metrics["ProfitFactor"] == pytest.approx(0.0)
+    assert metrics.get("LosslessProfitFactor") is True
+    assert metrics["LosslessGrossLossThreshold"] == pytest.approx(1_000_000.0)
 
 
 def test_run_backtest_deterministic():

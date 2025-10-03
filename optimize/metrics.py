@@ -82,6 +82,66 @@ def detect_lossless_profit_factor(
     return None
 
 
+def apply_lossless_anomaly(
+    target: Dict[str, float],
+    *,
+    trades: float | None = None,
+    wins: float | None = None,
+    losses: float | None = None,
+    gross_loss: float | None = None,
+    threshold: float | None = None,
+) -> Optional[Tuple[str, float, float, float, float]]:
+    """재계산된 손실 무시 감지를 ``target`` 에 적용합니다."""
+
+    def _coerce(value: object, default: float = 0.0) -> float:
+        if value is None:
+            return float(default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    trades_val = _coerce(trades, _coerce(target.get("Trades")))
+    wins_val = _coerce(wins, _coerce(target.get("Wins")))
+    losses_val = _coerce(losses, _coerce(target.get("Losses")))
+    gross_loss_val = _coerce(gross_loss, _coerce(target.get("GrossLoss")))
+
+    if threshold is None:
+        threshold_val = lossless_gross_loss_threshold(target)
+    else:
+        try:
+            threshold_val = max(float(threshold), EPS)
+        except (TypeError, ValueError):
+            threshold_val = lossless_gross_loss_threshold(target)
+
+    target["LosslessGrossLossThreshold"] = threshold_val
+
+    flag = detect_lossless_profit_factor(
+        trades=trades_val,
+        wins=wins_val,
+        losses=losses_val,
+        gross_loss=gross_loss_val,
+        threshold=threshold_val,
+    )
+
+    if not flag:
+        return None
+
+    existing = target.get("AnomalyFlags")
+    if isinstance(existing, str):
+        flags = [token.strip() for token in existing.split(",") if token.strip()]
+    elif isinstance(existing, (list, tuple)):
+        flags = [str(token) for token in existing if str(token)]
+    else:
+        flags = []
+    if flag not in flags:
+        flags.append(flag)
+    target["AnomalyFlags"] = flags
+    target["ProfitFactor"] = 0.0
+    target["LosslessProfitFactor"] = True
+    return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
+
+
 @dataclass
 class Trade:
     """Container describing the outcome of a single trade."""
@@ -223,46 +283,6 @@ def aggregate_metrics(
 
     # Nested helper declared below within aggregate_metrics.
 
-    def _mark_lossless(target: Dict[str, float]) -> None:
-        threshold = lossless_gross_loss_threshold(target)
-        target.setdefault("LosslessGrossLossThreshold", threshold)
-        flag = detect_lossless_profit_factor(
-            trades=len(trades),
-            wins=wins,
-            losses=losses,
-            gross_loss=gross_loss,
-            threshold=threshold,
-        )
-        if not flag:
-            return
-
-        existing = target.get("AnomalyFlags")
-        if isinstance(existing, str):
-            flags = [token.strip() for token in existing.split(",") if token.strip()]
-        elif isinstance(existing, (list, tuple)):
-            flags = [str(token) for token in existing if str(token)]
-        else:
-            flags = []
-        if flag not in flags:
-            flags.append(flag)
-            if flag == LOSSLESS_ANOMALY_FLAG:
-                LOGGER.info(
-                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
-                    len(trades),
-                    wins,
-                )
-            else:
-                LOGGER.warning(
-                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
-                    abs(gross_loss),
-                    threshold,
-                    len(trades),
-                    wins,
-                )
-        target["AnomalyFlags"] = flags
-        target["ProfitFactor"] = 0.0
-        target["LosslessProfitFactor"] = True
-
     if simple:
         metrics: Dict[str, float] = {
             "NetProfit": net_profit,
@@ -280,7 +300,29 @@ def aggregate_metrics(
         for key in fallback_keys:
             if key in metrics and not np.isfinite(metrics[key]):
                 metrics[key] = 0.0
-        _mark_lossless(metrics)
+        result = apply_lossless_anomaly(
+            metrics,
+            trades=len(trades),
+            wins=wins,
+            losses=losses,
+            gross_loss=gross_loss,
+        )
+        if result:
+            flag, trades_val, wins_val, abs_loss, threshold = result
+            if flag == LOSSLESS_ANOMALY_FLAG:
+                LOGGER.info(
+                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                    int(trades_val),
+                    int(wins_val),
+                )
+            else:
+                LOGGER.warning(
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                    abs_loss,
+                    threshold,
+                    int(trades_val),
+                    int(wins_val),
+                )
         return metrics
 
     weekly = _weekly_returns(returns)
@@ -315,7 +357,29 @@ def aggregate_metrics(
     for key in fallback_keys:
         if key in metrics and not np.isfinite(metrics[key]):
             metrics[key] = 0.0
-    _mark_lossless(metrics)
+    result = apply_lossless_anomaly(
+        metrics,
+        trades=len(trades),
+        wins=wins,
+        losses=losses,
+        gross_loss=gross_loss,
+    )
+    if result:
+        flag, trades_val, wins_val, abs_loss, threshold = result
+        if flag == LOSSLESS_ANOMALY_FLAG:
+            LOGGER.info(
+                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                int(trades_val),
+                int(wins_val),
+            )
+        else:
+            LOGGER.warning(
+                "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                abs_loss,
+                threshold,
+                int(trades_val),
+                int(wins_val),
+            )
     return metrics
 
 
@@ -451,4 +515,5 @@ __all__ = [
     "MICRO_LOSS_ANOMALY_FLAG",
     "lossless_gross_loss_threshold",
     "detect_lossless_profit_factor",
+    "apply_lossless_anomaly",
 ]

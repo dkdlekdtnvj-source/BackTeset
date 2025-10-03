@@ -9,7 +9,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .metrics import Trade, aggregate_metrics
+from .metrics import (
+    LOSSLESS_ANOMALY_FLAG,
+    LOSSLESS_GROSS_LOSS_PCT,
+    MICRO_LOSS_ANOMALY_FLAG,
+    Trade,
+    aggregate_metrics,
+    apply_lossless_anomaly,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1683,6 +1690,45 @@ def run_backtest(
         close_position(df.index[-1], df.iloc[-1]["close"], "EndOfData")
 
     metrics = aggregate_metrics(trades, returns_series, simple=simple_metrics_only)
+    initial_capital_value = float(state.initial_capital)
+    metrics["InitialCapital"] = initial_capital_value
+    metrics.setdefault("InitialEquity", initial_capital_value)
+    metrics.setdefault("InitialBalance", initial_capital_value)
+    metrics.setdefault("StartingBalance", initial_capital_value)
+    was_lossless = bool(metrics.get("LosslessProfitFactor"))
+    base_threshold = abs(initial_capital_value) * LOSSLESS_GROSS_LOSS_PCT
+    threshold_override = base_threshold
+    existing_threshold = metrics.get("LosslessGrossLossThreshold")
+    try:
+        existing_numeric = float(existing_threshold)
+    except (TypeError, ValueError):
+        existing_numeric = float("nan")
+    if np.isfinite(existing_numeric) and existing_numeric > 0:
+        threshold_override = max(existing_numeric, base_threshold)
+    result = apply_lossless_anomaly(metrics, threshold=threshold_override)
+    if result and not was_lossless:
+        flag, trades_val, wins_val, abs_loss, threshold = result
+        if flag == LOSSLESS_ANOMALY_FLAG:
+            LOGGER.info(
+                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                int(trades_val),
+                int(wins_val),
+            )
+        elif flag == MICRO_LOSS_ANOMALY_FLAG:
+            LOGGER.warning(
+                "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                abs_loss,
+                threshold,
+                int(trades_val),
+                int(wins_val),
+            )
+        else:
+            LOGGER.warning(
+                "ProfitFactor를 0으로 재조정하는 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                flag,
+                int(trades_val),
+                int(wins_val),
+            )
     if simple_metrics_only:
         metrics["SimpleMetricsOnly"] = True
     metrics["FinalEquity"] = state.equity
