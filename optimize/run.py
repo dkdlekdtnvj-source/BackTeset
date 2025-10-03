@@ -520,6 +520,37 @@ def _run_dataset_backtest_task(
     is used for parallel evaluation.
     """
 
+    # Determine if an alternative engine is requested.  The ``engine``
+    # parameter can be provided in the ``params`` dict as ``altEngine``
+    # (e.g. "vectorbt" or "pybroker").  If specified and an alternative
+    # engine is available, attempt to delegate the backtest accordingly.  In
+    # the event of missing dependencies or unimplemented integration, fall
+    # back to the native run_backtest implementation.
+    engine = None
+    try:
+        engine = params.get("altEngine") or params.get("engine")
+    except Exception:
+        engine = None
+    if engine:
+        try:
+            from .alternative_engine import run_backtest_alternative
+            return run_backtest_alternative(
+                dataset.df,
+                params,
+                fees,
+                risk,
+                htf_df=dataset.htf,
+                min_trades=min_trades,
+                engine=str(engine),
+            )
+        except Exception as exc:
+            # Log but continue with the default implementation
+            LOGGER.warning(
+                "Alternative engine '%s' failed (%s); falling back to native backtest.",
+                engine,
+                exc,
+            )
+    # Default: use native Python backtest
     return run_backtest(
         dataset.df,
         params,
@@ -2336,12 +2367,12 @@ def optimisation_loop(
                         constraints=constraints_cfg,
                         risk=risk,
                     )
-                    metrics = run_backtest(
-                        dataset.df,
+                    # Delegate backtest to the helper which supports alternative engines
+                    metrics = _run_dataset_backtest_task(
+                        dataset,
                         params,
                         fees,
                         risk,
-                        htf_df=dataset.htf,
                         min_trades=min_trades_requirement,
                     )
                 except Exception:

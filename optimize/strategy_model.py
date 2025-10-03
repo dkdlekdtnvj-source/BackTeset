@@ -18,6 +18,71 @@ from .metrics import (
     apply_lossless_anomaly,
 )
 
+# Attempt to import Numba for optional JIT acceleration.  If Numba is not
+# available in the environment, provide a no-op decorator so that the code
+# still runs without modification.  The ``NUMBA_AVAILABLE`` flag signals
+# whether accelerated paths can be used.
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    def njit(*args, **kwargs):  # type: ignore[override]
+        """Fallback decorator used when Numba is unavailable.  It simply
+        returns the original function unchanged.  This allows decorated
+        functions to be defined without errors when Numba is missing."""
+        # When used without arguments (e.g. ``@njit``) the first positional
+        # argument will be the function itself.  We handle both cases.
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return args[0]
+        def decorator(func):
+            return func
+        return decorator
+
+
+@njit  # type: ignore[misc]
+def _compute_cross_series_numba(momentum_array: np.ndarray, signal_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute cross-over and cross-under boolean arrays using a Numba-accelerated
+    loop.  The function accepts NumPy arrays of momentum and signal values
+    (derived from Pandas Series via ``.to_numpy()``) and returns two
+    boolean arrays indicating where a momentum cross-over (momentum rises
+    above the signal) and a cross-under (momentum falls below the signal)
+    occur.  A cross-over is defined when the previous momentum is less than
+    or equal to the previous signal and the current momentum exceeds the
+    current signal.  Similarly, a cross-under is defined when the previous
+    momentum is greater than or equal to the previous signal and the current
+    momentum is below the current signal.
+
+    Parameters
+    ----------
+    momentum_array : np.ndarray
+        The array of momentum values.
+    signal_array : np.ndarray
+        The array of corresponding signal values.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        A tuple containing two boolean arrays (cross_up, cross_down).
+    """
+    n = len(momentum_array)
+    cross_up = np.zeros(n, dtype=np.bool_)
+    cross_down = np.zeros(n, dtype=np.bool_)
+    # Initialise previous values with the first element to avoid out-of-bounds
+    prev_mom = momentum_array[0]
+    prev_sig = signal_array[0]
+    for i in range(n):
+        m = momentum_array[i]
+        s = signal_array[i]
+        # cross-over: previously below or equal and now above
+        cross_up[i] = (prev_mom <= prev_sig) and (m > s)
+        # cross-under: previously above or equal and now below
+        cross_down[i] = (prev_mom >= prev_sig) and (m < s)
+        prev_mom = m
+        prev_sig = s
+    return cross_up, cross_down
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -426,7 +491,23 @@ def run_backtest(
 
         return frame
 
+    # Determine the user-supplied start date if present. We don't want to
+    # blindly default to a date far in the future relative to the data
+    # because doing so causes the backtest loop to skip all bars and
+    # produce zero trades. Instead, we parse the supplied value here so that it
+    # exists before we adjust it against the dataset start timestamp below.
+    _start_raw = params.get("startDate")
+    try:
+        start_ts = pd.to_datetime(_start_raw, utc=True) if _start_raw else pd.NaT
+    except Exception:
+        start_ts = pd.NaT
     df = _normalise_ohlcv(df, "가격")
+    # Ensure that the start date is not in the future relative to the data.
+    # If no start date was provided or the provided date is earlier than the
+    # first bar, align it to the first timestamp of the dataset to avoid skipping
+    # the entire dataset and returning zero trades.
+    if not isinstance(start_ts, pd.Timestamp) or pd.isna(start_ts) or start_ts < df.index[0]:
+        start_ts = df.index[0]
     if htf_df is not None:
         htf_df = _normalise_ohlcv(htf_df, "HTF")
 
@@ -574,8 +655,14 @@ def run_backtest(
     dyn_len = int_param("dynLen", 21, enabled=use_dynamic_thresh)
     dyn_mult = float_param("dynMult", 1.1, enabled=use_dynamic_thresh)
     require_momentum_cross = bool_param("requireMomentumCross", True)
+    # Optional toggle: enable Numba-accelerated cross calculations.  When
+    # ``useNumba`` is True and Numba is installed in the environment,
+    # momentum/signal cross-over arrays will be computed using a
+    # Numba-jitted loop for improved performance.  Otherwise, a pure
+    # Pandas vectorised approach will be used.  Defaults to False.
+    use_numba = bool_param("useNumba", False)
 
-    start_ts = pd.to_datetime(params.get("startDate", "2025-07-01T00:00:00"), utc=True)
+    # (start_ts will be initialised prior to data normalisation below)
 
     leverage = float(risk.get("leverage", params.get("leverage", 10.0)))
     commission_pct = float(fees.get("commission_pct", params.get("commission_value", 0.0005)))
@@ -836,6 +923,33 @@ def run_backtest(
     norm = (df["close"] - avg_line) / atr_primary * 100.0
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
+    # -------------------------------------------------------------------------
+    # Precompute momentum cross-over/-under booleans once.
+    # Calculating cross overs inside the main bar loop can be expensive and
+    # unnecessarily repetitive. We compute the previous momentum and signal
+    # values here and derive boolean series indicating where a momentum
+    # cross-over or cross-under occurs. These are then referenced by index
+    # inside the loop to determine entry triggers.
+    # Compute cross-over/-under boolean series.  If Numba is available and
+    # the user has enabled ``useNumba``, leverage a JIT-compiled loop to
+    # build the arrays; otherwise, fall back to a vectorised Pandas approach.
+    if use_numba and NUMBA_AVAILABLE:
+        try:
+            cu, cd = _compute_cross_series_numba(momentum.to_numpy(), mom_signal.to_numpy())
+        except Exception:
+            # If JIT compilation fails at runtime, revert to vectorised method
+            _prev_mom = momentum.shift(1).fillna(momentum)
+            _prev_sig = mom_signal.shift(1).fillna(mom_signal)
+            _cross_up_series = (_prev_mom <= _prev_sig) & (momentum > mom_signal)
+            _cross_dn_series = (_prev_mom >= _prev_sig) & (momentum < mom_signal)
+        else:
+            _cross_up_series = pd.Series(cu, index=df.index)
+            _cross_dn_series = pd.Series(cd, index=df.index)
+    else:
+        _prev_mom = momentum.shift(1).fillna(momentum)
+        _prev_sig = mom_signal.shift(1).fillna(mom_signal)
+        _cross_up_series = (_prev_mom <= _prev_sig) & (momentum > mom_signal)
+        _cross_dn_series = (_prev_mom >= _prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
     flux_raw = _directional_flux(flux_df, flux_len)
@@ -1368,8 +1482,9 @@ def run_backtest(
         buy_thresh_val = buy_thresh_series.iloc[idx]
         sell_thresh_val = sell_thresh_series.iloc[idx]
 
-        cross_up = _cross_over(prev_momentum, prev_signal, mom_val, sig_val)
-        cross_down = _cross_under(prev_momentum, prev_signal, mom_val, sig_val)
+        # Determine cross-over and cross-under signals from the precomputed series.
+        cross_up = bool(_cross_up_series.iloc[idx])
+        cross_down = bool(_cross_dn_series.iloc[idx])
 
         long_cross_ok = cross_up or not require_momentum_cross
         short_cross_ok = cross_down or not require_momentum_cross

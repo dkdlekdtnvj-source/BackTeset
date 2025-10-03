@@ -1,0 +1,58 @@
+파워셸 실행 및 최적화 스크립트 가이드
+=================================
+
+1. 파워셸 실행하기
+   - **시작 메뉴**에서 "PowerShell"을 검색합니다.
+   - "Windows PowerShell"을 마우스 오른쪽 클릭 후 "관리자 권한으로 실행"을 선택합니다.
+   - 작업할 프로젝트 폴더로 이동합니다. 예)
+     ```powershell
+     Set-Location "D:\스퀴즈모멘텀백테\strategy-codex-implement-binance-api-for-parameter-optimization"
+     ```
+
+2. (선택) 가상환경 활성화
+   - 프로젝트 전용 가상환경이 있다면 다음과 같이 활성화합니다.
+     ```powershell
+     .\.venv\Scripts\Activate.ps1
+     ```
+   - 없으면 건너뛰어도 됩니다.
+
+3. 필수 패키지 설치
+   - 처음 실행하거나 라이브러리가 업데이트되었을 때는 요구사항을 설치합니다.
+     ```powershell
+     pip install -r requirements.txt
+     ```
+
+4. 데이터 캐시/설정 확인
+   - `config/params.yaml`에서 탐색 공간과 검색 옵션을 확인합니다.
+   - 현재 기본 팩터만 탐색하도록 구성되어 있으며, 오실레이터/BB/KC/플럭스/모멘텀 페이드 관련 키만 사용됩니다.
+   - 백테스트 대상 데이터는 `datafeed` 폴더의 캐시 설정을 참고하세요.
+
+5. 최적화 실행
+   - 권장 기본 실행 명령은 다음과 같습니다.
+     ```powershell
+     python -m optimize.run --config configs/your-config.yaml --no-simple-metrics
+     ```
+   - `--no-simple-metrics` 옵션을 사용하면 점수 스케일이 왜곡되지 않습니다.
+   - 실행 시 생성되는 로그와 리포트는 `reports` 폴더 아래 자동으로 분류됩니다.
+
+6. 경로 관련 오류 방지 (2025-10-02 오류 대응)
+   - 최신 코드에서는 `reports/<런ID>/trials` 폴더가 자동 생성됩니다.
+   - 만약 기존 버전에서 오류가 났다면, 다음 명령으로 수동 생성이 가능합니다.
+     ```powershell
+     New-Item -ItemType Directory -Force -Path "reports\<날짜-태그>\trials"
+     ```
+   - `<날짜-태그>`는 실행 로그 상단의 런 ID(예: `20251002-1206_ETHUSDT_1m_5m`)로 교체하세요.
+
+7. 중단 후 재시작
+   - 이전 실행의 은행/트라이얼 정보를 재활용하려면 `--resume-from` 옵션이나 `reports/<런ID>/bank.json` 파일을 사용합니다.
+   - `studies` 폴더를 활용하면 Optuna 스터디를 저장/재사용할 수 있습니다.
+
+8. 종료
+   - 가상환경을 썼다면 `deactivate` 명령으로 종료합니다.
+   - PowerShell 창을 닫습니다.
+
+추가 팁
+--------
+- 멀티 프로세스 실행 시 Windows에서는 `if __name__ == "__main__"` 보호 구문이 필수입니다. 현재 `optimize/run.py`는 이미 이를 준수하고 있습니다.
+- 실행 중 CPU/메모리 사용량을 모니터링하려면 PowerShell에서 `Get-Process python`을 활용하세요.
+- 로그 파일은 `reports/<런ID>/logs`에 저장되므로, 문제가 발생하면 해당 로그를 확인하면 빠르게 원인을 파악할 수 있습니다.

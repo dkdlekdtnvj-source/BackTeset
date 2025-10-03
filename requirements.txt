@@ -9,3 +9,4 @@ pytest>=7.4
 google-genai>=0.3
 SQLAlchemy>=1.4
 tenacity>=8.2
+numba>=0.56  # optional; used for JIT acceleration if available
