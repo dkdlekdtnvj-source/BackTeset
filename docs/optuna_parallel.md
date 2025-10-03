@@ -6,6 +6,8 @@
 
 `n_jobs>1`은 파이썬 스레드 기반이어서 GIL 영향을 받습니다. CPU 바운드 최적화에서는 **프로세스/노드 병렬**이 필수이며, 이를 위해 Optuna 스터디를 외부 RDB에 저장해야 합니다. 2025년 9월 이후 버전부터는 개별 데이터셋 백테스트도 `search.dataset_jobs`와 `search.dataset_executor`(thread/process) 설정으로 병렬화할 수 있으니, 단일 트라이얼이 여러 기간·심볼을 동시에 평가할 때 적극 활용하세요.
 
+> ⚠️ **SQLite 병렬 실행 주의**: `search.allow_sqlite_parallel: true` 또는 CLI `--allow-sqlite-parallel` 플래그로 강제로 n_jobs>1을 유지할 수 있지만, 여러 프로세스가 동시에 쓰면 `database is locked` 오류가 발생할 수 있습니다. 장시간 실행·고병렬 환경에서는 PostgreSQL/MySQL 같은 RDB 백엔드를 사용하는 것이 안전합니다.
+
 1. 데이터베이스 준비 (예: PostgreSQL)
    ```bash
    createdb pine_optuna

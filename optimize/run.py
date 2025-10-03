@@ -1901,14 +1901,21 @@ def optimisation_loop(
                 storage_meta["path"] = storage_path
             elif study_storage is not None:
                 storage_meta["path"] = str(study_storage)
+            allow_sqlite_parallel = bool(search_cfg.get("allow_sqlite_parallel"))
             if n_jobs > 1:
-                LOGGER.warning(
-                    "SQLite 스토리지는 동시에 쓰기를 지원하지 않아 Optuna n_jobs를 %d→1로 강제합니다.",
-                    n_jobs,
-                )
-                n_jobs = 1
-                search_cfg["n_jobs"] = n_jobs
-                LOGGER.info("SQLite 스토리지 사용: Optuna 병렬 worker를 1개로 제한합니다.")
+                if allow_sqlite_parallel:
+                    LOGGER.warning(
+                        "SQLite 스토리지 병렬 쓰기에는 잠금 오류 위험이 있습니다. n_jobs=%d 설정을 유지합니다.",
+                        n_jobs,
+                    )
+                else:
+                    LOGGER.warning(
+                        "SQLite 스토리지는 동시에 쓰기를 지원하지 않아 Optuna n_jobs를 %d→1로 강제합니다.",
+                        n_jobs,
+                    )
+                    n_jobs = 1
+                    search_cfg["n_jobs"] = n_jobs
+                    LOGGER.info("SQLite 스토리지 사용: Optuna 병렬 worker를 1개로 제한합니다.")
         else:
             engine_kwargs = {"pool_pre_ping": True}
             storage = optuna.storages.RDBStorage(
@@ -2625,6 +2632,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="가용 CPU 기반으로 Optuna worker 와 데이터셋 병렬 구성을 자동 조정합니다",
     )
+    parser.add_argument(
+        "--allow-sqlite-parallel",
+        action="store_true",
+        help="SQLite 스토리지 사용 시 잠금 위험을 감수하고 Optuna 병렬 실행을 허용합니다",
+    )
     parser.add_argument("--study-name", type=str, help="Override Optuna study name")
     parser.add_argument(
         "--study-template",
@@ -2760,6 +2772,9 @@ def _execute_single(
 
     if args.pruner:
         search_cfg["pruner"] = args.pruner
+
+    if args.allow_sqlite_parallel:
+        search_cfg["allow_sqlite_parallel"] = True
 
     forced_params: Dict[str, object] = dict(params_cfg.get("overrides", {}))
     auto_workers = bool(getattr(args, "auto_workers", False))
