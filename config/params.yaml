@@ -5,6 +5,9 @@ search:
   n_trials: 150
   seed: 42
   top_k: 5
+  n_jobs: 4
+  dataset_jobs: 2
+  dataset_executor: process
   # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
 
 objective:
