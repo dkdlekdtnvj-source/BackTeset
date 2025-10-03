@@ -34,14 +34,14 @@ from datafeed.cache import DataCache
 from optimize.metrics import (
     EPS,
     LOSSLESS_ANOMALY_FLAG,
+    LOSSLESS_GROSS_LOSS_PCT,
     MICRO_LOSS_ANOMALY_FLAG,
     ObjectiveSpec,
     Trade,
+    apply_lossless_anomaly,
     aggregate_metrics,
-    detect_lossless_profit_factor,
     equity_curve_from_returns,
     evaluate_objective_values,
-    lossless_gross_loss_threshold,
     normalise_objectives,
 )
 from optimize.report import generate_reports, write_bank_file, write_trials_dataframe
@@ -204,41 +204,16 @@ def _safe_sample_parameters(
 simple_metrics_enabled: bool = False
 
 
+_INITIAL_BALANCE_KEYS = (
+    "InitialCapital",
+    "InitialEquity",
+    "InitialBalance",
+    "StartingBalance",
+)
+
+
 def _apply_lossless_anomaly(target: Dict[str, float]) -> Optional[Tuple[str, float, float, float, float]]:
-    try:
-        trades_val = float(target.get("Trades", 0.0) or 0.0)
-        wins_val = float(target.get("Wins", 0.0) or 0.0)
-        losses_val = float(target.get("Losses", 0.0) or 0.0)
-        gross_loss_val = float(target.get("GrossLoss", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return None
-
-    threshold = lossless_gross_loss_threshold(target)
-    target.setdefault("LosslessGrossLossThreshold", threshold)
-
-    flag = detect_lossless_profit_factor(
-        trades=trades_val,
-        wins=wins_val,
-        losses=losses_val,
-        gross_loss=gross_loss_val,
-        threshold=threshold,
-    )
-    if not flag:
-        return None
-
-    existing = target.get("AnomalyFlags")
-    if isinstance(existing, str):
-        flags = [token.strip() for token in existing.split(",") if token.strip()]
-    elif isinstance(existing, (list, tuple)):
-        flags = [str(token) for token in existing if str(token)]
-    else:
-        flags = []
-    if flag not in flags:
-        flags.append(flag)
-    target["AnomalyFlags"] = flags
-    target["ProfitFactor"] = 0.0
-    target["LosslessProfitFactor"] = True
-    return flag, trades_val, wins_val, abs(gross_loss_val), threshold
+    return apply_lossless_anomaly(target)
 
 # 기본 팩터 최적화에 사용할 파라미터 키 집합입니다.
 # 복잡한 보호 장치·부가 필터 대신 핵심 진입 로직과 직접 관련된 항목만 남겨
@@ -1347,6 +1322,8 @@ def combine_metrics(
     hold_weight_sum = 0.0
     max_consecutive_losses = 0
     valid_flag = True
+    initial_balance_value: Optional[float] = None
+    threshold_override: Optional[float] = None
 
     for metrics in metric_list:
         returns = metrics.get("Returns")
@@ -1365,6 +1342,29 @@ def combine_metrics(
         for token in tokens:
             if token not in anomaly_flags:
                 anomaly_flags.append(token)
+
+        if initial_balance_value is None:
+            for key in _INITIAL_BALANCE_KEYS:
+                candidate = metrics.get(key)
+                if candidate is None:
+                    continue
+                try:
+                    numeric = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(numeric) or numeric == 0:
+                    continue
+                initial_balance_value = float(numeric)
+                break
+
+        if threshold_override is None and metrics.get("LosslessGrossLossThreshold") is not None:
+            try:
+                candidate_threshold = float(metrics["LosslessGrossLossThreshold"])
+            except (TypeError, ValueError):
+                candidate_threshold = None
+            else:
+                if np.isfinite(candidate_threshold) and candidate_threshold > 0:
+                    threshold_override = float(candidate_threshold)
 
         if simple_mode:
             trades_count = int(_coerce_float(metrics.get("Trades")))
@@ -1476,6 +1476,18 @@ def combine_metrics(
             "MaxConsecutiveLosses": float(max_consecutive_losses),
         }
         aggregated["SimpleMetricsOnly"] = True
+        effective_threshold = None
+        if initial_balance_value is not None:
+            aggregated["InitialCapital"] = float(initial_balance_value)
+            aggregated.setdefault("InitialEquity", float(initial_balance_value))
+            base_threshold = abs(float(initial_balance_value)) * LOSSLESS_GROSS_LOSS_PCT
+            effective_threshold = base_threshold
+            if threshold_override is not None:
+                effective_threshold = max(float(threshold_override), base_threshold)
+        elif threshold_override is not None:
+            effective_threshold = float(threshold_override)
+        if effective_threshold is not None:
+            aggregated["LosslessGrossLossThreshold"] = float(effective_threshold)
         _flag_lossless(aggregated)
     else:
         combined_trades.sort(
@@ -1485,6 +1497,18 @@ def combine_metrics(
             )
         )
         aggregated = aggregate_metrics(combined_trades, merged_returns, simple=False)
+        effective_threshold = None
+        if initial_balance_value is not None:
+            aggregated["InitialCapital"] = float(initial_balance_value)
+            aggregated.setdefault("InitialEquity", float(initial_balance_value))
+            base_threshold = abs(float(initial_balance_value)) * LOSSLESS_GROSS_LOSS_PCT
+            effective_threshold = base_threshold
+            if threshold_override is not None:
+                effective_threshold = max(float(threshold_override), base_threshold)
+        elif threshold_override is not None:
+            effective_threshold = float(threshold_override)
+        if effective_threshold is not None:
+            aggregated["LosslessGrossLossThreshold"] = float(effective_threshold)
         _flag_lossless(aggregated)
 
     aggregated["Trades"] = int(aggregated.get("Trades", 0))
