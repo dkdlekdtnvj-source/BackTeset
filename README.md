@@ -143,8 +143,12 @@ overrides:
   `reports/<timestamp>/logs/gemini_insights.md` 에 타임스탬프와 함께 기록되고 로그에도
   출력되어 후속 튜닝 방향을 빠르게 파악할 수 있습니다.
 
-- API 키는 `GEMINI_API_KEY` 환경변수 또는 `llm.api_key` 항목에서 읽습니다. 환경 변수나
-  하드코딩 값이 비어 있으면 실행 시 경고가 출력되고 LLM 단계는 생략됩니다.
+- API 키는 다음 우선순위로 탐색합니다.
+  1. `llm.api_key`
+  2. `llm.api_key_file`/`llm.api_key_path` 로 지정한 파일
+  3. `llm.api_key_env` (기본 `GEMINI_API_KEY`) 환경 변수
+  4. 현재 작업 디렉터리·저장소 루트·`config/` 아래 `.env` 파일에 정의된 동일한 이름의 키
+  어떤 경로에서도 키를 찾지 못하면 실행 시 경고가 출력되고 LLM 단계는 생략됩니다.
 - 기본 모델은 `gemini-2.0-flash-exp` 이며 `top_n`/`count` 값으로 참고할 트라이얼
   수와 제안 받을 후보 수를 제어할 수 있습니다.
 - `google-genai` 패키지가 설치돼 있지 않으면 경고만 출력하고 LLM 단계를 건너뜁니다.
@@ -154,7 +158,7 @@ overrides:
 예시:
 
 ```bash
-export GEMINI_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+echo "GEMINI_API_KEY=YOUR_API_KEY" > .env  # 또는 export GEMINI_API_KEY=...
 python -m optimize.run --params config/params.yaml --backtest config/backtest.yaml
 ```
 
