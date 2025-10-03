@@ -2713,6 +2713,55 @@ def _execute_single(
         or backtest_cfg.get("walk_forward")
         or {"train_bars": 5000, "test_bars": 2000, "step": 2000}
     )
+    min_trades_cfg = walk_cfg.get("min_trades") if isinstance(walk_cfg, dict) else None
+
+    def _coerce_min_trades(value: object) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            numeric = int(float(value))
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "walk_forward.min_trades 값을 정수로 변환할 수 없어 무시합니다: %s",
+                value,
+            )
+            return None
+        return max(0, numeric)
+
+    min_trades_requirement = _coerce_min_trades(min_trades_cfg)
+    min_trades_threshold = min_trades_requirement or 0
+
+    def _safe_float(value: object) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(number):
+            return 0.0
+        return number
+
+    def _apply_min_trades_to_cv(summary: Dict[str, object], threshold: int) -> None:
+        folds = summary.get("folds") or []
+        valid_scores: List[float] = []
+        valid_count = 0
+        for fold in folds:
+            metrics = dict(fold.get("test_metrics", {}))
+            fold["test_metrics"] = metrics
+            trades = _safe_float(metrics.get("Trades", 0.0))
+            is_valid = bool(metrics.get("Valid", True)) and trades >= threshold
+            if not is_valid:
+                metrics["Valid"] = False
+            else:
+                valid_scores.append(_safe_float(metrics.get("NetProfit", 0.0)))
+                valid_count += 1
+        if valid_scores:
+            summary["mean"] = float(np.mean(valid_scores))
+            summary["median"] = float(np.median(valid_scores))
+        else:
+            summary["mean"] = 0.0
+            summary["median"] = 0.0
+        summary["count"] = valid_count
+
     dataset_groups, timeframe_groups, default_key = _group_datasets(datasets)
 
     def _resolve_record_dataset(record: Dict[str, object]) -> Tuple[Tuple[str, Optional[str]], List[DatasetSpec]]:
@@ -2742,6 +2791,7 @@ def _execute_single(
         test_bars=int(walk_cfg.get("test_bars", 2000)),
         step=int(walk_cfg.get("step", 2000)),
         htf_df=primary_dataset.htf,
+        min_trades=min_trades_requirement,
     )
 
     cv_summary = None
@@ -2759,6 +2809,7 @@ def _execute_single(
             embargo=cv_embargo,
             htf_df=primary_dataset.htf,
         )
+        _apply_min_trades_to_cv(cv_summary, min_trades_threshold)
         wf_summary["purged_kfold"] = cv_summary
         cv_manifest = {"type": "purged-kfold", "k": cv_k, "embargo": cv_embargo}
     elif cv_choice and cv_choice != "none":
@@ -2806,6 +2857,7 @@ def _execute_single(
                 test_bars=int(walk_cfg.get("test_bars", 2000)),
                 step=int(walk_cfg.get("step", 2000)),
                 htf_df=candidate_dataset.htf,
+                min_trades=min_trades_requirement,
             )
             wf_cache[record["trial"]] = candidate_wf
             candidate_summaries.append(

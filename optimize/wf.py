@@ -37,6 +37,7 @@ def run_walk_forward(
     test_bars: int,
     step: int,
     htf_df: Optional[pd.DataFrame] = None,
+    min_trades: int | None = None,
 ) -> Dict[str, object]:
     segments: List[SegmentResult] = []
     total = len(df)
@@ -47,16 +48,31 @@ def run_walk_forward(
     train_bars = int(train_bars)
     test_bars = int(test_bars)
     step = max(int(step), 1)
+    min_trades_threshold = 0 if min_trades is None else max(int(min_trades), 0)
+
+    def _safe_float(value: object) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(number):
+            return 0.0
+        return number
 
     if train_bars <= 0 or train_bars >= total:
         train_bars = total
     if test_bars <= 0 or train_bars + test_bars > total:
         metrics = run_backtest(df, params, fees, risk, htf_df=htf_df)
         clean = _clean_metrics(metrics)
+        trades = _safe_float(clean.get("Trades", 0.0))
+        valid = bool(clean.get("Valid", True)) and trades >= min_trades_threshold
+        if not valid:
+            clean["Valid"] = 0.0
+        net_profit = _safe_float(clean.get("NetProfit", 0.0)) if valid else 0.0
         return {
             "segments": segments,
-            "oos_mean": float(clean.get("NetProfit", 0.0)),
-            "oos_median": float(clean.get("NetProfit", 0.0)),
+            "oos_mean": net_profit,
+            "oos_median": net_profit,
             "count": 0,
             "full_run": clean,
         }
@@ -78,10 +94,18 @@ def run_walk_forward(
         train_metrics = run_backtest(train_df, params, fees, risk, htf_df=train_htf)
         test_metrics = run_backtest(test_df, params, fees, risk, htf_df=test_htf)
 
+        clean_train = _clean_metrics(train_metrics)
+        clean_test = _clean_metrics(test_metrics)
+
+        trades = _safe_float(clean_test.get("Trades", 0.0))
+        valid = bool(clean_test.get("Valid", True)) and trades >= min_trades_threshold
+        if not valid:
+            clean_test["Valid"] = 0.0
+
         segments.append(
             SegmentResult(
-                train_metrics=_clean_metrics(train_metrics),
-                test_metrics=_clean_metrics(test_metrics),
+                train_metrics=clean_train,
+                test_metrics=clean_test,
                 train_start=train_df.index[0],
                 train_end=train_df.index[-1],
                 test_start=test_df.index[0],
@@ -90,13 +114,14 @@ def run_walk_forward(
         )
         start += step
 
-    oos_returns = [seg.test_metrics.get("NetProfit", 0.0) for seg in segments if seg.test_metrics.get("Valid", True)]
+    valid_segments = [seg for seg in segments if seg.test_metrics.get("Valid", True)]
+    oos_returns = [seg.test_metrics.get("NetProfit", 0.0) for seg in valid_segments]
     oos_series = pd.Series(oos_returns) if oos_returns else pd.Series(dtype=float)
     summary = {
         "segments": segments,
         "oos_mean": float(oos_series.mean()) if not oos_series.empty else 0.0,
         "oos_median": float(oos_series.median()) if not oos_series.empty else 0.0,
-        "count": len(segments),
+        "count": len(valid_segments),
     }
     return summary
 
