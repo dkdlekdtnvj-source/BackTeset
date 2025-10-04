@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -146,6 +148,7 @@ def export_results(
         param_order,
         (
             "ProfitFactor",
+            "Sortino",
             "Score",
             "CompositeScore",
             "Valid",
@@ -163,6 +166,7 @@ def export_results(
             param_order,
             (
                 "ProfitFactor",
+                "Sortino",
                 "Score",
                 "Valid",
                 "Trades",
@@ -303,7 +307,33 @@ def generate_reports(
         output_dir,
         param_order=param_order,
     )
-    export_best(best, wf_summary, output_dir)
+
+    best_payload = deepcopy(best)
+    if isinstance(best_payload, dict):
+        params_payload = best_payload.get("params")
+        if isinstance(params_payload, dict):
+            ordered_params = OrderedDict()
+            if param_order:
+                for key in param_order:
+                    if key in params_payload and key not in ordered_params:
+                        ordered_params[key] = params_payload[key]
+            for key, value in params_payload.items():
+                if key not in ordered_params:
+                    ordered_params[key] = value
+            best_payload["params"] = dict(ordered_params)
+
+        metrics_payload = best_payload.get("metrics")
+        if isinstance(metrics_payload, dict):
+            ordered_metrics = OrderedDict()
+            for key in ("ProfitFactor", "Sortino"):
+                if key in metrics_payload and key not in ordered_metrics:
+                    ordered_metrics[key] = metrics_payload[key]
+            for key, value in metrics_payload.items():
+                if key not in ordered_metrics:
+                    ordered_metrics[key] = value
+            best_payload["metrics"] = dict(ordered_metrics)
+
+    export_best(best_payload, wf_summary, output_dir)
     export_timeframe_summary(dataset_df, output_dir)
 
     params = list(best.get("params", {}).keys())
@@ -387,6 +417,7 @@ def write_trials_dataframe(
 
     summary_columns: Dict[str, pd.Series] = {
         "ProfitFactor": _attr_value("profit_factor"),
+        "Sortino": _metric_value("Sortino"),
         "Score": _attr_value("score"),
         "Valid": _attr_value("valid"),
         "Trades": _attr_value("trades"),
@@ -420,4 +451,6 @@ def write_trials_dataframe(
 
 
 def write_bank_file(output_dir: Path, payload: Dict[str, object]) -> None:
-    (output_dir / "bank.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    (output_dir / "bank.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False)
+    )
