@@ -3944,6 +3944,28 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
     params_cfg = load_yaml(args.params)
     backtest_cfg = load_yaml(args.backtest)
 
+    ltf_prompt = getattr(args, "_ltf_prompt_selection", None)
+    if (
+        ltf_prompt is None
+        and not getattr(args, "timeframe", None)
+        and not getattr(args, "timeframe_grid", None)
+    ):
+        ltf_prompt = _prompt_ltf_selection()
+        setattr(args, "_ltf_prompt_selection", ltf_prompt)
+
+    all_timeframes_requested = False
+    if ltf_prompt:
+        if ltf_prompt.use_all:
+            all_timeframes_requested = True
+            args.timeframe = None
+            if not getattr(args, "timeframe_grid", None):
+                ltf_candidates = _collect_ltf_candidates(backtest_cfg, params_cfg)
+                if not ltf_candidates:
+                    ltf_candidates = ["1m", "3m", "5m"]
+                args.timeframe_grid = ",".join(ltf_candidates)
+        elif ltf_prompt.timeframe and not getattr(args, "timeframe", None):
+            args.timeframe = ltf_prompt.timeframe
+
     auto_list: List[str] = []
 
     def _load_top_list() -> List[str]:

@@ -1,7 +1,15 @@
+import math
+
 import pandas as pd
 import pytest
 
-from optimize.strategy_model import _security_series, run_backtest
+from optimize.strategy_model import (
+    _bars_since_mask,
+    _rolling_rma_last,
+    _security_series,
+    _true_range,
+    run_backtest,
+)
 
 
 def _make_ohlcv(prices):
@@ -179,3 +187,75 @@ def test_security_series_resamples_monthly_timeframe():
     period_index = result.index.tz_localize(None).to_period("M")
     unique_per_month = result.groupby(period_index).nunique()
     assert (unique_per_month == 1).all()
+
+
+def test_mom_fade_bars_since_vectorised_matches_reference():
+    hist = pd.Series(
+        [0.5, -0.2, -0.1, 0.3, 0.2, -0.4, 0.1, 0.0, 0.6, -0.3],
+        index=pd.date_range("2025-01-01", periods=10, freq="1min", tz="UTC"),
+    )
+
+    nonpos_mask = hist.le(0)
+    nonneg_mask = hist.ge(0)
+
+    vector_nonpos = _bars_since_mask(nonpos_mask)
+    vector_nonneg = _bars_since_mask(nonneg_mask)
+
+    def _reference(mask: pd.Series) -> pd.Series:
+        results = []
+        for idx, _ in enumerate(mask):
+            count = 0
+            found = False
+            for lookback in range(idx, -1, -1):
+                if mask.iloc[lookback]:
+                    results.append(float(count))
+                    found = True
+                    break
+                count += 1
+            if not found:
+                results.append(float("inf"))
+        return pd.Series(results, index=mask.index, dtype=float)
+
+    ref_nonpos = _reference(nonpos_mask)
+    ref_nonneg = _reference(nonneg_mask)
+
+    for left, right in zip(vector_nonpos, ref_nonpos):
+        if math.isinf(right):
+            assert math.isinf(left)
+        else:
+            assert left == pytest.approx(right)
+
+    for left, right in zip(vector_nonneg, ref_nonneg):
+        if math.isinf(right):
+            assert math.isinf(left)
+        else:
+            assert left == pytest.approx(right)
+
+
+def test_volatility_guard_atr_matches_reference():
+    prices = [100, 101, 100.5, 102, 101.5, 103, 102.5, 104, 103.5, 105]
+    df = _make_ohlcv(prices)
+    window = 3
+
+    tr_series = _true_range(df)
+    atr_values = _rolling_rma_last(tr_series.to_numpy(dtype=float), window)
+
+    computed = []
+    for idx, close_value in enumerate(df["close"].to_numpy(dtype=float)):
+        if idx >= window and not math.isnan(atr_values[idx]) and close_value != 0.0:
+            computed.append(atr_values[idx] / close_value * 100.0)
+        else:
+            computed.append(0.0)
+
+    expected = []
+    for idx in range(len(df)):
+        if idx >= window:
+            window_tr = tr_series.iloc[idx - window + 1 : idx + 1].to_numpy(dtype=float)
+            acc = window_tr[0]
+            for value in window_tr[1:]:
+                acc = (acc * (window - 1) + value) / window
+            expected.append(acc / df["close"].iloc[idx] * 100.0)
+        else:
+            expected.append(0.0)
+
+    assert computed == pytest.approx(expected)

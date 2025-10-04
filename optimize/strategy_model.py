@@ -92,6 +92,38 @@ LOGGER = logging.getLogger(__name__)
 # =====================================================================================
 
 
+@njit  # type: ignore[misc]
+def _rolling_rma_last(values: np.ndarray, length: int) -> np.ndarray:
+    """슬라이딩 윈도우에 대해 Wilder RMA의 마지막 값을 계산합니다."""
+
+    n = len(values)
+    result = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        result[i] = np.nan
+
+    if length <= 0:
+        return result
+
+    for idx in range(length - 1, n):
+        start = idx - length + 1
+        acc = values[start]
+        for j in range(start + 1, idx + 1):
+            acc = (acc * (length - 1) + values[j]) / length
+        result[idx] = acc
+
+    return result
+
+
+def _bars_since_mask(mask: pd.Series) -> pd.Series:
+    mask_values = mask.fillna(False).to_numpy(dtype=bool)
+    indices = np.arange(mask_values.shape[0], dtype=np.int64)
+    last_true = np.where(mask_values, indices, -1)
+    last_true = np.maximum.accumulate(last_true)
+    counts = indices.astype(float) - last_true.astype(float)
+    counts[last_true < 0] = np.inf
+    return pd.Series(counts, index=mask.index, dtype=float)
+
+
 def _ensure_series(values: Iterable[float], index: pd.Index) -> pd.Series:
     return pd.Series(values, index=index, dtype=float)
 
@@ -980,6 +1012,10 @@ def run_backtest(
     mom_fade_abs = mom_fade_hist.abs()
     mom_fade_abs_prev = mom_fade_abs.shift().fillna(mom_fade_abs)
     mom_fade_abs_prev2 = mom_fade_abs.shift(2).fillna(mom_fade_abs_prev)
+    mom_fade_nonpos = mom_fade_hist.le(0)
+    mom_fade_nonneg = mom_fade_hist.ge(0)
+    mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
+    mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
     gate_dev = mom_fade_dev
     gate_atr = mom_range
@@ -1010,6 +1046,21 @@ def run_backtest(
         sell_thresh_series = pd.Series(sell_val, index=df.index)
 
     atr_len_series = _atr(df, osc_len)
+
+    vol_guard_atr_pct = pd.Series(0.0, index=df.index)
+    if use_volatility_guard:
+        atr_window = max(volatility_lookback, 1)
+        tr_values = _true_range(df).to_numpy(dtype=float)
+        atr_series_values = _rolling_rma_last(tr_values, atr_window)
+        close_values = df["close"].to_numpy(dtype=float)
+        atr_pct_array = np.zeros(len(df), dtype=float)
+        for pos in range(len(df)):
+            if pos >= atr_window:
+                atr_val = atr_series_values[pos]
+                close_val = close_values[pos]
+                if not np.isnan(atr_val) and close_val != 0.0:
+                    atr_pct_array[pos] = atr_val / close_val * 100.0
+        vol_guard_atr_pct = pd.Series(atr_pct_array, index=df.index)
 
     # 보조 필터 선계산 --------------------------------------------------------------
     if use_adx or use_atr_diff:
@@ -1342,14 +1393,6 @@ def run_backtest(
                 recent_trade_results.pop(0)
         reentry_countdown = reentry_bars
 
-    def bars_since(series: pd.Series, idx: int, condition: callable) -> int:
-        count = 0
-        for lookback in range(idx, -1, -1):
-            if condition(series.iloc[lookback]):
-                return count
-            count += 1
-        return int(1e9)
-
     prev_guard_state = guard_frozen
 
     for idx, ts in enumerate(df.index):
@@ -1395,13 +1438,7 @@ def run_backtest(
         loss_count_breached = max_daily_losses > 0 and daily_losses >= max_daily_losses
         guard_fire_limit = max_guard_fires > 0 and guard_fired_total >= max_guard_fires
 
-        atr_pct_val = 0.0
-        if use_volatility_guard:
-            atr_window = max(volatility_lookback, 1)
-            if idx >= atr_window:
-                atr_pct_val = _atr(df.iloc[idx - atr_window + 1 : idx + 1], atr_window).iloc[-1] / row["close"] * 100.0
-            else:
-                atr_pct_val = 0.0
+        atr_pct_val = vol_guard_atr_pct.iloc[idx] if use_volatility_guard else 0.0
         is_vol_ok = (not use_volatility_guard) or (
             volatility_lower_pct <= atr_pct_val <= volatility_upper_pct
         )
@@ -1617,7 +1654,10 @@ def run_backtest(
                 mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
                 and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
             )
-            fade_delay_long = mom_fade_zero_delay <= 0 or bars_since(mom_fade_hist, idx, lambda v: v <= 0) > mom_fade_zero_delay
+            fade_delay_long = (
+                mom_fade_zero_delay <= 0
+                or mom_fade_since_nonpos.iloc[idx] > mom_fade_zero_delay
+            )
             fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (
@@ -1647,7 +1687,10 @@ def run_backtest(
                 mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
                 and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
             )
-            fade_delay_short = mom_fade_zero_delay <= 0 or bars_since(mom_fade_hist, idx, lambda v: v >= 0) > mom_fade_zero_delay
+            fade_delay_short = (
+                mom_fade_zero_delay <= 0
+                or mom_fade_since_nonneg.iloc[idx] > mom_fade_zero_delay
+            )
             fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (
