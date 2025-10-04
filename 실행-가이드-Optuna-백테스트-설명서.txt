@@ -121,3 +121,6 @@ C. 이상치 스코어(무한대/NaN → 큰 양수 치환)
 - 데이터 다운로드 캐시가 존재하면 자동 재사용됨.
 
 끝.
+
+python -m pip install psycopg2-binary
+$env:OPTUNA_STORAGE = "postgresql+psycopg2://optuser:optuna@localhost:5432/optuna"
