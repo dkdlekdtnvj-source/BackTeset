@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -106,12 +106,74 @@ def _annotate_objectives(df: pd.DataFrame, objectives: Iterable[object]) -> pd.D
     return df
 
 
-def export_results(results: List[Dict[str, object]], objectives: Iterable[object], output_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _reorder_table(
+    df: pd.DataFrame,
+    param_order: Optional[Sequence[str]],
+    leading_columns: Sequence[str],
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    rename_map = {"score": "Score", "valid": "Valid"}
+    df = df.rename(columns={key: value for key, value in rename_map.items() if key in df.columns})
+
+    front: List[str] = [col for col in leading_columns if col in df.columns]
+    ordered_params: List[str] = []
+    if param_order:
+        ordered_params = [col for col in param_order if col in df.columns]
+    remaining = [
+        col
+        for col in df.columns
+        if col not in front
+        and col not in ordered_params
+    ]
+    ordered_cols = front + ordered_params + remaining
+    return df.loc[:, ordered_cols]
+
+
+def export_results(
+    results: List[Dict[str, object]],
+    objectives: Iterable[object],
+    output_dir: Path,
+    *,
+    param_order: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     _ensure_dir(output_dir)
     agg_df, dataset_df = _flatten_results(results)
     agg_df = _annotate_objectives(agg_df, objectives)
+    agg_df = _reorder_table(
+        agg_df,
+        param_order,
+        (
+            "ProfitFactor",
+            "Score",
+            "CompositeScore",
+            "Valid",
+            "Trades",
+            "WinRate",
+            "MaxDD",
+            "NetProfit",
+            "trial",
+        ),
+    )
     agg_df.to_csv(output_dir / "results.csv", index=False)
     if not dataset_df.empty:
+        dataset_df = _reorder_table(
+            dataset_df,
+            param_order,
+            (
+                "ProfitFactor",
+                "Score",
+                "Valid",
+                "Trades",
+                "WinRate",
+                "MaxDD",
+                "dataset",
+                "timeframe",
+                "htf_timeframe",
+                "trial",
+            ),
+        )
         dataset_df.to_csv(output_dir / "results_datasets.csv", index=False)
     return agg_df, dataset_df
 
@@ -232,8 +294,15 @@ def generate_reports(
     wf_summary: Dict[str, object],
     objectives: Iterable[object],
     output_dir: Path,
+    *,
+    param_order: Optional[Sequence[str]] = None,
 ) -> None:
-    agg_df, dataset_df = export_results(results, objectives, output_dir)
+    agg_df, dataset_df = export_results(
+        results,
+        objectives,
+        output_dir,
+        param_order=param_order,
+    )
     export_best(best, wf_summary, output_dir)
     export_timeframe_summary(dataset_df, output_dir)
 
@@ -243,15 +312,111 @@ def generate_reports(
     export_heatmap(agg_df, params, metric_name, plots_dir)
 
 
-def write_trials_dataframe(study: optuna.study.Study, output_dir: Path) -> None:
+def write_trials_dataframe(
+    study: optuna.study.Study,
+    output_dir: Path,
+    *,
+    param_order: Optional[Sequence[str]] = None,
+) -> None:
     _ensure_dir(output_dir)
     try:
-        trials_df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+        trials_df = study.trials_dataframe(
+            attrs=(
+                "number",
+                "value",
+                "state",
+                "datetime_start",
+                "datetime_complete",
+                "params",
+                "user_attrs",
+            )
+        )
     except Exception:
         return
     if trials_df.empty:
         return
-    trials_df.to_csv(output_dir / "trials.csv", index=False)
+    attrs_series = trials_df.get("user_attrs") if "user_attrs" in trials_df else None
+    if attrs_series is not None:
+        attrs_series = attrs_series.apply(
+            lambda payload: payload if isinstance(payload, dict) else {}
+        )
+
+    def _attr_value(key: str) -> pd.Series:
+        if attrs_series is None:
+            return pd.Series([None] * len(trials_df))
+        return attrs_series.apply(lambda payload: payload.get(key))
+
+    def _metric_value(*names: str) -> pd.Series:
+        if attrs_series is None:
+            return pd.Series([None] * len(trials_df))
+
+        def _extract(payload: object) -> Optional[object]:
+            metrics = None
+            if isinstance(payload, dict):
+                metrics = payload.get("metrics")
+            if not isinstance(metrics, dict):
+                return None
+            for name in names:
+                if name in metrics:
+                    return metrics.get(name)
+            return None
+
+        return attrs_series.apply(_extract)
+
+    if attrs_series is not None:
+        dataset_meta = attrs_series.apply(
+            lambda payload: payload.get("dataset_key")
+            if isinstance(payload, dict)
+            else {}
+        )
+    else:
+        dataset_meta = pd.Series([{}] * len(trials_df))
+
+    trial_numbers = trials_df["number"] if "number" in trials_df else pd.Series(range(len(trials_df)))
+    states = (
+        trials_df["state"].astype(str)
+        if "state" in trials_df
+        else pd.Series([None] * len(trials_df))
+    )
+    values = trials_df["value"] if "value" in trials_df else pd.Series([None] * len(trials_df))
+    completed = (
+        trials_df["datetime_complete"]
+        if "datetime_complete" in trials_df
+        else pd.Series([None] * len(trials_df))
+    )
+
+    summary_columns: Dict[str, pd.Series] = {
+        "ProfitFactor": _attr_value("profit_factor"),
+        "Score": _attr_value("score"),
+        "Valid": _attr_value("valid"),
+        "Trades": _attr_value("trades"),
+        "WinRate": _metric_value("WinRate"),
+        "MaxDD": _metric_value("MaxDD", "MaxDrawdown"),
+        "Trial": trial_numbers,
+        "State": states,
+        "Value": values,
+        "Completed": completed,
+        "Timeframe": dataset_meta.apply(lambda meta: meta.get("timeframe") if isinstance(meta, dict) else None),
+        "HTF": dataset_meta.apply(lambda meta: meta.get("htf_timeframe") if isinstance(meta, dict) else None),
+    }
+
+    summary_df = pd.DataFrame(summary_columns)
+
+    params_series = trials_df.get("params") if "params" in trials_df else None
+    if params_series is not None:
+        params_df = pd.json_normalize(params_series).replace({pd.NA: None})
+    else:
+        params_df = pd.DataFrame()
+    if not params_df.empty:
+        ordered_params: List[str] = []
+        if param_order:
+            ordered_params = [col for col in param_order if col in params_df.columns]
+        remaining_params = [col for col in params_df.columns if col not in ordered_params]
+        params_df = params_df.loc[:, ordered_params + remaining_params]
+
+    combined = pd.concat([summary_df, params_df], axis=1)
+    combined = combined.loc[:, [col for col in combined.columns if not combined[col].isna().all()]]
+    combined.to_csv(output_dir / "trials.csv", index=False)
 
 
 def write_bank_file(output_dir: Path, payload: Dict[str, object]) -> None:
