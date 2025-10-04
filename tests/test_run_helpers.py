@@ -6,8 +6,10 @@ import pandas as pd
 import pytest
 
 from optimize.run import (
+    PROFIT_FACTOR_CHECK_LABEL,
     DatasetSpec,
     _apply_study_registry_defaults,
+    _clean_metrics,
     _dataset_total_volume,
     _filter_basic_factor_params,
     _has_sufficient_volume,
@@ -243,3 +245,16 @@ def test_sanitise_storage_meta_masks_password():
     assert masked["url"].startswith("postgresql://postgres:***@127.0.0.1")
     # 원본 딕셔너리는 변경하지 않습니다.
     assert raw["url"].endswith("/optuna")
+
+
+def test_clean_metrics_rounds_profit_factor() -> None:
+    metrics = {"ProfitFactor": 1.98765, "Other": 10}
+    cleaned = _clean_metrics(metrics)
+    assert cleaned["ProfitFactor"] == "1.988"
+    assert cleaned["Other"] == 10
+
+
+def test_clean_metrics_preserves_check_label() -> None:
+    metrics = {"ProfitFactor": PROFIT_FACTOR_CHECK_LABEL}
+    cleaned = _clean_metrics(metrics)
+    assert cleaned["ProfitFactor"] == PROFIT_FACTOR_CHECK_LABEL

@@ -32,6 +32,7 @@ import ccxt
 import sqlalchemy
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
+from optuna.trial import TrialState
 
 from datafeed.cache import DataCache
 from optimize.metrics import (
@@ -135,6 +136,7 @@ DEFAULT_STORAGE_ENV_KEY = "OPTUNA_STORAGE"
 DEFAULT_POSTGRES_STORAGE_URL = (
     "postgresql://postgres:5432@127.0.0.1:5432/optuna"
 )
+POSTGRES_PREFIXES = ("postgresql://", "postgresql+psycopg://")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
@@ -142,12 +144,14 @@ STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
 PF_ANOMALY_THRESHOLD = 50.0
 MIN_VOLUME_THRESHOLD = 100.0
+MIN_TRADES_ENFORCED = 70
+PROFIT_FACTOR_CHECK_LABEL = "체크 필요"
 TRIAL_PROGRESS_FIELDS = [
     "number",
-    "state",
-    "value",
-    "score",
     "profit_factor",
+    "score",
+    "value",
+    "state",
     "trades",
     "win_rate",
     "max_dd",
@@ -162,6 +166,15 @@ TRIAL_PROGRESS_FIELDS = [
 
 
 TRIAL_LOG_WRITE_LOCK = Lock()
+
+
+def _mask_storage_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:
+        return url
 
 
 def _make_sqlite_storage(
@@ -1894,7 +1907,10 @@ def _clean_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     clean: Dict[str, object] = {}
     for key, value in metrics.items():
         if isinstance(value, (int, float, bool, str)):
-            clean[key] = value
+            if key == "ProfitFactor" and isinstance(value, (int, float)):
+                clean[key] = f"{float(value):.3f}"
+            else:
+                clean[key] = value
         elif isinstance(value, (list, tuple)):
             if all(isinstance(item, (int, float, bool, str)) for item in value):
                 clean[key] = ", ".join(str(item) for item in value)
@@ -1958,6 +1974,7 @@ def optimisation_loop(
     )
 
     space = _restrict_to_basic_factors(original_space, enabled=use_basic_factors)
+    param_order = list(space.keys())
     if use_basic_factors:
         if len(space) != len(original_space):
             LOGGER.info(
@@ -2051,6 +2068,13 @@ def optimisation_loop(
         )
         if dataset_executor == "process" and dataset_start_method:
             LOGGER.info("프로세스 start method=%s", dataset_start_method)
+
+    LOGGER.info(
+        "최종 병렬 구성: Optuna worker=%d, 데이터셋 worker=%d (%s)",
+        n_jobs,
+        dataset_jobs,
+        dataset_executor,
+    )
 
     algo_raw = search_cfg.get("algo", "bayes")
     algo = str(algo_raw or "bayes").lower()
@@ -2302,12 +2326,7 @@ def optimisation_loop(
         return value
 
     def _log_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        if trial_log_path is None:
-            return
-
         with TRIAL_LOG_WRITE_LOCK:
-            trial_log_path.parent.mkdir(parents=True, exist_ok=True)
-
             def _normalise_value(value: object) -> Optional[object]:
                 if value is None:
                     return None
@@ -2332,61 +2351,65 @@ def optimisation_loop(
                 "params": {key: _to_native(val) for key, val in trial.params.items()},
                 "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None,
             }
-            with trial_log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            if trial_log_path is not None:
+                trial_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with trial_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            metrics_attr = trial.user_attrs.get("metrics")
+            metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
+
+            def _metric_value(name: str) -> Optional[object]:
+                if name not in metrics:
+                    return None
+                return _to_native(metrics.get(name))
+
+            dataset_key = trial.user_attrs.get("dataset_key")
+            dataset_meta = dataset_key if isinstance(dataset_key, dict) else {}
+            skipped_attr = trial.user_attrs.get("skipped_datasets")
+            if isinstance(skipped_attr, list):
+                skipped_serialisable = skipped_attr
+            else:
+                skipped_serialisable = [skipped_attr] if skipped_attr else []
+
+            max_dd_value = _metric_value("MaxDD")
+            if max_dd_value is None:
+                max_dd_value = _metric_value("MaxDrawdown")
+
+            value_field: object
+            if isinstance(trial_value, list):
+                value_field = json.dumps(trial_value, ensure_ascii=False)
+            else:
+                value_field = trial_value
+
+            params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
+            skipped_json = (
+                json.dumps(skipped_serialisable, ensure_ascii=False)
+                if skipped_serialisable
+                else ""
+            )
+
+            row = {
+                "number": trial.number,
+                "state": str(trial.state),
+                "value": value_field,
+                "score": trial.user_attrs.get("score"),
+                "profit_factor": _metric_value("ProfitFactor")
+                or trial.user_attrs.get("profit_factor"),
+                "trades": _metric_value("Trades"),
+                "win_rate": _metric_value("WinRate"),
+                "max_dd": max_dd_value,
+                "valid": trial.user_attrs.get("valid"),
+                "timeframe": dataset_meta.get("timeframe"),
+                "htf_timeframe": dataset_meta.get("htf_timeframe"),
+                "pruned": trial.user_attrs.get("pruned"),
+                "params": params_json,
+                "skipped_datasets": skipped_json,
+                "datetime_complete": record["datetime_complete"],
+            }
 
             if trial_csv_path is not None:
-                metrics_attr = trial.user_attrs.get("metrics")
-                metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
-
-                def _metric_value(name: str) -> Optional[object]:
-                    if name not in metrics:
-                        return None
-                    return _to_native(metrics.get(name))
-
-                dataset_key = trial.user_attrs.get("dataset_key")
-                dataset_meta = dataset_key if isinstance(dataset_key, dict) else {}
-                skipped_attr = trial.user_attrs.get("skipped_datasets")
-                if isinstance(skipped_attr, list):
-                    skipped_serialisable = skipped_attr
-                else:
-                    skipped_serialisable = [skipped_attr] if skipped_attr else []
-
-                max_dd_value = _metric_value("MaxDD")
-                if max_dd_value is None:
-                    max_dd_value = _metric_value("MaxDrawdown")
-
-                value_field: object
-                if isinstance(trial_value, list):
-                    value_field = json.dumps(trial_value, ensure_ascii=False)
-                else:
-                    value_field = trial_value
-
-                params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
-                skipped_json = (
-                    json.dumps(skipped_serialisable, ensure_ascii=False)
-                    if skipped_serialisable
-                    else ""
-                )
-
-                row = {
-                    "number": trial.number,
-                    "state": str(trial.state),
-                    "value": value_field,
-                    "score": trial.user_attrs.get("score"),
-                    "profit_factor": _metric_value("ProfitFactor"),
-                    "trades": _metric_value("Trades"),
-                    "win_rate": _metric_value("WinRate"),
-                    "max_dd": max_dd_value,
-                    "valid": trial.user_attrs.get("valid"),
-                    "timeframe": dataset_meta.get("timeframe"),
-                    "htf_timeframe": dataset_meta.get("htf_timeframe"),
-                    "pruned": trial.user_attrs.get("pruned"),
-                    "params": params_json,
-                    "skipped_datasets": skipped_json,
-                    "datetime_complete": record["datetime_complete"],
-                }
-
                 file_exists = trial_csv_path.exists()
                 trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
                 with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
@@ -2394,6 +2417,30 @@ def optimisation_loop(
                     if not file_exists:
                         writer.writeheader()
                     writer.writerow(row)
+
+            try:
+                trials_snapshot = study.get_trials(deepcopy=False)
+            except TypeError:
+                trials_snapshot = study.trials
+            completed = sum(
+                1
+                for item in trials_snapshot
+                if item.state in {TrialState.COMPLETE, TrialState.PRUNED}
+            )
+            total_display: object = n_trials if n_trials else len(trials_snapshot)
+            pf_display = row.get("profit_factor") or trial.user_attrs.get("profit_factor") or "-"
+            trades_display = row.get("trades") if row.get("trades") not in {None, ""} else "-"
+            score_display = row.get("score") if row.get("score") not in {None, ""} else "-"
+            LOGGER.info(
+                "작업 진행상황 ＝＝＝＝＝＝ %d/%s (Trial %d %s) ProfitFactor=%s, Score=%s, Trades=%s",
+                completed,
+                total_display,
+                trial.number,
+                row.get("state"),
+                pf_display,
+                score_display,
+                trades_display,
+            )
 
             if best_yaml_path is None:
                 return
@@ -2435,9 +2482,7 @@ def optimisation_loop(
                 snapshot["basic_params"] = dict(best_params_full)
             with best_yaml_path.open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
-    callbacks: List = []
-    if trial_log_path is not None:
-        callbacks.append(_log_trial)
+    callbacks: List = [_log_trial]
 
     def objective(trial: optuna.Trial) -> float:
         params = _safe_sample_parameters(trial, space)
@@ -2543,19 +2588,49 @@ def optimisation_loop(
                         int(wins_val),
                     )
 
-            pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
-            if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
+            trades_value = _coerce_int(metrics.get("Trades") or metrics.get("TotalTrades"))
+            if trades_value is None:
+                trades_value = _coerce_int(cleaned_metrics.get("Trades"))
+            if trades_value is not None:
+                cleaned_metrics["Trades"] = trades_value
+            if trades_value is not None and trades_value < MIN_TRADES_ENFORCED:
                 dataset_entry["skipped"] = True
-                dataset_entry["skip_reason"] = "profit_factor_threshold"
-                dataset_entry["skip_metric"] = pf_value
-                dataset_entry["skip_threshold"] = PF_ANOMALY_THRESHOLD
+                dataset_entry["skip_reason"] = "trades_threshold"
+                dataset_entry["skip_metric"] = trades_value
+                dataset_entry["skip_threshold"] = MIN_TRADES_ENFORCED
                 dataset_metrics.append(dataset_entry)
                 skipped_dataset_records.append(
                     {
                         "name": dataset.name,
                         "timeframe": dataset.timeframe,
                         "htf_timeframe": dataset.htf_timeframe,
-                        "profit_factor": pf_value,
+                        "trades": trades_value,
+                        "min_trades": MIN_TRADES_ENFORCED,
+                    }
+                )
+                LOGGER.warning(
+                    "데이터셋 %s 의 트레이드 수 %d 가 최소 요구치 %d 미만이라 제외합니다.",
+                    dataset.name,
+                    trades_value,
+                    MIN_TRADES_ENFORCED,
+                )
+                return
+
+            pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
+            if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
+                dataset_entry["skipped"] = True
+                dataset_entry["skip_reason"] = "profit_factor_threshold"
+                dataset_entry["skip_metric"] = f"{pf_value:.3f}"
+                dataset_entry["skip_threshold"] = PF_ANOMALY_THRESHOLD
+                cleaned_metrics["ProfitFactor"] = PROFIT_FACTOR_CHECK_LABEL
+                dataset_metrics.append(dataset_entry)
+                skipped_dataset_records.append(
+                    {
+                        "name": dataset.name,
+                        "timeframe": dataset.timeframe,
+                        "htf_timeframe": dataset.htf_timeframe,
+                        "profit_factor": f"{pf_value:.3f}",
+                        "status": PROFIT_FACTOR_CHECK_LABEL,
                     }
                 )
                 LOGGER.warning(
@@ -2777,8 +2852,38 @@ def optimisation_loop(
             score = non_finite_penalty
             valid_status = False
             cleaned_aggregated["Valid"] = False
+            cleaned_aggregated["ProfitFactor"] = PROFIT_FACTOR_CHECK_LABEL
             if multi_objective and objective_values is not None:
                 objective_values = tuple(non_finite_penalty for _ in objective_values)
+
+        trades_total = _coerce_int(cleaned_aggregated.get("Trades"))
+        trade_anomaly = False
+        if trades_total is not None:
+            cleaned_aggregated["Trades"] = trades_total
+            if trades_total < MIN_TRADES_ENFORCED:
+                trade_anomaly = True
+                LOGGER.warning(
+                    "트라이얼 %d 의 총 트레이드 수 %d 가 최소 요구치 %d 미만이라 결과를 무효 처리합니다.",
+                    trial.number,
+                    trades_total,
+                    MIN_TRADES_ENFORCED,
+                )
+                score = non_finite_penalty
+                valid_status = False
+                cleaned_aggregated["Valid"] = False
+                if multi_objective and objective_values is not None:
+                    objective_values = tuple(non_finite_penalty for _ in objective_values)
+                trade_info = {
+                    "type": "trades_threshold",
+                    "value": trades_total,
+                    "threshold": MIN_TRADES_ENFORCED,
+                }
+                if anomaly_info is None:
+                    anomaly_info = trade_info
+                elif isinstance(anomaly_info, dict):
+                    related = anomaly_info.setdefault("related", [])
+                    if isinstance(related, list):
+                        related.append(trade_info)
 
         record = {
             "trial": trial.number,
@@ -2799,15 +2904,16 @@ def optimisation_loop(
             results.append(record)
         trial.set_user_attr("score", float(score))
         trial.set_user_attr("metrics", cleaned_aggregated)
-        trial.set_user_attr(
-            "profit_factor",
-            _safe_float(cleaned_aggregated.get("ProfitFactor")),
-        )
+        pf_display = cleaned_aggregated.get("ProfitFactor")
+        if pf_display is None and pf_anomaly:
+            pf_display = PROFIT_FACTOR_CHECK_LABEL
+        trial.set_user_attr("profit_factor", pf_display)
         trial.set_user_attr("trades", _coerce_int(cleaned_aggregated.get("Trades")))
         trial.set_user_attr("valid", valid_status)
         trial.set_user_attr("pruned", False)
         trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
         trial.set_user_attr("profit_factor_anomaly", pf_anomaly)
+        trial.set_user_attr("min_trades_enforced", trade_anomaly)
         if pf_anomaly and anomaly_info is not None:
             trial.set_user_attr("anomaly_reason", anomaly_info.get("type"))
         if multi_objective and objective_values is not None:
@@ -2893,6 +2999,7 @@ def optimisation_loop(
         "storage": storage_meta,
         "basic_factor_profile": use_basic_factors,
         "llm_insights": llm_insights,
+        "param_order": param_order,
     }
 
 
@@ -3405,6 +3512,29 @@ def _execute_single(
         storage_env_value or search_cfg.get("storage_url") or ""
     )
     using_sqlite = effective_storage_url.startswith("sqlite:///")
+    is_postgres = effective_storage_url.startswith(POSTGRES_PREFIXES)
+    masked_storage_url = _mask_storage_url(effective_storage_url) if effective_storage_url else ""
+    if storage_env_value:
+        storage_source = f"환경변수 {storage_env_key}"
+    elif effective_storage_url:
+        storage_source = "설정값"
+    else:
+        storage_source = "기본값"
+    backend_label = (
+        "PostgreSQL"
+        if is_postgres
+        else "SQLite"
+        if using_sqlite
+        else "기타 RDB"
+        if effective_storage_url
+        else "비활성"
+    )
+    LOGGER.info(
+        "Optuna 스토리지 백엔드: %s (%s, URL=%s)",
+        backend_label,
+        storage_source,
+        masked_storage_url or "(없음)",
+    )
 
     default_optuna_jobs = (
         SQLITE_SAFE_OPTUNA_JOBS if using_sqlite else DEFAULT_OPTUNA_JOBS
@@ -3455,7 +3585,11 @@ def _execute_single(
 
     study = optimisation.get("study")
     if study is not None:
-        write_trials_dataframe(study, output_dir)
+        write_trials_dataframe(
+            study,
+            output_dir,
+            param_order=optimisation.get("param_order"),
+        )
     else:
         LOGGER.warning("No Optuna study returned; skipping trials export")
 
@@ -3698,6 +3832,7 @@ def _execute_single(
         wf_summary,
         objective_specs,
         output_dir,
+        param_order=optimisation.get("param_order"),
     )
 
     LOGGER.info("Run complete. Outputs saved to %s", output_dir)
