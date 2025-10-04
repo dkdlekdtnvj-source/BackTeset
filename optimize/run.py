@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Sequence as AbcSequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import optuna
@@ -491,6 +492,35 @@ def _filter_basic_factor_params(
     if not enabled:
         return dict(params)
     return {key: value for key, value in params.items() if key in BASIC_FACTOR_KEYS}
+
+
+def _order_mapping(
+    payload: Mapping[str, object],
+    preferred_order: Optional[Sequence[str]] = None,
+    *,
+    priority: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    """주어진 참조 순서에 맞춰 딕셔너리 순서를 재정렬합니다."""
+
+    if not isinstance(payload, Mapping):
+        return {}
+
+    ordered: "OrderedDict[str, object]" = OrderedDict()
+
+    for key in priority or ():
+        if key in payload and key not in ordered:
+            ordered[key] = payload[key]
+
+    if preferred_order:
+        for key in preferred_order:
+            if key in payload and key not in ordered:
+                ordered[key] = payload[key]
+
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+
+    return dict(ordered)
 
 
 def _git_revision() -> Optional[str]:
@@ -1112,25 +1142,35 @@ def _prompt_bool(label: str, default: Optional[bool] = None) -> Optional[bool]:
         print("Please answer 'y' or 'n'.")
 
 
-def _prompt_ltf_selection() -> str:
-    """사용자가 선호하는 LTF(1, 3, 5분봉)를 선택하도록 안내합니다."""
+@dataclass(frozen=True)
+class LTFPromptResult:
+    timeframe: Optional[str]
+    use_all: bool = False
+
+
+def _prompt_ltf_selection() -> LTFPromptResult:
+    """사용자가 선호하는 LTF 조합(1, 3, 5분봉 또는 전체)을 선택하도록 안내합니다."""
 
     options = {"1": "1m", "3": "3m", "5": "5m"}
     if not sys.stdin or not sys.stdin.isatty():
         LOGGER.info("비대화형 환경이 감지되어 기본 1m LTF를 사용합니다.")
-        return "1m"
+        return LTFPromptResult("1m")
 
     while True:
         print("\n작업을 시작 하기 전에 LTF를 선택해주세요.")
         print("  1) 1분봉")
         print("  3) 3분봉")
         print("  5) 5분봉")
-        raw = input("선택 (1/3/5): ").strip()
+        print("  7) 1/3/5 전체 (혼합 실행)")
+        raw = input("선택 (1/3/5/7): ").strip()
         if raw in options:
             selection = options[raw]
             print(f"{raw}분봉을 선택했습니다.")
-            return selection
-        print("잘못된 입력입니다. 1, 3, 5 중 하나를 입력해주세요.")
+            return LTFPromptResult(selection)
+        if raw == "7":
+            print("1, 3, 5분봉을 모두 활용해 순차 실행합니다.")
+            return LTFPromptResult(None, use_all=True)
+        print("잘못된 입력입니다. 1, 3, 5, 7 중 하나를 입력해주세요.")
 
 
 def _apply_ltf_override_to_datasets(backtest_cfg: Dict[str, object], timeframe: str) -> None:
@@ -1173,6 +1213,43 @@ def _collect_tokens(items: Iterable[str]) -> List[str]:
             if token:
                 tokens.append(token)
     return tokens
+
+
+def _collect_ltf_candidates(*configs: Mapping[str, object]) -> List[str]:
+    seen: "OrderedDict[str, None]" = OrderedDict()
+
+    def _register(value: object) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        seen.setdefault(text, None)
+
+    for cfg in configs:
+        if not isinstance(cfg, Mapping):
+            continue
+        datasets = cfg.get("datasets")
+        if isinstance(datasets, list):
+            for entry in datasets:
+                if not isinstance(entry, Mapping):
+                    continue
+                for key in ("ltf", "ltfs", "timeframes"):
+                    raw = entry.get(key)
+                    if isinstance(raw, (list, tuple)):
+                        for item in raw:
+                            _register(item)
+                    elif raw is not None:
+                        _register(raw)
+
+        timeframes = cfg.get("timeframes")
+        if isinstance(timeframes, (list, tuple)):
+            for tf in timeframes:
+                _register(tf)
+        elif timeframes is not None:
+            _register(timeframes)
+
+    return list(seen.keys())
 
 
 def _ensure_dict(root: Dict[str, object], key: str) -> Dict[str, object]:
@@ -3278,18 +3355,25 @@ def _execute_single(
     htf_choices = list(dict.fromkeys(_collect_htfs(backtest_cfg) or _collect_htfs(params_cfg)))
 
     selected_symbol = args.symbol or params_cfg.get("symbol") or (symbol_choices[0] if symbol_choices else None)
-    selected_timeframe = args.timeframe
+    selected_timeframe: Optional[str] = args.timeframe
     selected_htf: Optional[str] = args.htf if args.htf else None
     timeframe_overridden = args.timeframe is not None
     htf_overridden = args.htf is not None
+    all_timeframes_requested = False
 
     if (
         not timeframe_overridden
         and not getattr(args, "timeframe_grid", None)
         and batch_ctx is None
     ):
-        selected_timeframe = _prompt_ltf_selection()
-        timeframe_overridden = True
+        prompt_selection = _prompt_ltf_selection()
+        if prompt_selection.use_all:
+            all_timeframes_requested = True
+            selected_timeframe = None
+            timeframe_overridden = False
+        else:
+            selected_timeframe = prompt_selection.timeframe
+            timeframe_overridden = True
 
     if args.interactive and symbol_choices:
         selected_symbol = _prompt_choice("Select symbol", symbol_choices, selected_symbol)
@@ -3629,6 +3713,12 @@ def _execute_single(
         )
 
     primary_min_trades = _min_trades_for_dataset(primary_dataset)
+    param_order = optimisation.get("param_order")
+
+    def _ordered_params_view(raw_params: object) -> Dict[str, object]:
+        if isinstance(raw_params, Mapping):
+            return _order_mapping(raw_params, param_order)
+        return {}
 
     wf_summary = run_walk_forward(
         primary_dataset.df,
@@ -3680,7 +3770,7 @@ def _execute_single(
             "trial": best_record["trial"],
             "score": best_record.get("score"),
             "oos_mean": wf_summary.get("oos_mean"),
-            "params": best_record.get("params"),
+            "params": _ordered_params_view(best_record.get("params")),
             "timeframe": best_key[0],
             "htf_timeframe": best_key[1],
         }
@@ -3715,7 +3805,7 @@ def _execute_single(
                     "trial": record["trial"],
                     "score": record.get("score"),
                     "oos_mean": candidate_wf.get("oos_mean"),
-                    "params": record.get("params"),
+                    "params": _ordered_params_view(record.get("params")),
                     "timeframe": candidate_key[0],
                     "htf_timeframe": candidate_key[1],
                 }
@@ -3737,7 +3827,7 @@ def _execute_single(
         "trial": best_record["trial"],
         "score": best_record.get("score"),
         "oos_mean": wf_summary.get("oos_mean"),
-        "params": best_record.get("params"),
+        "params": _ordered_params_view(best_record.get("params")),
         "timeframe": best_key[0],
         "htf_timeframe": best_key[1],
     }
@@ -3751,12 +3841,22 @@ def _execute_single(
         filtered_params = _filter_basic_factor_params(
             item.get("params") or {}, enabled=optimisation.get("basic_factor_profile", True)
         )
+        ordered_params = _order_mapping(filtered_params, param_order)
+        raw_metrics = trial_record.get("metrics") if isinstance(trial_record, dict) else {}
+        if isinstance(raw_metrics, Mapping):
+            metrics_payload: object = _order_mapping(
+                raw_metrics,
+                None,
+                priority=("ProfitFactor", "Sortino"),
+            )
+        else:
+            metrics_payload = raw_metrics
         entry = {
             "trial": item["trial"],
             "score": item.get("score"),
             "oos_mean": item.get("oos_mean"),
-            "params": filtered_params,
-            "metrics": trial_record.get("metrics"),
+            "params": ordered_params,
+            "metrics": metrics_payload,
             "timeframe": item.get("timeframe"),
             "htf_timeframe": item.get("htf_timeframe"),
         }
@@ -3904,6 +4004,19 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
         for dataset in datasets:
             if isinstance(dataset, dict):
                 dataset["symbol"] = selected_symbol
+
+    if all_timeframes_requested:
+        if getattr(args, "timeframe_grid", None):
+            LOGGER.info("사용자가 이미 타임프레임 그리드를 지정해 혼합 실행 요청을 유지합니다: %s", args.timeframe_grid)
+        else:
+            ltf_candidates = _collect_ltf_candidates(backtest_cfg, params_cfg)
+            if not ltf_candidates:
+                ltf_candidates = ["1m", "3m", "5m"]
+            args.timeframe_grid = ",".join(ltf_candidates)
+            LOGGER.info(
+                "혼합 LTF 실행을 위해 타임프레임 그리드를 자동 구성했습니다: %s",
+                ", ".join(ltf_candidates),
+            )
 
     combos = _parse_timeframe_grid(getattr(args, "timeframe_grid", None))
     if not combos:

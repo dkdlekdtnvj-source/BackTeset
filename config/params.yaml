@@ -1,5 +1,8 @@
 version: 1
 
+overrides:
+  altEngine: vectorbt
+
 search:
   algo: bayes
   n_trials: 1000

@@ -109,6 +109,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
     ranking_df = pd.read_csv(ranking_path, keep_default_na=False)
 
     assert results_df.columns[0] == "ProfitFactor"
+    assert results_df.columns[1] == "Sortino"
     osc_idx = results_df.columns.get_loc("oscLen")
     stat_idx = results_df.columns.get_loc("statThreshold")
     assert osc_idx < stat_idx
