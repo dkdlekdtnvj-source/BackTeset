@@ -1,8 +1,13 @@
 # 1. '.venv' 라는 이름의 가상환경 생성
 python -m venv .venv
-
 # 2. 생성한 가상환경 활성화
 .\.venv\Scripts\Activate.ps1
+
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+python -m pip install vectorbt
+
 
 $env:OPTUNA_STORAGE = "postgresql+psycopg2://postgres:5432@127.0.0.1:5432/optuna"
 $env:GEMINI_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
@@ -17,6 +22,24 @@ python -m optimize.run
 python -m optimize.run --pick-top50 1 `
   --n-trials 3000 `
   --auto-workers `
+
+# 1) 기존 가상환경 제거
+deactivate 2>$null
+Remove-Item -Recurse -Force .venv
+
+# 2) 새 가상환경 생성 (원하는 파이썬 버전 지정 가능)
+py -m venv .venv
+
+# 3) 활성화
+.\.venv\Scripts\Activate.ps1
+
+# 4) 기본 툴 업그레이드
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+
+
+
+
 
 
 
@@ -39,7 +62,7 @@ pip install numba
 python -m pip install --upgrade pip wheel setuptools
 python -m pip install psycopg2-binary
 pip install vectorbt
-
+python -m optimize.run --pick-top50 1 --timeframe-grid "1m@15m,3m@1h" --n-trials 1000
 
 python -m optimize.run --pick-top50 2 `-
   --n-trials 3000 `
