@@ -397,7 +397,6 @@ def test_time_stop_exit_reason():
         kcMult=1.0,
         fluxLen=2,
         useFluxHeikin=False,
-        requireMomentumCross=False,
         debugForceLong=True,
         startDate=data.index[0].isoformat(),
     )

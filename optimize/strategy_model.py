@@ -400,20 +400,39 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 
 def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
     length = max(int(length), 1)
-    high = df["high"]
-    low = df["low"]
-    prev_high = high.shift()
-    prev_low = low.shift()
-    up_move = high - prev_high
-    down_move = prev_low - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = _rma(pd.Series(plus_dm, index=df.index), length)
-    minus_dm = _rma(pd.Series(minus_dm, index=df.index), length)
-    atr = _atr(df, length).replace(0, np.nan)
-    plus_di = 100 * (plus_dm / atr)
-    minus_di = 100 * (minus_dm / atr)
-    return plus_di - minus_di
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    prev_high = high.shift().fillna(high)
+    prev_low = low.shift().fillna(low)
+    prev_close = close.shift().fillna(close)
+
+    up_move = (high - prev_high).clip(lower=0.0)
+    down_move = (prev_low - low).clip(lower=0.0)
+
+    up_rma = _rma(up_move, length)
+    down_rma = _rma(down_move, length)
+
+    true_range = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = _rma(true_range, length).replace(0.0, np.nan)
+
+    up = up_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
+    dn = down_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
+    denom = up + dn
+    ratio = (up - dn).divide(denom).replace([np.inf, -np.inf], np.nan)
+    ratio = ratio.fillna(0.0)
+
+    smooth_len = max(int(round(length / 2.0)), 1)
+    flux = _rma(ratio, smooth_len) * 100.0
+    return flux
 
 
 @dataclass
@@ -686,7 +705,7 @@ def run_backtest(
     sell_threshold = float_param("sellThreshold", 36.0)
     dyn_len = int_param("dynLen", 21, enabled=use_dynamic_thresh)
     dyn_mult = float_param("dynMult", 1.1, enabled=use_dynamic_thresh)
-    require_momentum_cross = bool_param("requireMomentumCross", True)
+    require_momentum_cross = True
     # Optional toggle: enable Numba-accelerated cross calculations.  When
     # ``useNumba`` is True and Numba is installed in the environment,
     # momentum/signal cross-over arrays will be computed using a
@@ -946,13 +965,14 @@ def run_backtest(
     bb_len_eff = osc_len if use_same_len else bb_len
     kc_len_eff = osc_len if use_same_len else kc_len
 
-    bb_basis = _sma(hl2, bb_len_eff)
-    highest = df["high"].rolling(osc_len, min_periods=osc_len).max()
-    lowest = df["low"].rolling(osc_len, min_periods=osc_len).min()
-    channel_mid = (highest + lowest) / 2.0
-    avg_line = (bb_basis + channel_mid) / 2.0
-    atr_primary = _atr(df, osc_len).replace(0.0, np.nan)
-    norm = (df["close"] - avg_line) / atr_primary * 100.0
+    kc_basis = _sma(hl2, kc_len_eff)
+    atr_kc = _atr(df, kc_len_eff).replace(0.0, np.nan)
+    kc_range = atr_kc * kc_mult
+    kc_upper = kc_basis + kc_range
+    kc_lower = kc_basis - kc_range
+    kc_average = (kc_upper + kc_lower) / 2.0
+    midline = (hl2 + kc_average) / 2.0
+    norm = (df["close"] - midline) / atr_kc * 100.0
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------

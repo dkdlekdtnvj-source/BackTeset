@@ -362,7 +362,6 @@ BASIC_FACTOR_KEYS = {
     "sellThreshold",
     "dynLen",
     "dynMult",
-    "requireMomentumCross",
     # Exit logic
     "exitOpposite",
     "useMomFade",

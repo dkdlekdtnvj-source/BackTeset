@@ -220,7 +220,7 @@ def _parse_core_settings(
 
     allow_long = _coerce_bool(params.get("allowLongEntry"), True)
     allow_short = _coerce_bool(params.get("allowShortEntry"), True)
-    require_cross = _coerce_bool(params.get("requireMomentumCross"), True)
+    require_cross = True
     exit_opposite = _coerce_bool(params.get("exitOpposite"), True)
 
     if min_trades is not None:
@@ -317,13 +317,14 @@ def _compute_indicators(
     flux_use_ha = _coerce_bool(params.get("useFluxHeikin"), True)
 
     hl2 = (df["high"] + df["low"]) / 2.0
-    bb_basis = _sma(hl2, bb_len)
-    highest = df["high"].rolling(osc_len, min_periods=osc_len).max()
-    lowest = df["low"].rolling(osc_len, min_periods=osc_len).min()
-    channel_mid = (highest + lowest) / 2.0
-    avg_line = (bb_basis + channel_mid) / 2.0
-    atr_primary = _atr(df, osc_len).replace(0.0, np.nan)
-    norm = (df["close"] - avg_line) / atr_primary * 100.0
+    atr_kc = _atr(df, kc_len).replace(0.0, np.nan)
+    kc_basis = _sma(hl2, kc_len)
+    kc_range = atr_kc * kc_mult
+    kc_upper = kc_basis + kc_range
+    kc_lower = kc_basis - kc_range
+    kc_average = (kc_upper + kc_lower) / 2.0
+    midline = (hl2 + kc_average) / 2.0
+    norm = (df["close"] - midline) / atr_kc * 100.0
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
 

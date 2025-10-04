@@ -66,7 +66,6 @@ space:
   sellThreshold:        { type: float, min: 20.0, max: 60.0, step: 2.0 }
   dynLen:               { type: int,   min: 10,  max: 60, step: 1 }
   dynMult:              { type: float, min: 0.8, max: 1.8, step: 0.05 }
-  requireMomentumCross: { type: bool }
 
   # --- Exit logic ---
   exitOpposite:   { type: bool }

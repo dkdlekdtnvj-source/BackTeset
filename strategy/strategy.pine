@@ -98,9 +98,25 @@ float haLow  = math.min(low,  math.min(haOpen, haClose))
 
 float srcClose = dfh ? haClose : close
 
-// --- 플럭스 계산 (단순 기울기 기반) ---
-float fluxRaw = ta.linreg(srcClose - nz(srcClose[1]), dfl, 0)
-float fluxVal = dfSmoothLen > 1 ? ta.sma(fluxRaw, dfSmoothLen) : fluxRaw
+// --- 플럭스 계산 (Deluxe 방식) ---
+float fluxHigh   = dfh ? haHigh : high
+float fluxLow    = dfh ? haLow  : low
+float fluxClose  = srcClose
+float prevClose  = nz(fluxClose[1], fluxClose)
+float upMove     = fluxHigh - nz(fluxHigh[1], fluxHigh)
+float downMove   = nz(fluxLow[1], fluxLow) - fluxLow
+float trRaw      = math.max(fluxHigh - fluxLow, math.max(math.abs(fluxHigh - prevClose), math.abs(fluxLow - prevClose)))
+float tr         = ta.rma(trRaw, dfl)
+float upRma      = ta.rma(math.max(upMove, 0.0), dfl)
+float downRma    = ta.rma(math.max(downMove, 0.0), dfl)
+float trSafe     = tr == 0.0 ? na : tr
+float up         = not na(trSafe) ? upRma / trSafe : 0.0
+float dn         = not na(trSafe) ? downRma / trSafe : 0.0
+float fluxDenom  = up + dn
+float fluxRatio  = fluxDenom != 0 ? (up - dn) / fluxDenom : 0.0
+int   fluxHalf   = math.max(int(math.round(dfl / 2.0)), 1)
+float fluxCore   = ta.rma(fluxRatio, fluxHalf) * 100.0
+float fluxVal    = dfSmoothLen > 1 ? ta.sma(fluxCore, dfSmoothLen) : fluxCore
 
 // --- 스퀴즈 모멘텀 계산 ---
 float bbBasis = ta.sma(close, bbLen)
@@ -108,10 +124,15 @@ float bbDev   = ta.stdev(close, bbLen) * bbMult
 float kcRange = ta.atr(kcLen) * kcMult
 bool squeezeOn = bbDev < kcRange
 
-float highestHigh = ta.highest(high, kcLen)
-float lowestLow   = ta.lowest(low, kcLen)
-float mean        = (highestHigh + lowestLow) / 2.0
-float momentum    = ta.linreg(close - mean, len, 0)
+float hl2         = (high + low) / 2.0
+float kcBasis     = ta.sma(hl2, kcLen)
+float kcUpper     = kcBasis + kcRange
+float kcLower     = kcBasis - kcRange
+float kcAverage   = (kcUpper + kcLower) / 2.0
+float midline     = math.avg(hl2, kcAverage)
+float atrPrimary  = ta.atr(kcLen)
+float norm        = atrPrimary > 0 ? (close - midline) / atrPrimary * 100.0 : 0.0
+float momentum    = ta.linreg(norm, len, 0)
 float momSignal   = ta.sma(momentum, sig)
 
 // --- 페이드 감지 ---
