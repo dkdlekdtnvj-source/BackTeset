@@ -420,6 +420,21 @@ def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
     return _rma(flux_base, smooth_len) * 100.0
 
 
+def _squeeze_momentum_norm(df: pd.DataFrame, length: int) -> pd.Series:
+    """Squeeze Momentum Deluxe 지표의 정규화된 모멘텀 입력값을 계산합니다."""
+
+    length = max(int(length), 1)
+
+    hl2 = (df["high"] + df["low"]) / 2.0
+    channel_mean = _sma(hl2, length)
+    atr = _atr(df, length).replace(0.0, np.nan)
+
+    channel_center = (hl2 + channel_mean) / 2.0
+    norm = ((df["close"] - channel_center) / atr).replace([np.inf, -np.inf], np.nan)
+
+    return (norm * 100.0).fillna(0.0)
+
+
 @dataclass
 class Position:
     direction: int = 0
@@ -946,12 +961,7 @@ def run_backtest(
     tick_size = _estimate_tick(df["close"])
     slip_value = tick_size * slippage_ticks
 
-    hl2 = (df["high"] + df["low"]) / 2.0
-    channel_avg = _sma(hl2, osc_len)
-    atr_primary = _atr(df, osc_len).replace(0.0, np.nan)
-    channel_mid = (hl2 + channel_avg) / 2.0
-    norm = ((df["close"] - channel_mid) / atr_primary).replace([np.inf, -np.inf], np.nan)
-    norm = (norm * 100.0).fillna(0.0)
+    norm = _squeeze_momentum_norm(df, osc_len)
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------
