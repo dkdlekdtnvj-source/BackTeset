@@ -399,40 +399,25 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
+    """Squeeze Momentum Deluxe 방식의 방향성 플럭스를 계산합니다."""
+
     length = max(int(length), 1)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
 
-    prev_high = high.shift().fillna(high)
-    prev_low = low.shift().fillna(low)
-    prev_close = close.shift().fillna(close)
+    # 기본 TR 및 ATR 계산
+    atr = _rma(_true_range(df), length).replace(0.0, np.nan)
 
-    up_move = (high - prev_high).clip(lower=0.0)
-    down_move = (prev_low - low).clip(lower=0.0)
+    # 상승/하락 움직임을 RMA 로 스무딩
+    up_move = _rma(df["high"].diff().clip(lower=0.0), length)
+    down_move = _rma((-df["low"].diff()).clip(lower=0.0), length)
 
-    up_rma = _rma(up_move, length)
-    down_rma = _rma(down_move, length)
+    up = up_move.divide(atr).replace([np.inf, -np.inf], np.nan)
+    dn = down_move.divide(atr).replace([np.inf, -np.inf], np.nan)
 
-    true_range = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = _rma(true_range, length).replace(0.0, np.nan)
+    flux_base = (up - dn).divide((up + dn).replace(0.0, np.nan))
+    flux_base = flux_base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    up = up_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
-    dn = down_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
-    denom = up + dn
-    ratio = (up - dn).divide(denom).replace([np.inf, -np.inf], np.nan)
-    ratio = ratio.fillna(0.0)
-
-    smooth_len = max(int(round(length / 2.0)), 1)
-    flux = _rma(ratio, smooth_len) * 100.0
-    return flux
+    smooth_len = max(length // 2, 1)
+    return _rma(flux_base, smooth_len) * 100.0
 
 
 @dataclass
@@ -962,17 +947,11 @@ def run_backtest(
     slip_value = tick_size * slippage_ticks
 
     hl2 = (df["high"] + df["low"]) / 2.0
-    bb_len_eff = osc_len if use_same_len else bb_len
-    kc_len_eff = osc_len if use_same_len else kc_len
-
-    kc_basis = _sma(hl2, kc_len_eff)
-    atr_kc = _atr(df, kc_len_eff).replace(0.0, np.nan)
-    kc_range = atr_kc * kc_mult
-    kc_upper = kc_basis + kc_range
-    kc_lower = kc_basis - kc_range
-    kc_average = (kc_upper + kc_lower) / 2.0
-    midline = (hl2 + kc_average) / 2.0
-    norm = (df["close"] - midline) / atr_kc * 100.0
+    channel_avg = _sma(hl2, osc_len)
+    atr_primary = _atr(df, osc_len).replace(0.0, np.nan)
+    channel_mid = (hl2 + channel_avg) / 2.0
+    norm = ((df["close"] - channel_mid) / atr_primary).replace([np.inf, -np.inf], np.nan)
+    norm = (norm * 100.0).fillna(0.0)
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------
