@@ -11,6 +11,133 @@ $env:NUMEXPR_NUM_THREADS="1"
 
 
 .\.venv\Scripts\Activate.ps1 
+$env:OPTUNA_STORAGE = "postgresql+psycopg2://optuser:optuna@127.0.0.1:5432/optuna"
+
+python -m optimize.run --pick-top50 1 `
+  --n-trials 3000 `
+  --auto-workers `
+pip install -r requirements.txt
+pip install numba
+//가상마다1회
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip wheel setuptools
+python -m pip install psycopg2-binary
+
+
+
+python -m optimize.run --pick-top50 2 `-
+  --n-trials 3000 `
+  --pruner asha `
+  --pruner-min-resource 30 `
+  --pruner-reduction-factor 3 `
+  --pruner-min-early-stopping-rate 0 `
+  --no-simple-metrics
+
+
+
+0) 사전 준비
+- (선택) 가상환경 활성화
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+- 필수 패키지 설치
+  pip install -U pip
+  pip install -r requirements.txt
+
+1) 성능 최적화 환경변수 (권장)
+# 내부 BLAS가 코어를 다 점유하는 걸 방지 → 병렬 효율↑
+$env:OMP_NUM_THREADS="1"
+$env:MKL_NUM_THREADS="1"
+$env:OPENBLAS_NUM_THREADS="1"
+$env:NUMEXPR_NUM_THREADS="1"
+
+2) 기본 실행 예시 (ETHUSDT / 1m vs HTF=5m)
+# 파라미터 탐색 범위는 params.yaml에 정의됨
+# --no-simple-metrics 권장(비정상 스코어 방지 가드 경로 사용)
+python -m optimize.run --pick-top50 1 `
+  --n-trials 400 `
+  --n-jobs 4 `
+  --dataset-jobs 2 `
+  --dataset-executor process `
+  --dataset-start-method spawn `
+  --no-simple-metrics
+
+3) 자동 워커(코어에 맞춰 자동 배분)
+python -m optimize.run --pick-top50 1 `
+  --n-trials 3000 `
+  --auto-workers `
+  --no-simple-metrics
+
+4) 탐색 집중형(Optuna 동시 트라이얼↑, 데이터셋 병렬 최소화)
+python -m optimize.run --pick-top50 1 `
+  --n-trials 800 `
+  --n-jobs 6 `
+  --dataset-jobs 0 `
+  --no-simple-metrics
+
+5) 데이터 무거운 케이스(데이터셋 병렬↑, Optuna 적당히)
+python -m optimize.run --pick-top50 1 `
+  --n-trials 600 `
+  --optuna-jobs 2 `
+  --dataset-jobs 6 `
+  --dataset-executor process `
+  --dataset-start-method spawn `
+  --no-simple-metrics
+
+6) LLM(Gemini 2.5) 후보/인사이트 활용
+- `config/params.yaml` > `llm` 기본값이 `enabled: true` 입니다. 핵심 필드:
+  - `count`: 큐에 넣을 후보 수 (기본 8)
+  - `initial_trials`: LLM 호출 전 사전 학습 트라이얼 수 (기본 20)
+  - `top_n`: LLM이 참고할 상위 트라이얼 개수 (기본 10)
+  - `thinking_budget`: Gemini 2.5 reasoning 예산 (기본 1024)
+- PowerShell에서 키 설정:
+  $env:GEMINI_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+- 실행 시 인터랙티브 질문 또는 CLI `--llm`/`--no-llm` 으로 즉시 전환 가능
+- Gemini 응답은 `candidates` 와 `insights` 를 포함한 JSON 객체 형식입니다.
+  인사이트 텍스트는 `reports/<timestamp>/logs/gemini_insights.md` 파일과 로그에서 확인할 수 있습니다.
+
+7) 리포트/로그 디렉터리 안내
+- 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<tf>_<htf>\...
+  예) reports\20251002-1206_ETHUSDT_1m_5m\trials\trials.jsonl
+- (패치 전 임시 해결) 경로가 없어서 에러 날 때는 먼저 폴더를 생성:
+  New-Item -ItemType Directory -Force -Path "reports\20251002-1206_ETHUSDT_1m_5m\trials"
+
+8) 자주 발생하는 오류와 해결
+A. FileNotFoundError / OSError: reports\...\trials 가 없다고 나옴
+- 원인: 멀티스레드 콜백이 파일 기록 전에 디렉터리를 만들지 않음.
+- 해결(코드 패치 적용 권장): run.py 내 리포트/트라이얼 저장 직전에
+  해당 디렉터리를 os.makedirs(..., exist_ok=True) 또는 Path(...).mkdir(parents=True, exist_ok=True)로 보장.
+
+B. Invalid interval (Binance)
+- 원인: 60m 같은 비정규 간격 → 1h로 정규화 필요.
+- 해결: 이미 코드에 normalize_timeframe 적용. 설정에서 60m가 남아있다면 1h로 수정.
+
+C. 이상치 스코어(무한대/NaN → 큰 양수 치환)
+- 해결: --no-simple-metrics 사용, 안전 가드(safe_pf/safe_clip) 적용. 분모=0, 무거래 시 큰 양수 대신 큰 음수 패널티로 처리.
+
+9) 재시작/재개
+- 같은 스터디로 이어서:
+  --resume-from 옵션 사용 (run.py가 지원하는 경우)
+- 스토리지(RDB) 사용 시 storage-url로 지정 가능.
+
+10) 참고 팁
+- Windows에선 dataset-executor는 process + spawn 조합이 안정적.
+- CPU 사용률이 낮으면 Optuna/데이터셋 워커 비율을 조절해 병목을 해소하세요.
+- 데이터 다운로드 캐시가 존재하면 자동 재사용됨.
+
+끝.
+
+[실행 가이드 — 백테스트 & 파라미터 최적화 (PowerShell)]
+
+이 문서는 Windows PowerShell 기준으로, 병렬 설정/권장 커맨드/환경 변수/문제 해결 방법을 한곳에 정리했습니다.
+
+
+$env:OMP_NUM_THREADS="1"
+$env:MKL_NUM_THREADS="1"
+$env:OPENBLAS_NUM_THREADS="1"
+$env:NUMEXPR_NUM_THREADS="1"
+
+
+.\.venv\Scripts\Activate.ps1 
 
 
 python -m optimize.run --pick-top50 1 `
