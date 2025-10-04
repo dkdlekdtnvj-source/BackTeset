@@ -23,9 +23,11 @@ import pandas as pd
 from optimize.metrics import Trade, aggregate_metrics
 from optimize.strategy_model import (  # 재사용 가능한 보조 함수들
     _atr,
+    _bars_since_mask,
     _directional_flux,
     _heikin_ashi,
     _linreg,
+    _rma,
     _sma,
     _std,
 )
@@ -74,6 +76,24 @@ class _ParsedInputs:
     min_trades: int
     min_hold_bars: int
     max_consecutive_losses: int
+
+
+@dataclass
+class _MomFadeContext:
+    """모멘텀 페이드 청산 계산에 필요한 선행 시계열과 설정 값."""
+
+    hist: pd.Series
+    abs_hist: pd.Series
+    abs_prev: pd.Series
+    abs_prev2: pd.Series
+    since_nonpos: pd.Series
+    since_nonneg: pd.Series
+    gate_valid: pd.Series
+    bars_required: int
+    zero_delay: int
+    min_abs: float
+    release_only: bool
+    require_two: bool
 
 
 def _coerce_bool(value: object, default: bool = False) -> bool:
@@ -241,8 +261,6 @@ def _parse_core_settings(
 
 def _validate_feature_flags(params: Dict[str, object]) -> None:
     unsupported = [
-        "useStopLoss",
-        "useAtrTrail",
         "useBreakevenStop",
         "usePivotStop",
         "useAtrProfit",
@@ -253,7 +271,6 @@ def _validate_feature_flags(params: Dict[str, object]) -> None:
         "useBETiers",
         "useShock",
         "useReversal",
-        "useMomFade",
         "useSqzGate",
         "useStructureGate",
         "useSizingOverride",
@@ -396,6 +413,332 @@ def _build_signals(
     )
 
 
+def _prepare_mom_fade_context(
+    df: pd.DataFrame,
+    params: Dict[str, object],
+) -> Optional[_MomFadeContext]:
+    """모멘텀 페이드 청산에 필요한 시계열과 파라미터를 계산한다."""
+
+    use_mom_fade = _coerce_bool(params.get("useMomFade"), False)
+    if not use_mom_fade:
+        return None
+
+    mom_fade_bars = max(_coerce_int(params.get("momFadeBars"), 1), 0)
+    mom_fade_reg_len = max(_coerce_int(params.get("momFadeRegLen"), 20), 1)
+    mom_fade_bb_len = max(_coerce_int(params.get("momFadeBbLen"), 20), 1)
+    mom_fade_kc_len = max(_coerce_int(params.get("momFadeKcLen"), 20), 1)
+    mom_fade_bb_mult = _coerce_float(params.get("momFadeBbMult"), 2.0)
+    mom_fade_kc_mult = _coerce_float(params.get("momFadeKcMult"), 1.5)
+    mom_fade_use_true_range = _coerce_bool(params.get("momFadeUseTrueRange"), True)
+    mom_fade_zero_delay = max(_coerce_int(params.get("momFadeZeroDelay"), 0), 0)
+    mom_fade_min_abs = max(0.0, _coerce_float(params.get("momFadeMinAbs"), 0.0))
+    mom_fade_release_only = _coerce_bool(params.get("momFadeReleaseOnly"), True)
+    mom_fade_require_two = _coerce_bool(params.get("momFadeRequireTwoBars"), False)
+    sqz_release_bars = max(_coerce_int(params.get("sqzReleaseBars"), 5), 0)
+
+    mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
+    mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
+    mom_fade_dev = _std(mom_fade_source, mom_fade_bb_len) * mom_fade_bb_mult
+    prev_close = df["close"].shift().fillna(df["close"])
+    if mom_fade_use_true_range:
+        tr = pd.concat(
+            [
+                (df["high"] - df["low"]).abs(),
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        mom_range = _rma(tr, mom_fade_kc_len)
+    else:
+        mom_range = _sma((df["high"] - df["low"]).abs(), mom_fade_kc_len)
+    mom_range = mom_range * mom_fade_kc_mult
+    mom_mid = mom_fade_basis
+    mom_fade_hist = _linreg(mom_fade_source - mom_mid, mom_fade_reg_len)
+    mom_fade_abs = mom_fade_hist.abs()
+    mom_fade_abs_prev = mom_fade_abs.shift(1).fillna(mom_fade_abs)
+    mom_fade_abs_prev2 = mom_fade_abs.shift(2).fillna(mom_fade_abs_prev)
+    mom_fade_nonpos = mom_fade_hist.le(0)
+    mom_fade_nonneg = mom_fade_hist.ge(0)
+    mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
+    mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
+
+    gate_dev = mom_fade_dev
+    gate_atr = mom_range
+    gate_sq_on = (gate_dev < gate_atr).fillna(False).astype(bool)
+    gate_sq_prev = gate_sq_on.shift(fill_value=False)
+    gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
+    gate_rel_idx = gate_sq_rel.cumsum()
+    gate_rel_idx = gate_rel_idx.where(gate_sq_rel, np.nan).ffill()
+    if gate_rel_idx.notna().any():
+        gate_bars_since_release = (
+            df.index.to_series()
+            .groupby(gate_rel_idx)
+            .cumcount()
+            .reindex(df.index, fill_value=np.nan)
+        )
+    else:
+        gate_bars_since_release = pd.Series(np.nan, index=df.index)
+    gate_bars_since_release = gate_bars_since_release.fillna(np.inf)
+    gate_release_seen = gate_bars_since_release != np.inf
+    gate_valid = (gate_release_seen & (gate_bars_since_release <= sqz_release_bars) & (~gate_sq_on)).astype(bool)
+
+    return _MomFadeContext(
+        hist=mom_fade_hist,
+        abs_hist=mom_fade_abs,
+        abs_prev=mom_fade_abs_prev,
+        abs_prev2=mom_fade_abs_prev2,
+        since_nonpos=mom_fade_since_nonpos,
+        since_nonneg=mom_fade_since_nonneg,
+        gate_valid=gate_valid,
+        bars_required=mom_fade_bars,
+        zero_delay=mom_fade_zero_delay,
+        min_abs=mom_fade_min_abs,
+        release_only=mom_fade_release_only,
+        require_two=mom_fade_require_two,
+    )
+
+
+def _apply_exit_overrides(
+    parsed: _ParsedInputs,
+    params: Dict[str, object],
+    long_entries: pd.Series,
+    long_exits: pd.Series,
+    short_entries: pd.Series,
+    short_exits: pd.Series,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """스탑 및 모멘텀 페이드 조건을 반영해 청산 신호를 조정한다."""
+
+    use_stop_loss = _coerce_bool(params.get("useStopLoss"), False)
+    use_atr_trail = _coerce_bool(params.get("useAtrTrail"), False)
+    use_mom_fade = _coerce_bool(params.get("useMomFade"), False)
+
+    if not any((use_stop_loss, use_atr_trail, use_mom_fade)):
+        return long_entries, long_exits, short_entries, short_exits
+
+    df = parsed.df
+    index = df.index
+    n = len(df)
+    close = df["close"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+
+    atr_values = None
+    atr_trail_mult = 0.0
+    if use_atr_trail:
+        atr_len = max(_coerce_int(params.get("atrTrailLen"), 7), 1)
+        atr_trail_mult = _coerce_float(params.get("atrTrailMult"), 2.5)
+        atr_values = _atr(df, atr_len).to_numpy(dtype=float)
+
+    swing_low = None
+    swing_high = None
+    if use_stop_loss:
+        lookback = max(_coerce_int(params.get("stopLookback"), 5), 1)
+        swing_low = df["low"].rolling(lookback, min_periods=lookback).min().to_numpy(dtype=float)
+        swing_high = df["high"].rolling(lookback, min_periods=lookback).max().to_numpy(dtype=float)
+
+    mom_ctx = _prepare_mom_fade_context(df, params) if use_mom_fade else None
+    if use_mom_fade and mom_ctx is None:
+        use_mom_fade = False
+
+    hist_arr = mom_ctx.hist.to_numpy(dtype=float) if mom_ctx else None
+    abs_arr = mom_ctx.abs_hist.to_numpy(dtype=float) if mom_ctx else None
+    abs_prev_arr = mom_ctx.abs_prev.to_numpy(dtype=float) if mom_ctx else None
+    abs_prev2_arr = mom_ctx.abs_prev2.to_numpy(dtype=float) if mom_ctx else None
+    since_nonpos_arr = mom_ctx.since_nonpos.to_numpy(dtype=float) if mom_ctx else None
+    since_nonneg_arr = mom_ctx.since_nonneg.to_numpy(dtype=float) if mom_ctx else None
+    gate_valid_arr = mom_ctx.gate_valid.to_numpy(dtype=bool) if mom_ctx else None
+
+    long_entries_arr = long_entries.to_numpy(dtype=bool)
+    short_entries_arr = short_entries.to_numpy(dtype=bool)
+    long_exits_arr = long_exits.to_numpy(dtype=bool)
+    short_exits_arr = short_exits.to_numpy(dtype=bool)
+
+    position_dir = 0
+    bars_held = 0
+    long_stop_price = np.nan
+    short_stop_price = np.nan
+
+    for i in range(n):
+        skip_entry = False
+
+        if position_dir != 0:
+            long_entries_arr[i] = False
+            short_entries_arr[i] = False
+
+        if position_dir > 0:
+            bars_held += 1
+            exit_long = bool(long_exits_arr[i])
+
+            # ATR 트레일링 스탑
+            if use_atr_trail and atr_values is not None:
+                atr_val = atr_values[i]
+                if np.isfinite(atr_val):
+                    candidate = close[i] - atr_val * atr_trail_mult
+                    if np.isfinite(candidate):
+                        if np.isnan(long_stop_price):
+                            long_stop_price = candidate
+                        else:
+                            long_stop_price = max(long_stop_price, candidate)
+
+            # 스윙 로우 기반 스탑
+            if use_stop_loss and swing_low is not None:
+                ref = swing_low[i]
+                if np.isfinite(ref):
+                    if np.isnan(long_stop_price):
+                        long_stop_price = ref
+                    else:
+                        long_stop_price = max(long_stop_price, ref)
+
+            if np.isfinite(long_stop_price) and low[i] <= long_stop_price:
+                exit_long = True
+
+            if use_mom_fade and mom_ctx is not None:
+                hist_val = hist_arr[i]
+                if np.isfinite(hist_val):
+                    fade_abs = abs_arr[i]
+                    prev_abs = abs_prev_arr[i]
+                    prev2_abs = abs_prev2_arr[i]
+                    fade_abs_falling = (
+                        fade_abs < prev_abs if mom_ctx.bars_required <= 1 else fade_abs <= prev_abs
+                    )
+                    fade_abs_two = (not mom_ctx.require_two) or (
+                        fade_abs <= prev_abs and prev_abs <= prev2_abs
+                    )
+                    delay_ok = (
+                        mom_ctx.zero_delay <= 0
+                        or since_nonpos_arr[i] > float(mom_ctx.zero_delay)
+                    )
+                    min_abs_ok = mom_ctx.min_abs <= 0 or fade_abs >= mom_ctx.min_abs
+                    release_ok = (not mom_ctx.release_only) or gate_valid_arr[i]
+                    if (
+                        hist_val > 0
+                        and fade_abs_falling
+                        and fade_abs_two
+                        and delay_ok
+                        and min_abs_ok
+                        and release_ok
+                        and bars_held >= mom_ctx.bars_required
+                    ):
+                        exit_long = True
+
+            long_exits_arr[i] = exit_long
+            if exit_long:
+                position_dir = 0
+                bars_held = 0
+                long_stop_price = np.nan
+                skip_entry = True
+                long_entries_arr[i] = False
+                short_entries_arr[i] = False
+
+        elif position_dir < 0:
+            bars_held += 1
+            exit_short = bool(short_exits_arr[i])
+
+            if use_atr_trail and atr_values is not None:
+                atr_val = atr_values[i]
+                if np.isfinite(atr_val):
+                    candidate = close[i] + atr_val * atr_trail_mult
+                    if np.isfinite(candidate):
+                        if np.isnan(short_stop_price):
+                            short_stop_price = candidate
+                        else:
+                            short_stop_price = min(short_stop_price, candidate)
+
+            if use_stop_loss and swing_high is not None:
+                ref = swing_high[i]
+                if np.isfinite(ref):
+                    if np.isnan(short_stop_price):
+                        short_stop_price = ref
+                    else:
+                        short_stop_price = min(short_stop_price, ref)
+
+            if np.isfinite(short_stop_price) and high[i] >= short_stop_price:
+                exit_short = True
+
+            if use_mom_fade and mom_ctx is not None:
+                hist_val = hist_arr[i]
+                if np.isfinite(hist_val):
+                    fade_abs = abs_arr[i]
+                    prev_abs = abs_prev_arr[i]
+                    prev2_abs = abs_prev2_arr[i]
+                    fade_abs_falling = (
+                        fade_abs < prev_abs if mom_ctx.bars_required <= 1 else fade_abs <= prev_abs
+                    )
+                    fade_abs_two = (not mom_ctx.require_two) or (
+                        fade_abs <= prev_abs and prev_abs <= prev2_abs
+                    )
+                    delay_ok = (
+                        mom_ctx.zero_delay <= 0
+                        or since_nonneg_arr[i] > float(mom_ctx.zero_delay)
+                    )
+                    min_abs_ok = mom_ctx.min_abs <= 0 or fade_abs >= mom_ctx.min_abs
+                    release_ok = (not mom_ctx.release_only) or gate_valid_arr[i]
+                    if (
+                        hist_val < 0
+                        and fade_abs_falling
+                        and fade_abs_two
+                        and delay_ok
+                        and min_abs_ok
+                        and release_ok
+                        and bars_held >= mom_ctx.bars_required
+                    ):
+                        exit_short = True
+
+            short_exits_arr[i] = exit_short
+            if exit_short:
+                position_dir = 0
+                bars_held = 0
+                short_stop_price = np.nan
+                skip_entry = True
+                long_entries_arr[i] = False
+                short_entries_arr[i] = False
+
+        else:
+            bars_held = 0
+            long_stop_price = np.nan
+            short_stop_price = np.nan
+
+        if position_dir == 0 and not skip_entry:
+            long_entry = long_entries_arr[i]
+            short_entry = short_entries_arr[i]
+            if long_entry and not short_entry:
+                position_dir = 1
+                bars_held = 0
+                long_stop_price = np.nan
+                if use_atr_trail and atr_values is not None:
+                    atr_val = atr_values[i]
+                    if np.isfinite(atr_val):
+                        candidate = close[i] - atr_val * atr_trail_mult
+                        if np.isfinite(candidate):
+                            long_stop_price = candidate
+                if use_stop_loss and swing_low is not None:
+                    ref = swing_low[i]
+                    if np.isfinite(ref):
+                        long_stop_price = ref if np.isnan(long_stop_price) else max(long_stop_price, ref)
+            elif short_entry and not long_entry:
+                position_dir = -1
+                bars_held = 0
+                short_stop_price = np.nan
+                if use_atr_trail and atr_values is not None:
+                    atr_val = atr_values[i]
+                    if np.isfinite(atr_val):
+                        candidate = close[i] + atr_val * atr_trail_mult
+                        if np.isfinite(candidate):
+                            short_stop_price = candidate
+                if use_stop_loss and swing_high is not None:
+                    ref = swing_high[i]
+                    if np.isfinite(ref):
+                        short_stop_price = ref if np.isnan(short_stop_price) else min(short_stop_price, ref)
+
+    return (
+        pd.Series(long_entries_arr, index=index, dtype=bool),
+        pd.Series(long_exits_arr, index=index, dtype=bool),
+        pd.Series(short_entries_arr, index=index, dtype=bool),
+        pd.Series(short_exits_arr, index=index, dtype=bool),
+    )
+
+
 def _bars_between(index: pd.DatetimeIndex, start: pd.Timestamp, end: pd.Timestamp) -> int:
     try:
         start_loc = index.get_loc(start)
@@ -419,6 +762,15 @@ def _vectorbt_backtest(
 
     long_entries, long_exits, short_entries, short_exits = _build_signals(
         parsed.df, params, parsed
+    )
+
+    long_entries, long_exits, short_entries, short_exits = _apply_exit_overrides(
+        parsed,
+        params,
+        long_entries,
+        long_exits,
+        short_entries,
+        short_exits,
     )
 
     trade_value = parsed.initial_capital * parsed.capital_pct * parsed.leverage
