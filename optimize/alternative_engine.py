@@ -341,7 +341,7 @@ def _compute_indicators(
     cross_down = (prev_mom >= prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len)
+    flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
     if flux_smooth_len > 1:
         flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
     else:
@@ -444,9 +444,13 @@ def _prepare_mom_fade_context(
     mom_fade_require_two = _coerce_bool(params.get("momFadeRequireTwoBars"), False)
     sqz_release_bars = max(_coerce_int(params.get("sqzReleaseBars"), 5), 0)
 
+    osc_len = max(_coerce_int(params.get("oscLen"), 20), 1)
+    use_same_len = _coerce_bool(params.get("useSameLen"), False)
+    kc_len = osc_len if use_same_len else max(_coerce_int(params.get("kcLen"), 18), 1)
+    kc_mult = _coerce_float(params.get("kcMult"), 1.0)
+
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
-    mom_fade_dev = _std(mom_fade_source, mom_fade_bb_len) * mom_fade_bb_mult
     prev_close = df["close"].shift().fillna(df["close"])
     if mom_fade_use_true_range:
         tr = pd.concat(
@@ -471,9 +475,10 @@ def _prepare_mom_fade_context(
     mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
-    gate_dev = mom_fade_dev
-    gate_atr = mom_range
-    gate_sq_on = (gate_dev < gate_atr).fillna(False).astype(bool)
+    source_for_squeeze = df["close"]
+    kc_dev_for_squeeze = _std(source_for_squeeze, kc_len)
+    atr_val_for_squeeze = _atr(df, kc_len) * kc_mult
+    gate_sq_on = (kc_dev_for_squeeze < atr_val_for_squeeze).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()

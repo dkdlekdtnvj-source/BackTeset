@@ -409,10 +409,11 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
+def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Series:
     """Squeeze Momentum Deluxe 방식의 방향성 플럭스를 계산합니다."""
 
     length = max(int(length), 1)
+    smooth_len = max(int(smooth_len), 1)
 
     # 기본 TR 및 ATR 계산
     atr = _rma(_true_range(df), length).replace(0.0, np.nan)
@@ -427,21 +428,19 @@ def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
     flux_base = (up - dn).divide((up + dn).replace(0.0, np.nan))
     flux_base = flux_base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    smooth_len = max(length // 2, 1)
     return _rma(flux_base, smooth_len) * 100.0
 
 
-def _squeeze_momentum_norm(df: pd.DataFrame, length: int) -> pd.Series:
+def _squeeze_momentum_norm(df: pd.DataFrame, length: int, atr_series: pd.Series) -> pd.Series:
     """Squeeze Momentum Deluxe 지표의 정규화된 모멘텀 입력값을 계산합니다."""
 
     length = max(int(length), 1)
 
     hl2 = (df["high"] + df["low"]) / 2.0
     channel_mean = _sma(hl2, length)
-    atr = _atr(df, length).replace(0.0, np.nan)
 
     channel_center = (hl2 + channel_mean) / 2.0
-    norm = ((df["close"] - channel_center) / atr).replace([np.inf, -np.inf], np.nan)
+    norm = ((df["close"] - channel_center) / atr_series.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
     return (norm * 100.0).fillna(0.0)
 
@@ -972,7 +971,8 @@ def run_backtest(
     tick_size = _estimate_tick(df["close"])
     slip_value = tick_size * slippage_ticks
 
-    norm = _squeeze_momentum_norm(df, osc_len)
+    atr_len_series = _atr(df, osc_len)
+    norm = _squeeze_momentum_norm(df, osc_len, atr_len_series)
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------
@@ -1004,7 +1004,7 @@ def run_backtest(
         _cross_dn_series = (_prev_mom >= _prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len)
+    flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
     if flux_smooth_len > 1:
         flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
     else:
@@ -1037,9 +1037,10 @@ def run_backtest(
     mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
-    gate_dev = mom_fade_dev
-    gate_atr = mom_range
-    gate_sq_on = (gate_dev < gate_atr).fillna(False).astype(bool)
+    source_for_squeeze = df["close"]
+    kc_dev_for_squeeze = _std(source_for_squeeze, kc_len)
+    atr_val_for_squeeze = _atr(df, kc_len) * kc_mult
+    gate_sq_on = (kc_dev_for_squeeze < atr_val_for_squeeze).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
@@ -1064,8 +1065,6 @@ def run_backtest(
             sell_val = abs(sell_threshold)
         buy_thresh_series = pd.Series(buy_val, index=df.index)
         sell_thresh_series = pd.Series(sell_val, index=df.index)
-
-    atr_len_series = _atr(df, osc_len)
 
     vol_guard_atr_pct = pd.Series(0.0, index=df.index)
     if use_volatility_guard:
