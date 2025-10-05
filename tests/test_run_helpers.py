@@ -163,9 +163,10 @@ def test_threshold_dependency_enables_dynamic_when_static_absent():
         "sellThreshold": 0,
     }
 
-    changed = _ensure_threshold_dependencies(params, {})
+    result = _ensure_threshold_dependencies(params, {})
 
-    assert changed is True
+    assert result.adjusted is True
+    assert result.should_skip is False
     assert params["useDynamicThresh"] is True
 
 
@@ -177,12 +178,11 @@ def test_threshold_dependency_respects_forced_dynamic_override():
         "sellThreshold": 0,
     }
 
-    changed = _ensure_threshold_dependencies(params, {"useDynamicThresh": False})
+    result = _ensure_threshold_dependencies(params, {"useDynamicThresh": False})
 
-    assert changed is False
+    assert result.adjusted is False
+    assert result.should_skip is True
     assert params["useDynamicThresh"] is False
-
-
 def test_has_sufficient_volume_detects_shortfall():
     dataset = _make_dataset("1m", None)
 

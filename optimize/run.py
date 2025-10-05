@@ -401,6 +401,19 @@ BASIC_FACTOR_KEYS = {
 }
 
 
+
+
+@dataclass(frozen=True)
+class ThresholdGuardResult:
+    """동적/정적 임계값 조정 결과를 표현합니다."""
+
+    adjusted: bool
+    should_skip: bool
+
+
+_THRESHOLD_UNCHANGED = ThresholdGuardResult(adjusted=False, should_skip=False)
+
+
 _STATIC_THRESHOLD_KEYS = ("statThreshold", "buyThreshold", "sellThreshold")
 
 
@@ -438,23 +451,24 @@ def _static_threshold_active(params: Mapping[str, object]) -> bool:
 
 def _ensure_threshold_dependencies(
     params: Dict[str, object], forced: Optional[Mapping[str, object]] = None
-) -> bool:
+) -> ThresholdGuardResult:
     """동적/정적 임계값이 동시에 꺼진 조합을 방지합니다.
 
-    반환값이 ``True``이면 ``useDynamicThresh`` 를 강제로 활성화한 것입니다.
+    반환값의 ``adjusted`` 가 ``True``이면 ``useDynamicThresh`` 를 강제로 활성화한 것입니다.
+    ``should_skip`` 이 ``True``인 경우 해당 파라미터 조합은 실행 대상에서 제외해야 합니다.
     """
 
     forced = forced or {}
     use_dynamic = bool(params.get("useDynamicThresh"))
     if use_dynamic or _static_threshold_active(params):
-        return False
+        return _THRESHOLD_UNCHANGED
 
     forced_flag = _coerce_bool_flag(forced.get("useDynamicThresh"))
     if forced_flag is False:
-        return False
+        return ThresholdGuardResult(adjusted=False, should_skip=True)
 
     params["useDynamicThresh"] = True
-    return True
+    return ThresholdGuardResult(adjusted=True, should_skip=False)
 
 
 def _utcnow_isoformat() -> str:
@@ -2495,7 +2509,13 @@ def optimisation_loop(
     for params in seed_trials or []:
         trial_params = dict(params)
         trial_params.update(forced_params)
-        _ensure_threshold_dependencies(trial_params, forced_params)
+        guard = _ensure_threshold_dependencies(trial_params, forced_params)
+        if guard.should_skip:
+            LOGGER.debug(
+                "시드 트라이얼 파라미터가 동적/정적 임계값을 모두 비활성화하여 큐에 등록하지 않습니다.: %s",
+                trial_params,
+            )
+            continue
         try:
             study.enqueue_trial(trial_params, skip_if_exists=True)
         except Exception:
@@ -2679,7 +2699,17 @@ def optimisation_loop(
     def objective(trial: optuna.Trial) -> float:
         params = _safe_sample_parameters(trial, space)
         params.update(forced_params)
-        threshold_adjusted = _ensure_threshold_dependencies(params, forced_params)
+        guard = _ensure_threshold_dependencies(params, forced_params)
+        if guard.should_skip:
+            trial.set_user_attr("threshold_combo_skipped", True)
+            trial.set_user_attr("pruned", True)
+            trial.set_user_attr("valid", False)
+            LOGGER.debug(
+                "트라이얼 %d: 동적/정적 임계값이 모두 비활성화되어 실행을 건너뜁니다.",
+                trial.number,
+            )
+            raise optuna.TrialPruned("동적/정적 임계값 조합이 모두 비활성화되었습니다.")
+        threshold_adjusted = guard.adjusted
         key, selected_datasets = _select_datasets_for_params(
             params_cfg, dataset_groups, timeframe_groups, default_key, params
         )
@@ -3150,7 +3180,13 @@ def optimisation_loop(
                 if not trial_params:
                     continue
                 trial_params.update(forced_params)
-                _ensure_threshold_dependencies(trial_params, forced_params)
+                guard = _ensure_threshold_dependencies(trial_params, forced_params)
+                if guard.should_skip:
+                    LOGGER.debug(
+                        "LLM 제안 파라미터가 동적/정적 임계값을 모두 비활성화하여 큐에 등록하지 않습니다.: %s",
+                        trial_params,
+                    )
+                    continue
                 try:
                     study.enqueue_trial(trial_params, skip_if_exists=True)
                 except Exception as exc:
