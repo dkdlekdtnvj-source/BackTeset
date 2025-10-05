@@ -5,7 +5,7 @@ overrides:
 
 search:
   algo: bayes
-  n_trials: 1000
+  n_trials: 3000
   seed: 42
   top_k: 5
   dataset_executor: process
