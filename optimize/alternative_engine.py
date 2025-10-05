@@ -359,6 +359,15 @@ def _resolve_thresholds(
     stat_threshold = _coerce_float(params.get("statThreshold"), 38.0)
     buy_threshold = _coerce_float(params.get("buyThreshold"), 36.0)
     sell_threshold = _coerce_float(params.get("sellThreshold"), 36.0)
+    static_active = any(abs(value) > 1e-9 for value in (stat_threshold, buy_threshold, sell_threshold))
+    if not use_dynamic and not static_active:
+        LOGGER.warning(
+            "동적/정적 임계값이 모두 비활성화되어 기본 정적 임계값(38/36)을 적용합니다."
+        )
+        stat_threshold = 38.0
+        buy_threshold = 36.0
+        sell_threshold = 36.0
+        static_active = True
     if use_dynamic:
         dyn_len = max(_coerce_int(params.get("dynLen"), 21), 1)
         dyn_mult = _coerce_float(params.get("dynMult"), 1.1)

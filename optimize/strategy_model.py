@@ -713,6 +713,17 @@ def run_backtest(
     stat_threshold = float_param("statThreshold", 38.0)
     buy_threshold = float_param("buyThreshold", 36.0)
     sell_threshold = float_param("sellThreshold", 36.0)
+    static_threshold_active = any(
+        abs(value) > 1e-9 for value in (stat_threshold, buy_threshold, sell_threshold)
+    )
+    if not use_dynamic_thresh and not static_threshold_active:
+        LOGGER.warning(
+            "동적/정적 임계값이 모두 비활성화되어 기본 정적 임계값(38/36)을 적용합니다."
+        )
+        stat_threshold = 38.0
+        buy_threshold = 36.0
+        sell_threshold = 36.0
+        static_threshold_active = True
     dyn_len = int_param("dynLen", 21, enabled=use_dynamic_thresh)
     dyn_mult = float_param("dynMult", 1.1, enabled=use_dynamic_thresh)
     require_momentum_cross = True
