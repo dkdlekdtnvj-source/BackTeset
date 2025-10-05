@@ -401,6 +401,62 @@ BASIC_FACTOR_KEYS = {
 }
 
 
+_STATIC_THRESHOLD_KEYS = ("statThreshold", "buyThreshold", "sellThreshold")
+
+
+def _coerce_bool_flag(value: object) -> Optional[bool]:
+    """주어진 값을 불리언 플래그로 해석합니다."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _static_threshold_active(params: Mapping[str, object]) -> bool:
+    for key in _STATIC_THRESHOLD_KEYS:
+        value = params.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if abs(numeric) > 1e-9:
+            return True
+    return False
+
+
+def _ensure_threshold_dependencies(
+    params: Dict[str, object], forced: Optional[Mapping[str, object]] = None
+) -> bool:
+    """동적/정적 임계값이 동시에 꺼진 조합을 방지합니다.
+
+    반환값이 ``True``이면 ``useDynamicThresh`` 를 강제로 활성화한 것입니다.
+    """
+
+    forced = forced or {}
+    use_dynamic = bool(params.get("useDynamicThresh"))
+    if use_dynamic or _static_threshold_active(params):
+        return False
+
+    forced_flag = _coerce_bool_flag(forced.get("useDynamicThresh"))
+    if forced_flag is False:
+        return False
+
+    params["useDynamicThresh"] = True
+    return True
+
+
 def _utcnow_isoformat() -> str:
     """현재 UTC 시각을 ISO8601 ``Z`` 표기 문자열로 반환합니다."""
 
@@ -1210,6 +1266,22 @@ def _apply_ltf_override_to_datasets(backtest_cfg: Dict[str, object], timeframe: 
         entry["ltf"] = [timeframe]
         entry["ltfs"] = [timeframe]
         entry["timeframes"] = [timeframe]
+
+
+def _remove_htf_overrides_from_datasets(backtest_cfg: Dict[str, object]) -> None:
+    """Remove any explicitly configured HTF mappings from dataset entries."""
+
+    entries = backtest_cfg.get("datasets")
+    if not isinstance(entries, list):
+        return
+
+    htf_keys = ("htf", "htfs", "htf_timeframes", "htf_timeframe")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for key in htf_keys:
+            if key in entry:
+                entry.pop(key, None)
 
 
 def _coerce_bool_or_none(value: object) -> Optional[bool]:
@@ -2423,6 +2495,7 @@ def optimisation_loop(
     for params in seed_trials or []:
         trial_params = dict(params)
         trial_params.update(forced_params)
+        _ensure_threshold_dependencies(trial_params, forced_params)
         try:
             study.enqueue_trial(trial_params, skip_if_exists=True)
         except Exception:
@@ -2606,6 +2679,7 @@ def optimisation_loop(
     def objective(trial: optuna.Trial) -> float:
         params = _safe_sample_parameters(trial, space)
         params.update(forced_params)
+        threshold_adjusted = _ensure_threshold_dependencies(params, forced_params)
         key, selected_datasets = _select_datasets_for_params(
             params_cfg, dataset_groups, timeframe_groups, default_key, params
         )
@@ -2613,6 +2687,12 @@ def optimisation_loop(
             "dataset_key",
             {"timeframe": key[0], "htf_timeframe": key[1]},
         )
+        if threshold_adjusted:
+            trial.set_user_attr("threshold_combo_adjusted", True)
+            LOGGER.debug(
+                "트라이얼 %d: 동적/정적 임계값이 모두 비활성화되어 동적 임계값을 강제로 활성화했습니다.",
+                trial.number,
+            )
         dataset_metrics: List[Dict[str, object]] = []
         numeric_metrics: List[Dict[str, float]] = []
         dataset_scores: List[float] = []
@@ -3070,6 +3150,7 @@ def optimisation_loop(
                 if not trial_params:
                     continue
                 trial_params.update(forced_params)
+                _ensure_threshold_dependencies(trial_params, forced_params)
                 try:
                     study.enqueue_trial(trial_params, skip_if_exists=True)
                 except Exception as exc:
@@ -3427,12 +3508,25 @@ def _execute_single(
         params_cfg["timeframe"] = selected_timeframe
         backtest_cfg["timeframes"] = [selected_timeframe]
         _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
+
+    disable_htf = bool(getattr(args, "_force_no_htf", False))
+    if not disable_htf and timeframe_overridden and not htf_overridden:
+        disable_htf = True
+
     if htf_overridden and selected_htf is not None:
         params_cfg["htf_timeframes"] = [selected_htf]
         backtest_cfg["htf_timeframes"] = [selected_htf]
+    elif disable_htf:
+        params_cfg.pop("htf_timeframes", None)
+        backtest_cfg.pop("htf_timeframes", None)
+        _remove_htf_overrides_from_datasets(backtest_cfg)
     elif htf_choices:
         params_cfg["htf_timeframes"] = htf_choices
         backtest_cfg["htf_timeframes"] = htf_choices
+    else:
+        params_cfg.pop("htf_timeframes", None)
+        backtest_cfg.pop("htf_timeframes", None)
+
     params_cfg.pop("htf_timeframe", None)
     backtest_cfg.pop("htf_timeframe", None)
 
@@ -4081,8 +4175,11 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
                 "혼합 LTF 실행을 위해 타임프레임 그리드를 자동 구성했습니다: %s",
                 ", ".join(ltf_candidates),
             )
+            setattr(args, "_force_no_htf", True)
 
     combos = _parse_timeframe_grid(getattr(args, "timeframe_grid", None))
+    if combos and all(htf is None for _, htf in combos):
+        setattr(args, "_force_no_htf", True)
     if not combos:
         _execute_single(args, params_cfg, backtest_cfg, argv)
         return
@@ -4116,6 +4213,7 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
         batch_args = argparse.Namespace(**vars(args))
         batch_args.timeframe = ltf
         batch_args.htf = htf
+        batch_args._force_no_htf = bool(htf is None) or bool(getattr(args, "_force_no_htf", False))
         suffix = f"{_slugify_timeframe(ltf)}_{_slugify_timeframe(htf)}".strip("_")
         context = {
             "index": index,

@@ -11,6 +11,7 @@ from optimize.run import (
     _apply_study_registry_defaults,
     _clean_metrics,
     _dataset_total_volume,
+    _ensure_threshold_dependencies,
     _filter_basic_factor_params,
     _has_sufficient_volume,
     _group_datasets,
@@ -152,6 +153,34 @@ def test_dataset_total_volume_handles_missing_volume_column():
     total = _dataset_total_volume(dataset)
 
     assert total == 0.0
+
+
+def test_threshold_dependency_enables_dynamic_when_static_absent():
+    params = {
+        "useDynamicThresh": False,
+        "statThreshold": 0.0,
+        "buyThreshold": 0,
+        "sellThreshold": 0,
+    }
+
+    changed = _ensure_threshold_dependencies(params, {})
+
+    assert changed is True
+    assert params["useDynamicThresh"] is True
+
+
+def test_threshold_dependency_respects_forced_dynamic_override():
+    params = {
+        "useDynamicThresh": False,
+        "statThreshold": 0.0,
+        "buyThreshold": 0,
+        "sellThreshold": 0,
+    }
+
+    changed = _ensure_threshold_dependencies(params, {"useDynamicThresh": False})
+
+    assert changed is False
+    assert params["useDynamicThresh"] is False
 
 
 def test_has_sufficient_volume_detects_shortfall():
