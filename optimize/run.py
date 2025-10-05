@@ -51,7 +51,7 @@ from optimize.metrics import (
 )
 from optimize.report import generate_reports, write_bank_file, write_trials_dataframe
 from optimize.search_spaces import build_space, grid_choices, mutate_around, sample_parameters
-from optimize.strategy_model import run_backtest
+from optimize.wrapper_strategy_model import run_backtest_wrapped as run_backtest
 from optimize.wf import run_purged_kfold, run_walk_forward
 from optimize.regime import detect_regime_label, summarise_regime_performance
 from optimize.llm import LLMSuggestions, generate_llm_candidates

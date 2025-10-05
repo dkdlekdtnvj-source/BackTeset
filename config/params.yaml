@@ -30,6 +30,11 @@ objective:
   # === 기본룰: ProfitFactor 중심 ===
   - name: ProfitFactor
     weight: 1.0
+  - name: Sortino
+    weight: 1.5
+  - name: MaxDD
+    weight: 0.8
+    goal: minimize
 
 constraints:
   min_trades_test: 12   # 테스트 구간에서 최소 거래 수 (없으면 강한 패널티)
