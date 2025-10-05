@@ -78,7 +78,7 @@ space:
 risk:
   leverage: 10
   fee_pct: 0.0006
-  slippage_ticks: 3
+  slippage_ticks: 1
 
 # --- LLM assistant configuration ---
 # To enable Gemini‑assisted parameter proposals, set `enabled: true` and provide
