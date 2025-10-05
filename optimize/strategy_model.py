@@ -1012,7 +1012,6 @@ def run_backtest(
 
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
-    mom_fade_dev = _std(mom_fade_source, mom_fade_bb_len) * mom_fade_bb_mult
     prev_close = df["close"].shift().fillna(df["close"])
     if mom_fade_use_true_range:
         tr = pd.concat(
@@ -1038,9 +1037,10 @@ def run_backtest(
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
     source_for_squeeze = df["close"]
-    kc_dev_for_squeeze = _std(source_for_squeeze, kc_len)
-    atr_val_for_squeeze = _atr(df, kc_len) * kc_mult
-    gate_sq_on = (kc_dev_for_squeeze < atr_val_for_squeeze).fillna(False).astype(bool)
+    basis_sq = _sma(source_for_squeeze, kc_len)
+    dev_sq = _std(source_for_squeeze, kc_len)
+    atr_val_for_squeeze = _atr(df, kc_len)
+    gate_sq_on = (dev_sq < atr_val_for_squeeze).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
