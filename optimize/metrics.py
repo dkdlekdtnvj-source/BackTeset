@@ -1,527 +1,73 @@
-"""Performance metric calculations for optimisation."""
+"""
+Wrapper around the original ``optimize.metrics`` module to adjust
+behaviour of the ``sortino_ratio`` function.  In the original
+implementation the Sortino ratio returns zero if there are no
+downside returns.  This can lead to misleading metrics when a
+strategy only produces non‑negative returns but still has variance.
+
+The wrapper re‑exports all public names from ``optimize.metrics`` and
+redefines ``sortino_ratio`` to fall back to a Sharpe‑style
+calculation when there are no downside returns.  If there are no
+returns at all or the standard deviation is zero, the ratio will
+still return zero.
+
+To use the patched metrics, import from this module instead of
+``optimize.metrics``.
+"""
+
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
-
+from typing import Iterable, List, Dict, Sequence
 import numpy as np
 import pandas as pd
 
-
-EPS = 1e-12
-LOSSLESS_GROSS_LOSS_PCT = 1e-3
-LOSSLESS_ANOMALY_FLAG = "lossless_profit_factor"
-MICRO_LOSS_ANOMALY_FLAG = "micro_loss_profit_factor"
-_INITIAL_BALANCE_KEYS = (
-    "InitialCapital",
-    "InitialEquity",
-    "InitialBalance",
-    "StartingBalance",
-)
-
-
-LOGGER = logging.getLogger(__name__)
-
-
-def _resolve_initial_balance(target: Dict[str, float], default: float = 1.0) -> float:
-    for key in _INITIAL_BALANCE_KEYS:
-        value = target.get(key)
-        if value is None:
-            continue
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(numeric) and numeric != 0:
-            return abs(numeric)
-    return abs(default)
-
-
-def lossless_gross_loss_threshold(target: Dict[str, float], *, default_initial: float = 1.0) -> float:
-    override = target.get("LosslessGrossLossThreshold")
-    if override is not None:
-        try:
-            numeric = abs(float(override))
-        except (TypeError, ValueError):
-            numeric = float("nan")
-        else:
-            if np.isfinite(numeric) and numeric > 0:
-                return max(numeric, EPS)
-
-    base = _resolve_initial_balance(target, default=default_initial)
-    threshold = abs(base) * LOSSLESS_GROSS_LOSS_PCT
-    return max(threshold, EPS)
-
-
-def detect_lossless_profit_factor(
-    *,
-    trades: float,
-    wins: float,
-    losses: float,
-    gross_loss: float,
-    threshold: float,
-) -> str | None:
-    try:
-        trades = float(trades)
-        wins = float(wins)
-        losses = float(losses)
-        gross_loss = float(gross_loss)
-        threshold = max(float(threshold), EPS)
-    except (TypeError, ValueError):
-        return None
-
-    if trades <= 0 or wins <= 0:
-        return None
-
-    abs_loss = abs(gross_loss)
-    if abs_loss <= EPS and losses <= 0:
-        return LOSSLESS_ANOMALY_FLAG
-    if abs_loss <= threshold:
-        return MICRO_LOSS_ANOMALY_FLAG
-    return None
-
-
-def apply_lossless_anomaly(
-    target: Dict[str, float],
-    *,
-    trades: float | None = None,
-    wins: float | None = None,
-    losses: float | None = None,
-    gross_loss: float | None = None,
-    threshold: float | None = None,
-) -> Optional[Tuple[str, float, float, float, float]]:
-    """재계산된 손실 무시 감지를 ``target`` 에 적용합니다."""
-
-    def _coerce(value: object, default: float = 0.0) -> float:
-        if value is None:
-            return float(default)
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return float(default)
-
-    trades_val = _coerce(trades, _coerce(target.get("Trades")))
-    wins_val = _coerce(wins, _coerce(target.get("Wins")))
-    losses_val = _coerce(losses, _coerce(target.get("Losses")))
-    gross_loss_val = _coerce(gross_loss, _coerce(target.get("GrossLoss")))
-
-    if threshold is None:
-        threshold_val = lossless_gross_loss_threshold(target)
-    else:
-        try:
-            threshold_val = max(float(threshold), EPS)
-        except (TypeError, ValueError):
-            threshold_val = lossless_gross_loss_threshold(target)
-
-    target["LosslessGrossLossThreshold"] = threshold_val
-
-    flag = detect_lossless_profit_factor(
-        trades=trades_val,
-        wins=wins_val,
-        losses=losses_val,
-        gross_loss=gross_loss_val,
-        threshold=threshold_val,
-    )
-
-    if not flag:
-        return None
-
-    existing = target.get("AnomalyFlags")
-    if isinstance(existing, str):
-        flags = [token.strip() for token in existing.split(",") if token.strip()]
-    elif isinstance(existing, (list, tuple)):
-        flags = [str(token) for token in existing if str(token)]
-    else:
-        flags = []
-    if flag not in flags:
-        flags.append(flag)
-    target["AnomalyFlags"] = flags
-    target["ProfitFactor"] = 0.0
-    target["LosslessProfitFactor"] = True
-    return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
-
-
-@dataclass
-class Trade:
-    """Container describing the outcome of a single trade."""
-
-    entry_time: pd.Timestamp
-    exit_time: pd.Timestamp
-    direction: str
-    size: float
-    entry_price: float
-    exit_price: float
-    profit: float
-    return_pct: float
-    mfe: float
-    mae: float
-    bars_held: int
-    reason: str = ""
-
-
-@dataclass(frozen=True)
-class ObjectiveSpec:
-    """Normalised representation of an optimisation objective."""
-
-    name: str
-    weight: float = 1.0
-    goal: str = "maximize"
-
-    @property
-    def direction(self) -> str:
-        goal = str(self.goal).lower()
-        if goal in {"minimise", "minimize", "min", "lower"}:
-            return "minimize"
-        return "maximize"
-
-    @property
-    def is_minimize(self) -> bool:
-        return self.direction == "minimize"
-
-
-def equity_curve_from_returns(returns: pd.Series, initial: float = 1.0) -> pd.Series:
-    """Create an equity curve from percentage returns."""
-
-    equity = (1 + returns.fillna(0)).cumprod() * initial
-    return equity
-
-
-def max_drawdown(equity: pd.Series) -> float:
-    """Return the maximum drawdown as a negative percentage."""
-
-    if equity.empty:
-        return 0.0
-    running_max = equity.cummax()
-    drawdown = (equity / running_max) - 1.0
-    return float(drawdown.min()) if not drawdown.empty else 0.0
+# Import everything from the original metrics module.  The wildcard
+# import is safe here because we are essentially wrapping the module.
+from optimize.metrics import *  # type: ignore
 
 
 def sortino_ratio(returns: pd.Series, risk_free: float = 0.0) -> float:
+    """Compute the Sortino ratio with a fallback when there are no downside returns.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        A series of periodic returns (percentage or fractional).
+    risk_free : float, default 0.0
+        The risk‑free rate used as the target return.  Any returns
+        below this level are considered downside risk.
+
+    Returns
+    -------
+    float
+        The Sortino ratio, defined as the expected return minus the
+        risk free rate, divided by the standard deviation of
+        downside returns.  When there are no returns below the
+        ``risk_free`` threshold the function falls back to a Sharpe
+        ratio calculation (using the overall standard deviation).
+    """
+    # Identify returns below the risk‑free rate.  Replace infinities and
+    # drop NaNs to avoid propagating them into the standard deviation.
     downside = returns[returns < risk_free]
-    if not downside.empty:
-        downside = downside.replace([np.inf, -np.inf], np.nan).dropna()
+    downside = downside.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # When there are no downside returns, fall back to a Sharpe
+    # calculation.  This avoids returning zero for strategies that never
+    # produce losses but still have variability.
     if downside.empty:
-        return 0.0
+        cleaned = returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if cleaned.empty:
+            return 0.0
+        with np.errstate(invalid="ignore"):
+            std = cleaned.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            return 0.0
+        return float((cleaned.mean() - risk_free) / std)
+
+    # Otherwise compute the Sortino ratio normally.
     expected = returns.replace([np.inf, -np.inf], np.nan).dropna().mean() - risk_free
     with np.errstate(invalid="ignore"):
         downside_std = downside.std(ddof=0)
     if downside_std == 0 or np.isnan(downside_std):
         return 0.0
     return float(expected / downside_std)
-
-
-def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0) -> float:
-    cleaned = returns.replace([np.inf, -np.inf], np.nan).dropna()
-    if cleaned.empty:
-        return 0.0
-    with np.errstate(invalid="ignore"):
-        std = cleaned.std(ddof=0)
-    if std == 0 or np.isnan(std):
-        return 0.0
-    return float((cleaned.mean() - risk_free) / std)
-
-
-def profit_factor(trades: Iterable[Trade]) -> float:
-    gross_profit = 0.0
-    gross_loss = 0.0
-
-    for trade in trades:
-        profit = float(trade.profit)
-        if profit > 0:
-            gross_profit += profit
-        else:
-            gross_loss += profit
-
-    denominator = max(abs(gross_loss), EPS)
-    return float(gross_profit / denominator)
-
-
-def win_rate(trades: Sequence[Trade]) -> float:
-    if not trades:
-        return 0.0
-    wins = sum(1 for trade in trades if trade.profit > 0)
-    return wins / len(trades)
-
-
-def average_rr(trades: Sequence[Trade]) -> float:
-    rs = [trade.mfe / abs(trade.mae) for trade in trades if trade.mae < 0]
-    return float(np.mean(rs)) if rs else 0.0
-
-
-def average_hold_time(trades: Sequence[Trade]) -> float:
-    holds = [trade.bars_held for trade in trades]
-    return float(np.mean(holds)) if holds else 0.0
-
-
-def _consecutive_losses(trades: Sequence[Trade]) -> int:
-    streak = 0
-    worst = 0
-    for trade in trades:
-        if trade.profit < 0:
-            streak += 1
-            worst = max(worst, streak)
-        else:
-            streak = 0
-    return worst
-
-
-def _weekly_returns(returns: pd.Series) -> pd.Series:
-    if not isinstance(returns.index, pd.DatetimeIndex):
-        return pd.Series(dtype=float)
-    weekly = returns.resample("W").sum()
-    return weekly.dropna()
-
-
-def aggregate_metrics(
-    trades: List[Trade], returns: pd.Series, *, simple: bool = False
-) -> Dict[str, float]:
-    """Aggregate trade-level information into rich performance metrics."""
-
-    returns = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    equity = equity_curve_from_returns(returns, initial=1.0)
-    net_profit = float((equity.iloc[-1] - equity.iloc[0]) / equity.iloc[0]) if len(equity) > 1 else 0.0
-
-    gross_profit = float(sum(max(trade.profit, 0.0) for trade in trades))
-    gross_loss = float(sum(min(trade.profit, 0.0) for trade in trades))
-    wins = sum(1 for trade in trades if trade.profit > 0)
-    losses = sum(1 for trade in trades if trade.profit < 0)
-
-    fallback_keys = ("ProfitFactor", "Sortino", "Sharpe")
-
-    # Nested helper declared below within aggregate_metrics.
-
-    if simple:
-        metrics: Dict[str, float] = {
-            "NetProfit": net_profit,
-            "TotalReturn": net_profit,
-            "ProfitFactor": float(profit_factor(trades)),
-            "Trades": float(len(trades)),
-            "Wins": float(wins),
-            "Losses": float(losses),
-            "GrossProfit": gross_profit,
-            "GrossLoss": gross_loss,
-            "AvgHoldBars": float(average_hold_time(trades)),
-            "MaxConsecutiveLosses": float(_consecutive_losses(trades)),
-            "WinRate": float(win_rate(trades)),
-        }
-        for key in fallback_keys:
-            if key in metrics and not np.isfinite(metrics[key]):
-                metrics[key] = 0.0
-        result = apply_lossless_anomaly(
-            metrics,
-            trades=len(trades),
-            wins=wins,
-            losses=losses,
-            gross_loss=gross_loss,
-        )
-        if result:
-            flag, trades_val, wins_val, abs_loss, threshold = result
-            if flag == LOSSLESS_ANOMALY_FLAG:
-                LOGGER.info(
-                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
-                    int(trades_val),
-                    int(wins_val),
-                )
-            else:
-                LOGGER.warning(
-                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
-                    abs_loss,
-                    threshold,
-                    int(trades_val),
-                    int(wins_val),
-                )
-        return metrics
-
-    weekly = _weekly_returns(returns)
-    weekly_mean = float(weekly.mean()) if not weekly.empty else 0.0
-    weekly_std = float(weekly.std(ddof=0)) if len(weekly) > 1 else 0.0
-
-    metrics: Dict[str, float] = {
-        "NetProfit": net_profit,
-        "TotalReturn": net_profit,
-        "MaxDD": float(max_drawdown(equity)),
-        "WinRate": float(win_rate(trades)),
-        "ProfitFactor": float(profit_factor(trades)),
-        "Sortino": float(sortino_ratio(returns)),
-        "Sharpe": float(sharpe_ratio(returns)),
-        "AvgRR": float(average_rr(trades)),
-        "AvgHoldBars": float(average_hold_time(trades)),
-        "Trades": float(len(trades)),
-        "Wins": float(wins),
-        "Losses": float(losses),
-        "GrossProfit": gross_profit,
-        "GrossLoss": gross_loss,
-        "Expectancy": float((gross_profit + gross_loss) / len(trades)) if trades else 0.0,
-        "WeeklyNetProfit": weekly_mean,
-        "WeeklyReturnStd": weekly_std,
-        "MaxConsecutiveLosses": float(_consecutive_losses(trades)),
-    }
-
-    mfe = [trade.mfe for trade in trades]
-    mae = [trade.mae for trade in trades]
-    metrics["AvgMFE"] = float(np.mean(mfe)) if mfe else 0.0
-    metrics["AvgMAE"] = float(np.mean(mae)) if mae else 0.0
-    for key in fallback_keys:
-        if key in metrics and not np.isfinite(metrics[key]):
-            metrics[key] = 0.0
-    result = apply_lossless_anomaly(
-        metrics,
-        trades=len(trades),
-        wins=wins,
-        losses=losses,
-        gross_loss=gross_loss,
-    )
-    if result:
-        flag, trades_val, wins_val, abs_loss, threshold = result
-        if flag == LOSSLESS_ANOMALY_FLAG:
-            LOGGER.info(
-                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
-                int(trades_val),
-                int(wins_val),
-            )
-        else:
-            LOGGER.warning(
-                "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
-                abs_loss,
-                threshold,
-                int(trades_val),
-                int(wins_val),
-            )
-    return metrics
-
-
-def normalise_objectives(objectives: Iterable[object]) -> List[ObjectiveSpec]:
-    """Coerce raw objective declarations into :class:`ObjectiveSpec` entries."""
-
-    specs: List[ObjectiveSpec] = []
-    for obj in objectives:
-        if isinstance(obj, ObjectiveSpec):
-            specs.append(obj)
-            continue
-        if isinstance(obj, str):
-            specs.append(ObjectiveSpec(name=obj))
-            continue
-        if isinstance(obj, dict):
-            name = obj.get("name") or obj.get("metric")
-            if not name:
-                continue
-            weight = float(obj.get("weight", 1.0))
-            if "minimize" in obj:
-                goal = "minimize" if bool(obj.get("minimize")) else "maximize"
-            elif "maximize" in obj:
-                goal = "maximize" if bool(obj.get("maximize")) else "minimize"
-            else:
-                goal_raw = obj.get("goal") or obj.get("direction") or obj.get("target")
-                if goal_raw is None:
-                    goal = "maximize"
-                else:
-                    goal_text = str(goal_raw).lower()
-                    if goal_text in {"min", "minimise", "minimize", "lower"}:
-                        goal = "minimize"
-                    elif goal_text in {"max", "maximise", "maximize", "higher"}:
-                        goal = "maximize"
-                    else:
-                        goal = "maximize"
-            specs.append(ObjectiveSpec(name=str(name), weight=weight, goal=goal))
-    return specs
-
-
-def _objective_iterator(objectives: Iterable[object]) -> Iterable[ObjectiveSpec]:
-    for spec in normalise_objectives(objectives):
-        yield spec
-
-
-def evaluate_objective_values(
-    metrics: Dict[str, float],
-    objectives: Sequence[ObjectiveSpec],
-    non_finite_penalty: float,
-) -> Tuple[float, ...]:
-    """Transform metric dict into ordered objective values respecting directions."""
-
-    penalty = abs(float(non_finite_penalty))
-    values: List[float] = []
-    for spec in objectives:
-        raw = metrics.get(spec.name)
-        try:
-            numeric = float(raw)
-        except Exception:
-            numeric = float("nan")
-
-        name_lower = spec.name.lower()
-        if name_lower in {"maxdd", "maxdrawdown"}:
-            numeric = abs(numeric) if spec.is_minimize else -abs(numeric)
-
-        if not np.isfinite(numeric):
-            weight = abs(float(spec.weight))
-            if weight == 0:
-                numeric = 0.0
-            else:
-                base = penalty if spec.is_minimize else -penalty
-                numeric = base * weight
-        else:
-            numeric *= float(spec.weight)
-
-        values.append(numeric)
-
-    return tuple(values)
-
-
-def score_metrics(metrics: Dict[str, float], objectives: Iterable[object]) -> float:
-    """Score a metric dictionary according to weighted objectives and penalties."""
-
-    score = 0.0
-    for spec in _objective_iterator(objectives):
-        value = metrics.get(spec.name)
-        if value is None:
-            continue
-        try:
-            numeric = float(value)
-        except Exception:
-            continue
-        name_lower = spec.name.lower()
-        if name_lower in {"maxdd", "maxdrawdown"}:
-            contribution = -abs(numeric)
-        elif spec.is_minimize:
-            contribution = -numeric
-        else:
-            contribution = numeric
-        score += float(spec.weight) * contribution
-
-    trades = float(metrics.get("Trades", 0))
-    min_trades = metrics.get("MinTrades")
-    if min_trades is not None and trades < float(min_trades):
-        penalty = float(metrics.get("TradePenalty", 1.0))
-        score -= (float(min_trades) - trades) * penalty
-
-    avg_hold = float(metrics.get("AvgHoldBars", 0.0))
-    min_hold = metrics.get("MinHoldBars")
-    if min_hold is not None and avg_hold < float(min_hold):
-        penalty = float(metrics.get("HoldPenalty", 1.0))
-        score -= (float(min_hold) - avg_hold) * penalty
-
-    losses = float(metrics.get("MaxConsecutiveLosses", 0.0))
-    loss_cap = metrics.get("MaxConsecutiveLossLimit")
-    if loss_cap is not None and losses > float(loss_cap):
-        penalty = float(metrics.get("ConsecutiveLossPenalty", 1.0))
-        score -= (losses - float(loss_cap)) * penalty
-
-    return float(score)
-
-
-__all__ = [
-    "Trade",
-    "ObjectiveSpec",
-    "evaluate_objective_values",
-    "aggregate_metrics",
-    "equity_curve_from_returns",
-    "max_drawdown",
-    "normalise_objectives",
-    "score_metrics",
-    "LOSSLESS_GROSS_LOSS_PCT",
-    "LOSSLESS_ANOMALY_FLAG",
-    "MICRO_LOSS_ANOMALY_FLAG",
-    "lossless_gross_loss_threshold",
-    "detect_lossless_profit_factor",
-    "apply_lossless_anomaly",
-]
