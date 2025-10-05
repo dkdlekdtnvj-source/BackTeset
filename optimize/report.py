@@ -143,14 +143,15 @@ def export_results(
     _ensure_dir(output_dir)
     agg_df, dataset_df = _flatten_results(results)
     agg_df = _annotate_objectives(agg_df, objectives)
-    # Reorder columns so that Sortino precedes ProfitFactor.  Many consumers
-    # expect the key risk-adjusted metrics to appear up front in this order.
+    # ProfitFactor가 Sortino보다 먼저 오도록 컬럼을 재정렬한다. 보고서를 확인하는
+    # 사용자들이 수익성과 위험 조정 지표를 이 순서로 보는 경우가 많으므로 CSV도
+    # 이에 맞춰 배치한다.
     agg_df = _reorder_table(
         agg_df,
         param_order,
         (
-            "Sortino",
             "ProfitFactor",
+            "Sortino",
             "Score",
             "CompositeScore",
             "Valid",
@@ -167,8 +168,8 @@ def export_results(
             dataset_df,
             param_order,
             (
-                "Sortino",
                 "ProfitFactor",
+                "Sortino",
                 "Score",
                 "Valid",
                 "Trades",
