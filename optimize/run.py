@@ -9,15 +9,19 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import time
+from collections import OrderedDict
 from collections.abc import Sequence as AbcSequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from threading import Lock
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import optuna
@@ -29,6 +33,7 @@ import ccxt
 import sqlalchemy
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
+from optuna.trial import TrialState
 
 from datafeed.cache import DataCache
 from optimize.metrics import (
@@ -49,7 +54,7 @@ from optimize.search_spaces import build_space, grid_choices, mutate_around, sam
 from optimize.strategy_model import run_backtest
 from optimize.wf import run_purged_kfold, run_walk_forward
 from optimize.regime import detect_regime_label, summarise_regime_performance
-from optimize.llm import generate_llm_candidates
+from optimize.llm import LLMSuggestions, generate_llm_candidates
 from optuna.exceptions import StorageInternalError
 from tenacity import (
     retry,
@@ -118,14 +123,44 @@ def fetch_top_usdt_perp_symbols(
 
 
 LOGGER = logging.getLogger("optimize")
+
+# ---------------------------------------------------------------------------
+# Warning management
+#
+# Optuna exposes a number of experimental features (e.g. heartbeat_interval,
+# multivariate sampling) that trigger `ExperimentalWarning` on import or
+# configuration.  These warnings are not actionable for end users of this
+# framework and clutter the console.  Filter them globally so they do not
+# interfere with logging output.  Likewise, other libraries may raise
+# `UserWarning` when a supplied option has no effect; these should be handled
+# at the call site (see optimize/alternative_engine.py).
+import warnings
+try:
+    from optuna.exceptions import ExperimentalWarning  # type: ignore
+except Exception:
+    ExperimentalWarning = None  # type: ignore
+
+if ExperimentalWarning is not None:
+    warnings.filterwarnings("ignore", category=ExperimentalWarning)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Set the number of threads for OpenMP/BLAS libraries to the number of
+# available CPU cores.  This improves performance of underlying numerical
+# routines by utilising multiple cores during heavy vectorized operations.
+_threads = str(os.cpu_count() or 1)
+os.environ.setdefault("OMP_NUM_THREADS", _threads)
+os.environ.setdefault("MKL_NUM_THREADS", _threads)
 
 CPU_COUNT = os.cpu_count() or 4
-DEFAULT_DATASET_JOBS = max(1, CPU_COUNT // 2)
-DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT // 2)
+DEFAULT_OPTUNA_JOBS = max(1, CPU_COUNT)
+DEFAULT_DATASET_JOBS = max(1, CPU_COUNT)
+SQLITE_SAFE_OPTUNA_JOBS = max(1, CPU_COUNT // 2)
+SQLITE_SAFE_DATASET_JOBS = max(1, CPU_COUNT // 2)
+DEFAULT_STORAGE_ENV_KEY = "OPTUNA_STORAGE"
+DEFAULT_POSTGRES_STORAGE_URL = (
+    "postgresql://postgres:5432@127.0.0.1:5432/optuna"
+)
+POSTGRES_PREFIXES = ("postgresql://", "postgresql+psycopg://")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_ROOT = Path("reports")
@@ -133,12 +168,19 @@ STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
 PF_ANOMALY_THRESHOLD = 50.0
 MIN_VOLUME_THRESHOLD = 100.0
+MIN_TRADES_ENFORCED = 70
+PROFIT_FACTOR_CHECK_LABEL = "체크 필요"
+# When logging individual trial progress to CSV, record Sortino before
+# ProfitFactor and maintain parameters in the order they were provided.  The
+# ordering here dictates the column order of the CSV.  A field for Sortino
+# has been added to capture this risk-adjusted metric per trial.
 TRIAL_PROGRESS_FIELDS = [
     "number",
-    "state",
-    "value",
-    "score",
+    "sortino",
     "profit_factor",
+    "score",
+    "value",
+    "state",
     "trades",
     "win_rate",
     "max_dd",
@@ -150,6 +192,18 @@ TRIAL_PROGRESS_FIELDS = [
     "skipped_datasets",
     "datetime_complete",
 ]
+
+
+TRIAL_LOG_WRITE_LOCK = Lock()
+
+
+def _mask_storage_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:
+        return url
 
 
 def _make_sqlite_storage(
@@ -174,11 +228,102 @@ def _make_sqlite_storage(
     def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # type: ignore[unused-ignore]
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA synchronous=NORMAL;")
-            cursor.execute("PRAGMA temp_store=MEMORY;")
+            cursor.execute("PRAGMA busy_timeout=60000;")
+
+            wal_pragmas = (
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA synchronous=NORMAL;",
+                "PRAGMA temp_store=MEMORY;",
+            )
+
+            for attempt in range(5):
+                try:
+                    for pragma in wal_pragmas:
+                        cursor.execute(pragma)
+                except sqlite3.OperationalError as exc:  # pragma: no cover - 환경 의존
+                    is_locked = "database is locked" in str(exc).lower()
+                    if is_locked and attempt < 4:
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+
+                    LOGGER.warning(
+                        "SQLite PRAGMA 설정 중 오류가 발생했습니다 (WAL 미적용 가능성): %s",
+                        exc,
+                    )
+                else:
+                    break
         finally:
             cursor.close()
+
+    return storage
+
+
+def _make_rdb_storage(
+    url: str,
+    *,
+    heartbeat_interval: Optional[int] = None,
+    grace_period: Optional[int] = None,
+    pool_size: Optional[int] = None,
+    max_overflow: Optional[int] = None,
+    pool_timeout: Optional[int] = None,
+    pool_recycle: Optional[int] = None,
+    isolation_level: Optional[str] = None,
+    connect_timeout: Optional[int] = None,
+    statement_timeout_ms: Optional[int] = None,
+) -> optuna.storages.RDBStorage:
+    """PostgreSQL 등 외부 RDB 용도의 Optuna 스토리지를 생성합니다."""
+
+    engine_kwargs: Dict[str, object] = {"pool_pre_ping": True}
+
+    if pool_size is not None:
+        engine_kwargs["pool_size"] = pool_size
+    if max_overflow is not None:
+        engine_kwargs["max_overflow"] = max_overflow
+    if pool_timeout is not None:
+        engine_kwargs["pool_timeout"] = pool_timeout
+    if pool_recycle is not None:
+        engine_kwargs["pool_recycle"] = pool_recycle
+    if isolation_level:
+        engine_kwargs["isolation_level"] = isolation_level
+
+    connect_args: Dict[str, object] = {}
+    if connect_timeout is not None:
+        connect_args["connect_timeout"] = connect_timeout
+
+    options_parts: List[str] = []
+    if statement_timeout_ms is not None:
+        options_parts.append(f"-c statement_timeout={statement_timeout_ms}")
+
+    url_info = None
+    try:
+        url_info = make_url(url)
+    except Exception:
+        url_info = None
+
+    is_postgres = bool(url_info and url_info.drivername.startswith("postgresql"))
+    if is_postgres:
+        engine_kwargs.setdefault("pool_size", 5)
+        engine_kwargs.setdefault("max_overflow", 10)
+        engine_kwargs.setdefault("pool_recycle", 1800)
+        if connect_timeout is None:
+            connect_args.setdefault("connect_timeout", 10)
+        options_parts.append("-c timezone=UTC")
+
+    if options_parts:
+        existing_options = str(connect_args.get("options", "")).strip()
+        if existing_options:
+            options_parts.insert(0, existing_options)
+        connect_args["options"] = " ".join(part for part in options_parts if part)
+
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
+
+    storage = optuna.storages.RDBStorage(
+        url=url,
+        engine_kwargs=engine_kwargs,
+        heartbeat_interval=heartbeat_interval or None,
+        grace_period=grace_period or None,
+    )
 
     return storage
 
@@ -245,7 +390,6 @@ BASIC_FACTOR_KEYS = {
     "sellThreshold",
     "dynLen",
     "dynMult",
-    "requireMomentumCross",
     # Exit logic
     "exitOpposite",
     "useMomFade",
@@ -261,6 +405,74 @@ def _utcnow_isoformat() -> str:
     """현재 UTC 시각을 ISO8601 ``Z`` 표기 문자열로 반환합니다."""
 
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _register_study_reference(
+    study_storage: Optional[Path],
+    *,
+    storage_meta: Dict[str, object],
+    study_name: Optional[str] = None,
+) -> None:
+    """Persist study storage metadata for later reuse."""
+
+    if study_storage is None:
+        return
+
+    backend = str(storage_meta.get("backend") or "none").lower()
+    if backend in {"", "none"}:
+        return
+
+    registry_dir = _study_registry_dir(study_storage)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    pointer_path = registry_dir / "storage.json"
+
+    payload: Dict[str, object] = {
+        "updated_at": _utcnow_isoformat(),
+        "backend": backend,
+        "study_name": study_name,
+        "storage_url_env": storage_meta.get("env_key"),
+        "env_value_present": storage_meta.get("env_value_present"),
+    }
+
+    url_value = storage_meta.get("url")
+    if isinstance(url_value, str) and url_value:
+        payload["storage_url"] = url_value
+        try:
+            payload["storage_url_masked"] = make_url(url_value).render_as_string(
+                hide_password=True
+            )
+        except Exception:
+            payload["storage_url_masked"] = url_value
+
+    if backend == "sqlite":
+        payload["sqlite_path"] = storage_meta.get("path") or str(study_storage)
+        payload["allow_parallel"] = storage_meta.get("allow_parallel")
+    else:
+        pool_meta = storage_meta.get("pool")
+        if isinstance(pool_meta, dict) and pool_meta:
+            payload["pool"] = pool_meta
+        if storage_meta.get("connect_timeout") is not None:
+            payload["connect_timeout"] = storage_meta.get("connect_timeout")
+        if storage_meta.get("isolation_level"):
+            payload["isolation_level"] = storage_meta.get("isolation_level")
+        if storage_meta.get("statement_timeout_ms") is not None:
+            payload["statement_timeout_ms"] = storage_meta.get("statement_timeout_ms")
+
+    pointer_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def _sanitise_storage_meta(storage_meta: Dict[str, object]) -> Dict[str, object]:
+    if not storage_meta:
+        return {}
+
+    cleaned = copy.deepcopy(storage_meta)
+    url_value = cleaned.get("url")
+    if isinstance(url_value, str) and url_value:
+        try:
+            cleaned["url"] = make_url(url_value).render_as_string(hide_password=True)
+        except Exception:
+            cleaned["url"] = "***invalid-url***"
+    return cleaned
 
 
 def _slugify_symbol(symbol: str) -> str:
@@ -307,6 +519,35 @@ def _filter_basic_factor_params(
     if not enabled:
         return dict(params)
     return {key: value for key, value in params.items() if key in BASIC_FACTOR_KEYS}
+
+
+def _order_mapping(
+    payload: Mapping[str, object],
+    preferred_order: Optional[Sequence[str]] = None,
+    *,
+    priority: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    """주어진 참조 순서에 맞춰 딕셔너리 순서를 재정렬합니다."""
+
+    if not isinstance(payload, Mapping):
+        return {}
+
+    ordered: "OrderedDict[str, object]" = OrderedDict()
+
+    for key in priority or ():
+        if key in payload and key not in ordered:
+            ordered[key] = payload[key]
+
+    if preferred_order:
+        for key in preferred_order:
+            if key in payload and key not in ordered:
+                ordered[key] = payload[key]
+
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+
+    return dict(ordered)
 
 
 def _git_revision() -> Optional[str]:
@@ -387,6 +628,41 @@ def _coerce_min_trades_value(value: object) -> Optional[int]:
         return None
 
     return max(0, int(round(numeric)))
+
+
+def _coerce_config_int(value: object, *, minimum: int, name: str) -> Optional[int]:
+    """설정값을 정수로 강제 변환하며 하한선을 검증합니다."""
+
+    if value is None:
+        return None
+
+    raw_value = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        raw_value = text
+
+    try:
+        numeric = int(float(raw_value))
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "%s 값 '%s' 을(를) 정수로 변환할 수 없어 무시합니다.",
+            name,
+            raw_value,
+        )
+        return None
+
+    if numeric < minimum:
+        LOGGER.warning(
+            "%s 값 %d 이(가) %d 보다 작아 무시합니다.",
+            name,
+            numeric,
+            minimum,
+        )
+        return None
+
+    return numeric
 
 
 def _timeframe_lookup_keys(timeframe: Optional[str], htf: Optional[str]) -> List[str]:
@@ -656,6 +932,69 @@ def _resolve_study_storage(
     return STUDY_ROOT / f"{symbol_slug}_{timeframe_slug}_{htf_slug}.db"
 
 
+def _study_registry_dir(storage_path: Path) -> Path:
+    """Return the directory that holds study registry metadata."""
+
+    if storage_path.suffix:
+        return storage_path.with_suffix("")
+    return storage_path
+
+
+def _study_registry_payload_path(storage_path: Path) -> Path:
+    return _study_registry_dir(storage_path) / "storage.json"
+
+
+def _load_study_registry(
+    study_storage: Optional[Path],
+) -> Tuple[Dict[str, object], Optional[Path]]:
+    if study_storage is None:
+        return {}, None
+
+    pointer_path = _study_registry_payload_path(study_storage)
+    if not pointer_path.exists():
+        return {}, pointer_path
+
+    return _load_json(pointer_path), pointer_path
+
+
+def _apply_study_registry_defaults(
+    search_cfg: Dict[str, object], study_storage: Optional[Path]
+) -> None:
+    """Apply stored storage settings when explicit configuration is missing."""
+
+    payload, pointer_path = _load_study_registry(study_storage)
+    if not payload:
+        return
+
+    backend = str(payload.get("backend") or "none").lower()
+    if backend in {"", "none"}:
+        return
+
+    applied: List[str] = []
+
+    if backend == "sqlite":
+        stored_url = payload.get("storage_url") or payload.get("sqlite_url")
+        if stored_url and not search_cfg.get("storage_url"):
+            search_cfg["storage_url"] = stored_url
+            applied.append("storage_url")
+    else:
+        env_key = payload.get("storage_url_env")
+        if env_key and not search_cfg.get("storage_url_env"):
+            search_cfg["storage_url_env"] = env_key
+            applied.append("storage_url_env")
+        stored_url = payload.get("storage_url")
+        if stored_url and not search_cfg.get("storage_url"):
+            search_cfg["storage_url"] = stored_url
+            applied.append("storage_url")
+
+    if applied and pointer_path is not None:
+        LOGGER.info(
+            "스터디 레지스트리(%s)에서 %s 설정을 불러왔습니다.",
+            pointer_path,
+            ", ".join(applied),
+        )
+
+
 def _extract_primary_htf(
     params_cfg: Dict[str, object],
     datasets: Sequence["DatasetSpec"],
@@ -830,25 +1169,35 @@ def _prompt_bool(label: str, default: Optional[bool] = None) -> Optional[bool]:
         print("Please answer 'y' or 'n'.")
 
 
-def _prompt_ltf_selection() -> str:
-    """사용자가 선호하는 LTF(1, 3, 5분봉)를 선택하도록 안내합니다."""
+@dataclass(frozen=True)
+class LTFPromptResult:
+    timeframe: Optional[str]
+    use_all: bool = False
+
+
+def _prompt_ltf_selection() -> LTFPromptResult:
+    """사용자가 선호하는 LTF 조합(1, 3, 5분봉 또는 전체)을 선택하도록 안내합니다."""
 
     options = {"1": "1m", "3": "3m", "5": "5m"}
     if not sys.stdin or not sys.stdin.isatty():
         LOGGER.info("비대화형 환경이 감지되어 기본 1m LTF를 사용합니다.")
-        return "1m"
+        return LTFPromptResult("1m")
 
     while True:
         print("\n작업을 시작 하기 전에 LTF를 선택해주세요.")
         print("  1) 1분봉")
         print("  3) 3분봉")
         print("  5) 5분봉")
-        raw = input("선택 (1/3/5): ").strip()
+        print("  7) 1/3/5 전체 (혼합 실행)")
+        raw = input("선택 (1/3/5/7): ").strip()
         if raw in options:
             selection = options[raw]
             print(f"{raw}분봉을 선택했습니다.")
-            return selection
-        print("잘못된 입력입니다. 1, 3, 5 중 하나를 입력해주세요.")
+            return LTFPromptResult(selection)
+        if raw == "7":
+            print("1, 3, 5분봉을 모두 활용해 순차 실행합니다.")
+            return LTFPromptResult(None, use_all=True)
+        print("잘못된 입력입니다. 1, 3, 5, 7 중 하나를 입력해주세요.")
 
 
 def _apply_ltf_override_to_datasets(backtest_cfg: Dict[str, object], timeframe: str) -> None:
@@ -891,6 +1240,43 @@ def _collect_tokens(items: Iterable[str]) -> List[str]:
             if token:
                 tokens.append(token)
     return tokens
+
+
+def _collect_ltf_candidates(*configs: Mapping[str, object]) -> List[str]:
+    seen: "OrderedDict[str, None]" = OrderedDict()
+
+    def _register(value: object) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        seen.setdefault(text, None)
+
+    for cfg in configs:
+        if not isinstance(cfg, Mapping):
+            continue
+        datasets = cfg.get("datasets")
+        if isinstance(datasets, list):
+            for entry in datasets:
+                if not isinstance(entry, Mapping):
+                    continue
+                for key in ("ltf", "ltfs", "timeframes"):
+                    raw = entry.get(key)
+                    if isinstance(raw, (list, tuple)):
+                        for item in raw:
+                            _register(item)
+                    elif raw is not None:
+                        _register(raw)
+
+        timeframes = cfg.get("timeframes")
+        if isinstance(timeframes, (list, tuple)):
+            for tf in timeframes:
+                _register(tf)
+        elif timeframes is not None:
+            _register(timeframes)
+
+    return list(seen.keys())
 
 
 def _ensure_dict(root: Dict[str, object], key: str) -> Dict[str, object]:
@@ -1625,7 +2011,10 @@ def _clean_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     clean: Dict[str, object] = {}
     for key, value in metrics.items():
         if isinstance(value, (int, float, bool, str)):
-            clean[key] = value
+            if key == "ProfitFactor" and isinstance(value, (int, float)):
+                clean[key] = f"{float(value):.3f}"
+            else:
+                clean[key] = value
         elif isinstance(value, (list, tuple)):
             if all(isinstance(item, (int, float, bool, str)) for item in value):
                 clean[key] = ", ".join(str(item) for item in value)
@@ -1689,6 +2078,7 @@ def optimisation_loop(
     )
 
     space = _restrict_to_basic_factors(original_space, enabled=use_basic_factors)
+    param_order = list(space.keys())
     if use_basic_factors:
         if len(space) != len(original_space):
             LOGGER.info(
@@ -1718,11 +2108,16 @@ def optimisation_loop(
     except (TypeError, ValueError):
         LOGGER.warning("search.n_jobs 값 '%s' 을 해석할 수 없어 1로 대체합니다.", raw_n_jobs)
         n_jobs = 1
+    force_sqlite_serial = bool(search_cfg.get("force_sqlite_serial"))
+    if force_sqlite_serial and n_jobs != 1:
+        LOGGER.info("SQLite 직렬 강제 옵션으로 Optuna worker %d→1개 조정", n_jobs)
+        n_jobs = 1
+        search_cfg["n_jobs"] = n_jobs
     if n_trials := int(search_cfg.get("n_trials", 0) or 0):
         auto_jobs = max(1, min(available_cpu, n_trials))
     else:
         auto_jobs = max(1, available_cpu)
-    if n_jobs <= 1 and auto_jobs > n_jobs:
+    if not force_sqlite_serial and n_jobs <= 1 and auto_jobs > n_jobs:
         n_jobs = auto_jobs
         search_cfg["n_jobs"] = n_jobs
         LOGGER.info("기본 팩터 프로파일: Optuna worker %d개 자동 할당", n_jobs)
@@ -1777,6 +2172,13 @@ def optimisation_loop(
         )
         if dataset_executor == "process" and dataset_start_method:
             LOGGER.info("프로세스 start method=%s", dataset_start_method)
+
+    LOGGER.info(
+        "최종 병렬 구성: Optuna worker=%d, 데이터셋 worker=%d (%s)",
+        n_jobs,
+        dataset_jobs,
+        dataset_executor,
+    )
 
     algo_raw = search_cfg.get("algo", "bayes")
     algo = str(algo_raw or "bayes").lower()
@@ -1851,7 +2253,11 @@ def optimisation_loop(
     elif use_nsga:
         sampler = optuna.samplers.NSGAIISampler(**nsga_kwargs)
     else:
-        sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True, group=True)
+        # Instantiate TPESampler without experimental arguments.  Passing
+        # multivariate=True or group=True triggers ExperimentalWarning and may
+        # change algorithm behaviour.  Use default settings to avoid
+        # experimental features and suppress related warnings.
+        sampler = optuna.samplers.TPESampler(seed=seed)
 
     pruner_cfg = str(search_cfg.get("pruner", "asha"))
     pruner_params = search_cfg.get("pruner_params", {})
@@ -1882,8 +2288,11 @@ def optimisation_loop(
         "env_value_present": bool(storage_env_value),
     }
     if storage_url:
-        heartbeat_interval = max(int(search_cfg.get("heartbeat_interval", 60)), 0)
-        heartbeat_grace = max(int(search_cfg.get("heartbeat_grace_period", 120)), 0)
+        # When creating storages, avoid setting heartbeat_interval or grace_period
+        # to prevent Optuna experimental warnings.  Leave these as None so that
+        # Optuna uses its defaults without emitting ExperimentalWarning.
+        heartbeat_interval = None
+        heartbeat_grace = None
         if storage_url.startswith("sqlite:///"):
             timeout_raw = search_cfg.get("sqlite_timeout", 120)
             try:
@@ -1897,8 +2306,8 @@ def optimisation_loop(
             storage = _make_sqlite_storage(
                 storage_url,
                 timeout_sec=sqlite_timeout,
-                heartbeat_interval=heartbeat_interval or None,
-                grace_period=heartbeat_grace or None,
+                heartbeat_interval=None,
+                grace_period=None,
             )
             storage_meta["backend"] = "sqlite"
             storage_meta["url"] = storage_url
@@ -1920,22 +2329,79 @@ def optimisation_loop(
                     )
                 else:
                     LOGGER.warning(
-                        "SQLite 스토리지는 동시에 쓰기를 지원하지 않아 Optuna n_jobs를 %d→1로 강제합니다.",
+                        "SQLite 스토리지에서 Optuna worker %d개를 병렬로 실행합니다. 잠금 충돌 시 자동 재시도로 복구를 시도하니 모니터링하세요.",
                         n_jobs,
                     )
-                    n_jobs = 1
-                    search_cfg["n_jobs"] = n_jobs
-                    LOGGER.info("SQLite 스토리지 사용: Optuna 병렬 worker를 1개로 제한합니다.")
         else:
-            engine_kwargs = {"pool_pre_ping": True}
-            storage = optuna.storages.RDBStorage(
-                url=storage_url,
-                engine_kwargs=engine_kwargs,
-                heartbeat_interval=heartbeat_interval or None,
-                grace_period=heartbeat_grace or None,
+            pool_size = _coerce_config_int(
+                search_cfg.get("storage_pool_size"),
+                minimum=1,
+                name="storage_pool_size",
+            )
+            max_overflow = _coerce_config_int(
+                search_cfg.get("storage_max_overflow"),
+                minimum=0,
+                name="storage_max_overflow",
+            )
+            pool_timeout = _coerce_config_int(
+                search_cfg.get("storage_pool_timeout"),
+                minimum=0,
+                name="storage_pool_timeout",
+            )
+            pool_recycle = _coerce_config_int(
+                search_cfg.get("storage_pool_recycle"),
+                minimum=0,
+                name="storage_pool_recycle",
+            )
+            connect_timeout = _coerce_config_int(
+                search_cfg.get("storage_connect_timeout"),
+                minimum=1,
+                name="storage_connect_timeout",
+            )
+            statement_timeout_ms = _coerce_config_int(
+                search_cfg.get("storage_statement_timeout_ms"),
+                minimum=1,
+                name="storage_statement_timeout_ms",
+            )
+
+            isolation_level_raw = search_cfg.get("storage_isolation_level")
+            isolation_level = None
+            if isinstance(isolation_level_raw, str):
+                isolation_level = isolation_level_raw.strip() or None
+            elif isolation_level_raw is not None:
+                isolation_level = str(isolation_level_raw).strip() or None
+
+            storage = _make_rdb_storage(
+                storage_url,
+                heartbeat_interval=None,
+                grace_period=None,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+                pool_recycle=pool_recycle,
+                isolation_level=isolation_level,
+                connect_timeout=connect_timeout,
+                statement_timeout_ms=statement_timeout_ms,
             )
             storage_meta["backend"] = "rdb"
             storage_meta["url"] = storage_url
+            pool_meta = {}
+            if pool_size is not None:
+                pool_meta["size"] = pool_size
+            if max_overflow is not None:
+                pool_meta["max_overflow"] = max_overflow
+            if pool_timeout is not None:
+                pool_meta["timeout"] = pool_timeout
+            if pool_recycle is not None:
+                pool_meta["recycle"] = pool_recycle
+            if pool_meta:
+                storage_meta["pool"] = pool_meta
+            if connect_timeout is not None:
+                storage_meta["connect_timeout"] = connect_timeout
+            if isolation_level:
+                storage_meta["isolation_level"] = isolation_level
+            if statement_timeout_ms is not None:
+                storage_meta["statement_timeout_ms"] = statement_timeout_ms
     else:
         storage_meta["backend"] = "none"
     storage_arg = storage if storage is not None else storage_url
@@ -1963,6 +2429,7 @@ def optimisation_loop(
             continue
 
     results: List[Dict[str, object]] = []
+    results_lock = Lock()
 
     def _to_native(value: object) -> object:
         if isinstance(value, np.generic):
@@ -1970,37 +2437,37 @@ def optimisation_loop(
         return value
 
     def _log_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        if trial_log_path is None:
-            return
-        trial_log_path.parent.mkdir(parents=True, exist_ok=True)
-        def _normalise_value(value: object) -> Optional[object]:
-            if value is None:
-                return None
-            if isinstance(value, AbcSequence) and not isinstance(value, (str, bytes, bytearray)):
-                normalised: List[float] = []
-                for item in value:
-                    try:
-                        normalised.append(float(item))
-                    except Exception:
-                        return None
-                return normalised
-            try:
-                return float(value)
-            except Exception:
-                return None
+        with TRIAL_LOG_WRITE_LOCK:
+            def _normalise_value(value: object) -> Optional[object]:
+                if value is None:
+                    return None
+                if isinstance(value, AbcSequence) and not isinstance(value, (str, bytes, bytearray)):
+                    normalised: List[float] = []
+                    for item in value:
+                        try:
+                            normalised.append(float(item))
+                        except Exception:
+                            return None
+                    return normalised
+                try:
+                    return float(value)
+                except Exception:
+                    return None
 
-        trial_value = _normalise_value(trial.value)
-        record = {
-            "number": trial.number,
-            "value": trial_value,
-            "state": str(trial.state),
-            "params": {key: _to_native(val) for key, val in trial.params.items()},
-            "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None,
-        }
-        with trial_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            trial_value = _normalise_value(trial.value)
+            record = {
+                "number": trial.number,
+                "value": trial_value,
+                "state": str(trial.state),
+                "params": {key: _to_native(val) for key, val in trial.params.items()},
+                "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None,
+            }
 
-        if trial_csv_path is not None:
+            if trial_log_path is not None:
+                trial_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with trial_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
             metrics_attr = trial.user_attrs.get("metrics")
             metrics = metrics_attr if isinstance(metrics_attr, dict) else {}
 
@@ -2034,12 +2501,18 @@ def optimisation_loop(
                 else ""
             )
 
+            # Extract metrics for the trial.  Sortino and ProfitFactor are
+            # explicitly captured to support ordered CSV logging.
+            sortino_val = _metric_value("Sortino") or trial.user_attrs.get("sortino")
+            pf_val = _metric_value("ProfitFactor") or trial.user_attrs.get("profit_factor")
+
             row = {
                 "number": trial.number,
                 "state": str(trial.state),
                 "value": value_field,
                 "score": trial.user_attrs.get("score"),
-                "profit_factor": _metric_value("ProfitFactor"),
+                "sortino": sortino_val,
+                "profit_factor": pf_val,
                 "trades": _metric_value("Trades"),
                 "win_rate": _metric_value("WinRate"),
                 "max_dd": max_dd_value,
@@ -2052,58 +2525,83 @@ def optimisation_loop(
                 "datetime_complete": record["datetime_complete"],
             }
 
-            file_exists = trial_csv_path.exists()
-            trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
-                writer = csv.DictWriter(csv_handle, fieldnames=TRIAL_PROGRESS_FIELDS)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(row)
+            if trial_csv_path is not None:
+                file_exists = trial_csv_path.exists()
+                trial_csv_path.parent.mkdir(parents=True, exist_ok=True)
+                with trial_csv_path.open("a", encoding="utf-8", newline="") as csv_handle:
+                    writer = csv.DictWriter(csv_handle, fieldnames=TRIAL_PROGRESS_FIELDS)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(row)
 
-        if best_yaml_path is None:
-            return
-        best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
-
-        selected_trial: Optional[optuna.trial.FrozenTrial]
-        if multi_objective:
             try:
-                pareto_trials = list(study.best_trials)
-            except ValueError:
-                return
-            if not pareto_trials:
-                return
-            selected_trial = next(
-                (best_trial for best_trial in pareto_trials if best_trial.number == trial.number),
-                None,
+                trials_snapshot = study.get_trials(deepcopy=False)
+            except TypeError:
+                trials_snapshot = study.trials
+            completed = sum(
+                1
+                for item in trials_snapshot
+                if item.state in {TrialState.COMPLETE, TrialState.PRUNED}
             )
-            if selected_trial is None:
-                return
-        else:
-            try:
-                selected_trial = study.best_trial
-            except ValueError:
-                return
-            if selected_trial.number != trial.number:
-                return
+            total_display: object = n_trials if n_trials else len(trials_snapshot)
+            # Display Sortino and ProfitFactor for progress logs in order of importance
+            sortino_display = row.get("sortino") or trial.user_attrs.get("sortino") or "-"
+            pf_display = row.get("profit_factor") or trial.user_attrs.get("profit_factor") or "-"
+            trades_display = row.get("trades") if row.get("trades") not in {None, ""} else "-"
+            score_display = row.get("score") if row.get("score") not in {None, ""} else "-"
+            LOGGER.info(
+                "작업 진행상황 ＝＝＝＝＝＝ %d/%s (Trial %d %s) Sortino=%s, ProfitFactor=%s, Score=%s, Trades=%s",
+                completed,
+                total_display,
+                trial.number,
+                row.get("state"),
+                sortino_display,
+                pf_display,
+                score_display,
+                trades_display,
+            )
 
-        best_value = _normalise_value(selected_trial.value)
-        best_params_full = {key: _to_native(val) for key, val in selected_trial.params.items()}
-        snapshot = {
-            "best_value": best_value,
-            "best_params": best_params_full,
-        }
-        if use_basic_factors:
-            snapshot["basic_params"] = {
-                key: value for key, value in best_params_full.items() if key in BASIC_FACTOR_KEYS
+            if best_yaml_path is None:
+                return
+            best_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+
+            selected_trial: Optional[optuna.trial.FrozenTrial]
+            if multi_objective:
+                try:
+                    pareto_trials = list(study.best_trials)
+                except ValueError:
+                    return
+                if not pareto_trials:
+                    return
+                selected_trial = next(
+                    (best_trial for best_trial in pareto_trials if best_trial.number == trial.number),
+                    None,
+                )
+                if selected_trial is None:
+                    return
+            else:
+                try:
+                    selected_trial = study.best_trial
+                except ValueError:
+                    return
+                if selected_trial.number != trial.number:
+                    return
+
+            best_value = _normalise_value(selected_trial.value)
+            best_params_full = {key: _to_native(val) for key, val in selected_trial.params.items()}
+            snapshot = {
+                "best_value": best_value,
+                "best_params": best_params_full,
             }
-        else:
-            snapshot["basic_params"] = dict(best_params_full)
-        with best_yaml_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
-
-    callbacks: List = []
-    if trial_log_path is not None:
-        callbacks.append(_log_trial)
+            if use_basic_factors:
+                snapshot["basic_params"] = {
+                    key: value for key, value in best_params_full.items() if key in BASIC_FACTOR_KEYS
+                }
+            else:
+                snapshot["basic_params"] = dict(best_params_full)
+            with best_yaml_path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
+    callbacks: List = [_log_trial]
 
     def objective(trial: optuna.Trial) -> float:
         params = _safe_sample_parameters(trial, space)
@@ -2209,19 +2707,49 @@ def optimisation_loop(
                         int(wins_val),
                     )
 
-            pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
-            if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
+            trades_value = _coerce_int(metrics.get("Trades") or metrics.get("TotalTrades"))
+            if trades_value is None:
+                trades_value = _coerce_int(cleaned_metrics.get("Trades"))
+            if trades_value is not None:
+                cleaned_metrics["Trades"] = trades_value
+            if trades_value is not None and trades_value < MIN_TRADES_ENFORCED:
                 dataset_entry["skipped"] = True
-                dataset_entry["skip_reason"] = "profit_factor_threshold"
-                dataset_entry["skip_metric"] = pf_value
-                dataset_entry["skip_threshold"] = PF_ANOMALY_THRESHOLD
+                dataset_entry["skip_reason"] = "trades_threshold"
+                dataset_entry["skip_metric"] = trades_value
+                dataset_entry["skip_threshold"] = MIN_TRADES_ENFORCED
                 dataset_metrics.append(dataset_entry)
                 skipped_dataset_records.append(
                     {
                         "name": dataset.name,
                         "timeframe": dataset.timeframe,
                         "htf_timeframe": dataset.htf_timeframe,
-                        "profit_factor": pf_value,
+                        "trades": trades_value,
+                        "min_trades": MIN_TRADES_ENFORCED,
+                    }
+                )
+                LOGGER.warning(
+                    "데이터셋 %s 의 트레이드 수 %d 가 최소 요구치 %d 미만이라 제외합니다.",
+                    dataset.name,
+                    trades_value,
+                    MIN_TRADES_ENFORCED,
+                )
+                return
+
+            pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
+            if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
+                dataset_entry["skipped"] = True
+                dataset_entry["skip_reason"] = "profit_factor_threshold"
+                dataset_entry["skip_metric"] = f"{pf_value:.3f}"
+                dataset_entry["skip_threshold"] = PF_ANOMALY_THRESHOLD
+                cleaned_metrics["ProfitFactor"] = PROFIT_FACTOR_CHECK_LABEL
+                dataset_metrics.append(dataset_entry)
+                skipped_dataset_records.append(
+                    {
+                        "name": dataset.name,
+                        "timeframe": dataset.timeframe,
+                        "htf_timeframe": dataset.htf_timeframe,
+                        "profit_factor": f"{pf_value:.3f}",
+                        "status": PROFIT_FACTOR_CHECK_LABEL,
                     }
                 )
                 LOGGER.warning(
@@ -2266,7 +2794,8 @@ def optimisation_loop(
                 }
                 if partial_objectives is not None:
                     pruned_record["objective_values"] = list(partial_objectives)
-                results.append(pruned_record)
+                with results_lock:
+                    results.append(pruned_record)
                 trial.set_user_attr("score", float(partial_score))
                 trial.set_user_attr("metrics", cleaned_partial)
                 trial.set_user_attr(
@@ -2442,8 +2971,38 @@ def optimisation_loop(
             score = non_finite_penalty
             valid_status = False
             cleaned_aggregated["Valid"] = False
+            cleaned_aggregated["ProfitFactor"] = PROFIT_FACTOR_CHECK_LABEL
             if multi_objective and objective_values is not None:
                 objective_values = tuple(non_finite_penalty for _ in objective_values)
+
+        trades_total = _coerce_int(cleaned_aggregated.get("Trades"))
+        trade_anomaly = False
+        if trades_total is not None:
+            cleaned_aggregated["Trades"] = trades_total
+            if trades_total < MIN_TRADES_ENFORCED:
+                trade_anomaly = True
+                LOGGER.warning(
+                    "트라이얼 %d 의 총 트레이드 수 %d 가 최소 요구치 %d 미만이라 결과를 무효 처리합니다.",
+                    trial.number,
+                    trades_total,
+                    MIN_TRADES_ENFORCED,
+                )
+                score = non_finite_penalty
+                valid_status = False
+                cleaned_aggregated["Valid"] = False
+                if multi_objective and objective_values is not None:
+                    objective_values = tuple(non_finite_penalty for _ in objective_values)
+                trade_info = {
+                    "type": "trades_threshold",
+                    "value": trades_total,
+                    "threshold": MIN_TRADES_ENFORCED,
+                }
+                if anomaly_info is None:
+                    anomaly_info = trade_info
+                elif isinstance(anomaly_info, dict):
+                    related = anomaly_info.setdefault("related", [])
+                    if isinstance(related, list):
+                        related.append(trade_info)
 
         record = {
             "trial": trial.number,
@@ -2460,18 +3019,20 @@ def optimisation_loop(
             record["anomaly"] = anomaly_info
         if objective_values is not None:
             record["objective_values"] = list(objective_values)
-        results.append(record)
+        with results_lock:
+            results.append(record)
         trial.set_user_attr("score", float(score))
         trial.set_user_attr("metrics", cleaned_aggregated)
-        trial.set_user_attr(
-            "profit_factor",
-            _safe_float(cleaned_aggregated.get("ProfitFactor")),
-        )
+        pf_display = cleaned_aggregated.get("ProfitFactor")
+        if pf_display is None and pf_anomaly:
+            pf_display = PROFIT_FACTOR_CHECK_LABEL
+        trial.set_user_attr("profit_factor", pf_display)
         trial.set_user_attr("trades", _coerce_int(cleaned_aggregated.get("Trades")))
         trial.set_user_attr("valid", valid_status)
         trial.set_user_attr("pruned", False)
         trial.set_user_attr("skipped_datasets", list(skipped_dataset_records))
         trial.set_user_attr("profit_factor_anomaly", pf_anomaly)
+        trial.set_user_attr("min_trades_enforced", trade_anomaly)
         if pf_anomaly and anomaly_info is not None:
             trial.set_user_attr("anomaly_reason", anomaly_info.get("type"))
         if multi_objective and objective_values is not None:
@@ -2488,18 +3049,21 @@ def optimisation_loop(
             show_progress_bar=False,
             callbacks=callbacks,
             gc_after_trial=True,
+            catch=(sqlalchemy.exc.OperationalError, StorageInternalError),
         )
 
     use_llm = bool(llm_cfg.get("enabled"))
     llm_count = int(llm_cfg.get("count", 0)) if use_llm else 0
     llm_initial = int(llm_cfg.get("initial_trials", max(10, n_trials // 2))) if use_llm else 0
     llm_initial = max(0, min(llm_initial, n_trials))
+    llm_insights: List[str] = []
 
     try:
         if use_llm and llm_count > 0 and 0 < llm_initial < n_trials:
             _run_optuna(llm_initial)
-            candidates = generate_llm_candidates(space, study.trials, llm_cfg)
-            for candidate in candidates[:llm_count]:
+            llm_bundle: LLMSuggestions = generate_llm_candidates(space, study.trials, llm_cfg)
+            llm_insights = list(llm_bundle.insights)
+            for candidate in llm_bundle.candidates[:llm_count]:
                 trial_params = _filter_basic_factor_params(
                     dict(candidate), enabled=use_basic_factors
                 )
@@ -2553,6 +3117,8 @@ def optimisation_loop(
         "multi_objective": multi_objective,
         "storage": storage_meta,
         "basic_factor_profile": use_basic_factors,
+        "llm_insights": llm_insights,
+        "param_order": param_order,
     }
 
 
@@ -2609,6 +3175,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="기본 팩터 필터를 강제로 활성화합니다",
     )
+    parser.add_argument(
+        "--llm",
+        dest="llm",
+        action="store_true",
+        help="Gemini 기반 LLM 후보 제안과 전략 인사이트를 활성화합니다",
+    )
+    parser.add_argument(
+        "--no-llm",
+        dest="llm",
+        action="store_false",
+        help="Gemini 기반 제안을 비활성화합니다",
+    )
+    parser.set_defaults(llm=None)
     parser.add_argument("--interactive", action="store_true", help="Prompt for dataset and toggle selections")
     parser.add_argument("--enable", action="append", default=[], help="Force-enable boolean parameters (comma separated)")
     parser.add_argument("--disable", action="append", default=[], help="Force-disable boolean parameters (comma separated)")
@@ -2706,8 +3285,7 @@ def _execute_single(
         return any(token == flag or token.startswith(f"{flag}=") for token in cli_tokens)
 
     search_cfg = _ensure_dict(params_cfg, "search")
-    search_cfg.setdefault("n_jobs", DEFAULT_OPTUNA_JOBS)
-    search_cfg.setdefault("dataset_jobs", DEFAULT_DATASET_JOBS)
+
     search_cfg.setdefault("dataset_executor", "process")
     search_cfg.setdefault("allow_sqlite_parallel", False)
 
@@ -2791,6 +3369,8 @@ def _execute_single(
 
     if getattr(args, "force_sqlite_serial", False):
         search_cfg["allow_sqlite_parallel"] = False
+        search_cfg["force_sqlite_serial"] = True
+        LOGGER.info("CLI --force-sqlite-serial 지정: Optuna worker를 1개로 강제합니다.")
 
     if args.pruner:
         search_cfg["pruner"] = args.pruner
@@ -2817,18 +3397,25 @@ def _execute_single(
     htf_choices = list(dict.fromkeys(_collect_htfs(backtest_cfg) or _collect_htfs(params_cfg)))
 
     selected_symbol = args.symbol or params_cfg.get("symbol") or (symbol_choices[0] if symbol_choices else None)
-    selected_timeframe = args.timeframe
+    selected_timeframe: Optional[str] = args.timeframe
     selected_htf: Optional[str] = args.htf if args.htf else None
     timeframe_overridden = args.timeframe is not None
     htf_overridden = args.htf is not None
+    all_timeframes_requested = False
 
     if (
         not timeframe_overridden
         and not getattr(args, "timeframe_grid", None)
         and batch_ctx is None
     ):
-        selected_timeframe = _prompt_ltf_selection()
-        timeframe_overridden = True
+        prompt_selection = _prompt_ltf_selection()
+        if prompt_selection.use_all:
+            all_timeframes_requested = True
+            selected_timeframe = None
+            timeframe_overridden = False
+        else:
+            selected_timeframe = prompt_selection.timeframe
+            timeframe_overridden = True
 
     if args.interactive and symbol_choices:
         selected_symbol = _prompt_choice("Select symbol", symbol_choices, selected_symbol)
@@ -2905,6 +3492,25 @@ def _execute_single(
             decision = _prompt_bool(f"Enable {name}", default_val)
             if decision is not None:
                 forced_params[name] = decision
+
+    llm_cfg = _ensure_dict(params_cfg, "llm")
+    if args.llm is not None:
+        llm_cfg["enabled"] = bool(args.llm)
+    elif args.interactive:
+        llm_default = _coerce_bool_or_none(llm_cfg.get("enabled"))
+        llm_choice = _prompt_bool(
+            "Gemini 후보/전략 인사이트를 사용할까요?", llm_default
+        )
+        if llm_choice is not None:
+            llm_cfg["enabled"] = llm_choice
+
+    if llm_cfg.get("enabled"):
+        api_key_env = str(llm_cfg.get("api_key_env", "GEMINI_API_KEY"))
+        if not llm_cfg.get("api_key") and not os.environ.get(api_key_env):
+            LOGGER.warning(
+                "Gemini 활성화 상태지만 API 키가 설정되지 않았습니다. %s 환경 변수를 확인하세요.",
+                api_key_env,
+            )
 
     def _resolve_simple_metrics_flag() -> bool:
         for candidate in (
@@ -3017,6 +3623,59 @@ def _execute_single(
     )
 
     study_storage = _resolve_study_storage(params_cfg, datasets)
+    _apply_study_registry_defaults(search_cfg, study_storage)
+
+    storage_env_key = str(search_cfg.get("storage_url_env") or DEFAULT_STORAGE_ENV_KEY)
+    if not storage_env_key:
+        storage_env_key = DEFAULT_STORAGE_ENV_KEY
+    search_cfg["storage_url_env"] = storage_env_key
+
+    if not search_cfg.get("storage_url"):
+        search_cfg["storage_url"] = DEFAULT_POSTGRES_STORAGE_URL
+
+    storage_env_value = os.getenv(storage_env_key) if storage_env_key else None
+    effective_storage_url = str(
+        storage_env_value or search_cfg.get("storage_url") or ""
+    )
+    using_sqlite = effective_storage_url.startswith("sqlite:///")
+    is_postgres = effective_storage_url.startswith(POSTGRES_PREFIXES)
+    masked_storage_url = _mask_storage_url(effective_storage_url) if effective_storage_url else ""
+    if storage_env_value:
+        storage_source = f"환경변수 {storage_env_key}"
+    elif effective_storage_url:
+        storage_source = "설정값"
+    else:
+        storage_source = "기본값"
+    backend_label = (
+        "PostgreSQL"
+        if is_postgres
+        else "SQLite"
+        if using_sqlite
+        else "기타 RDB"
+        if effective_storage_url
+        else "비활성"
+    )
+    LOGGER.info(
+        "Optuna 스토리지 백엔드: %s (%s, URL=%s)",
+        backend_label,
+        storage_source,
+        masked_storage_url or "(없음)",
+    )
+
+    default_optuna_jobs = (
+        SQLITE_SAFE_OPTUNA_JOBS if using_sqlite else DEFAULT_OPTUNA_JOBS
+    )
+    default_dataset_jobs = (
+        SQLITE_SAFE_DATASET_JOBS if using_sqlite else DEFAULT_DATASET_JOBS
+    )
+
+    if not search_cfg.get("n_jobs"):
+        search_cfg["n_jobs"] = default_optuna_jobs
+    if not search_cfg.get("dataset_jobs"):
+        search_cfg["dataset_jobs"] = default_dataset_jobs
+
+    if using_sqlite and not search_cfg.get("allow_sqlite_parallel"):
+        search_cfg.setdefault("force_sqlite_serial", True)
 
     trials_log_dir = output_dir / "trials"
 
@@ -3033,9 +3692,30 @@ def _execute_single(
         log_dir=trials_log_dir,
     )
 
+    llm_insights_logged: List[str] = []
+    raw_llm_insights = optimisation.get("llm_insights")
+    if isinstance(raw_llm_insights, (list, tuple)):
+        llm_insights_logged = [str(item) for item in raw_llm_insights if str(item).strip()]
+    if llm_insights_logged:
+        logs_dir = output_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        insight_file = logs_dir / "gemini_insights.md"
+        timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S %Z")
+        with insight_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"## {timestamp}\n")
+            for insight in llm_insights_logged:
+                handle.write(f"- {insight}\n")
+            handle.write("\n")
+        for insight in llm_insights_logged:
+            LOGGER.info("[Gemini Insight] %s", insight)
+
     study = optimisation.get("study")
     if study is not None:
-        write_trials_dataframe(study, output_dir)
+        write_trials_dataframe(
+            study,
+            output_dir,
+            param_order=optimisation.get("param_order"),
+        )
     else:
         LOGGER.warning("No Optuna study returned; skipping trials export")
 
@@ -3075,6 +3755,12 @@ def _execute_single(
         )
 
     primary_min_trades = _min_trades_for_dataset(primary_dataset)
+    param_order = optimisation.get("param_order")
+
+    def _ordered_params_view(raw_params: object) -> Dict[str, object]:
+        if isinstance(raw_params, Mapping):
+            return _order_mapping(raw_params, param_order)
+        return {}
 
     wf_summary = run_walk_forward(
         primary_dataset.df,
@@ -3126,7 +3812,7 @@ def _execute_single(
             "trial": best_record["trial"],
             "score": best_record.get("score"),
             "oos_mean": wf_summary.get("oos_mean"),
-            "params": best_record.get("params"),
+            "params": _ordered_params_view(best_record.get("params")),
             "timeframe": best_key[0],
             "htf_timeframe": best_key[1],
         }
@@ -3161,7 +3847,7 @@ def _execute_single(
                     "trial": record["trial"],
                     "score": record.get("score"),
                     "oos_mean": candidate_wf.get("oos_mean"),
-                    "params": record.get("params"),
+                    "params": _ordered_params_view(record.get("params")),
                     "timeframe": candidate_key[0],
                     "htf_timeframe": candidate_key[1],
                 }
@@ -3183,7 +3869,7 @@ def _execute_single(
         "trial": best_record["trial"],
         "score": best_record.get("score"),
         "oos_mean": wf_summary.get("oos_mean"),
-        "params": best_record.get("params"),
+        "params": _ordered_params_view(best_record.get("params")),
         "timeframe": best_key[0],
         "htf_timeframe": best_key[1],
     }
@@ -3197,12 +3883,22 @@ def _execute_single(
         filtered_params = _filter_basic_factor_params(
             item.get("params") or {}, enabled=optimisation.get("basic_factor_profile", True)
         )
+        ordered_params = _order_mapping(filtered_params, param_order)
+        raw_metrics = trial_record.get("metrics") if isinstance(trial_record, dict) else {}
+        if isinstance(raw_metrics, Mapping):
+            metrics_payload: object = _order_mapping(
+                raw_metrics,
+                None,
+                priority=("ProfitFactor", "Sortino"),
+            )
+        else:
+            metrics_payload = raw_metrics
         entry = {
             "trial": item["trial"],
             "score": item.get("score"),
             "oos_mean": item.get("oos_mean"),
-            "params": filtered_params,
-            "metrics": trial_record.get("metrics"),
+            "params": ordered_params,
+            "metrics": metrics_payload,
             "timeframe": item.get("timeframe"),
             "htf_timeframe": item.get("htf_timeframe"),
         }
@@ -3222,6 +3918,16 @@ def _execute_single(
         validation_manifest["summary"] = cv_summary
 
     storage_meta = optimisation.get("storage", {}) or {}
+    _register_study_reference(
+        study_storage,
+        storage_meta=storage_meta,
+        study_name=str(search_cfg.get("study_name")) if search_cfg.get("study_name") else None,
+    )
+    sanitised_storage_meta = _sanitise_storage_meta(storage_meta)
+    registry_dir = _study_registry_dir(study_storage) if study_storage else None
+    registry_dir_str = (
+        str(registry_dir) if registry_dir and registry_dir.exists() else None
+    )
     search_manifest = copy.deepcopy(params_cfg.get("search", {}))
     if "storage_url" in search_manifest:
         url_value = search_manifest.get("storage_url")
@@ -3240,11 +3946,12 @@ def _execute_single(
         "basic_factor_profile": optimisation.get("basic_factor_profile", True),
         "resume_bank": str(resume_bank_path) if resume_bank_path else None,
         "study_storage": storage_meta.get("path") if storage_meta.get("backend") == "sqlite" else None,
+        "study_registry": registry_dir_str,
         "regime": regime_summary.__dict__,
         "cli": list(argv or []),
     }
-    if storage_meta:
-        manifest["storage"] = storage_meta
+    if sanitised_storage_meta:
+        manifest["storage"] = sanitised_storage_meta
     if validation_manifest:
         manifest["validation"] = validation_manifest
 
@@ -3267,6 +3974,7 @@ def _execute_single(
         wf_summary,
         objective_specs,
         output_dir,
+        param_order=optimisation.get("param_order"),
     )
 
     LOGGER.info("Run complete. Outputs saved to %s", output_dir)
@@ -3277,6 +3985,28 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
 
     params_cfg = load_yaml(args.params)
     backtest_cfg = load_yaml(args.backtest)
+
+    ltf_prompt = getattr(args, "_ltf_prompt_selection", None)
+    if (
+        ltf_prompt is None
+        and not getattr(args, "timeframe", None)
+        and not getattr(args, "timeframe_grid", None)
+    ):
+        ltf_prompt = _prompt_ltf_selection()
+        setattr(args, "_ltf_prompt_selection", ltf_prompt)
+
+    all_timeframes_requested = False
+    if ltf_prompt:
+        if ltf_prompt.use_all:
+            all_timeframes_requested = True
+            args.timeframe = None
+            if not getattr(args, "timeframe_grid", None):
+                ltf_candidates = _collect_ltf_candidates(backtest_cfg, params_cfg)
+                if not ltf_candidates:
+                    ltf_candidates = ["1m", "3m", "5m"]
+                args.timeframe_grid = ",".join(ltf_candidates)
+        elif ltf_prompt.timeframe and not getattr(args, "timeframe", None):
+            args.timeframe = ltf_prompt.timeframe
 
     auto_list: List[str] = []
 
@@ -3338,6 +4068,19 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
         for dataset in datasets:
             if isinstance(dataset, dict):
                 dataset["symbol"] = selected_symbol
+
+    if all_timeframes_requested:
+        if getattr(args, "timeframe_grid", None):
+            LOGGER.info("사용자가 이미 타임프레임 그리드를 지정해 혼합 실행 요청을 유지합니다: %s", args.timeframe_grid)
+        else:
+            ltf_candidates = _collect_ltf_candidates(backtest_cfg, params_cfg)
+            if not ltf_candidates:
+                ltf_candidates = ["1m", "3m", "5m"]
+            args.timeframe_grid = ",".join(ltf_candidates)
+            LOGGER.info(
+                "혼합 LTF 실행을 위해 타임프레임 그리드를 자동 구성했습니다: %s",
+                ", ".join(ltf_candidates),
+            )
 
     combos = _parse_timeframe_grid(getattr(args, "timeframe_grid", None))
     if not combos:
@@ -3403,8 +4146,24 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Entry point for ``python -m optimize.run``."""
 
-    args = parse_args(argv)
-    execute(args, argv)
+    if argv is None:
+        original_argv: List[str] = list(sys.argv[1:])
+    else:
+        original_argv = list(argv)
+
+    parsed_argv = list(original_argv)
+    replaced_interactive = False
+    for index, token in enumerate(parsed_argv):
+        if token == "시작":
+            parsed_argv[index] = "--interactive"
+            replaced_interactive = True
+            break
+
+    if replaced_interactive and "--interactive" not in parsed_argv:
+        parsed_argv.append("--interactive")
+
+    args = parse_args(parsed_argv)
+    execute(args, original_argv)
 
 
 if __name__ == "__main__":
