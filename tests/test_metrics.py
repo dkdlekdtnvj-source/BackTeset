@@ -1,25 +1,13 @@
 import math
 
-import importlib
-
 import numpy as np
 import pandas as pd
 import pytest
 
-try:  # 사전 로드로 pandas 부분 초기화를 방지
-    import seaborn  # type: ignore
-except Exception:  # pragma: no cover
-    seaborn = None
-
 pytest.importorskip("optuna", reason="optimize.run 모듈은 optuna 의존성을 필요로 합니다.")
 pytest.importorskip("ccxt", reason="데이터 캐시 초기화에는 ccxt 의존성이 필요합니다.")
 pytest.importorskip("matplotlib", reason="리포트 모듈은 matplotlib 을 요구합니다.")
-if seaborn is None:
-    pytest.skip("리포트 모듈은 seaborn 을 요구합니다.", allow_module_level=True)
-
-# 일부 환경에서는 seaborn import 실패 후 pandas 가 부분 초기화 상태로 남는다.
-# 테스트 시작 전에 강제로 reload 해 Pandas API 를 온전히 복구한다.
-pd = importlib.reload(pd)
+pytest.importorskip("seaborn", reason="리포트 모듈은 seaborn 을 요구합니다.")
 
 from optimize.metrics import (
     ObjectiveSpec,
@@ -40,7 +28,7 @@ from optimize.strategy_model import run_backtest
 
 def _base_params(**overrides):
     params = {
-        "oscLen": 20,
+        "oscLen": 12,
         "signalLen": 3,
         "bbLen": 20,
         "kcLen": 18,
@@ -397,6 +385,7 @@ def test_time_stop_exit_reason():
         kcMult=1.0,
         fluxLen=2,
         useFluxHeikin=False,
+        requireMomentumCross=False,
         debugForceLong=True,
         startDate=data.index[0].isoformat(),
     )

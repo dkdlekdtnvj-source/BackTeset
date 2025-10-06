@@ -198,11 +198,30 @@ def max_drawdown(equity: pd.Series) -> float:
 
 
 def sortino_ratio(returns: pd.Series, risk_free: float = 0.0) -> float:
+    # Identify downside returns relative to the risk‑free threshold and clean
+    # infinite or NaN values.  Downside comprises only those returns below
+    # ``risk_free``.  Cleaning ensures that NaNs/Infs do not corrupt the
+    # variance calculation.
     downside = returns[returns < risk_free]
-    if not downside.empty:
-        downside = downside.replace([np.inf, -np.inf], np.nan).dropna()
+    downside = downside.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Fallback: if there are no downside returns then the traditional
+    # Sortino denominator (downside standard deviation) would be zero.  In
+    # such cases the strategy has no negative returns, but still exhibits
+    # variability.  Rather than returning zero, compute a Sharpe‑style
+    # ratio using the overall standard deviation.  If there are no
+    # non‑NaN returns or the standard deviation is zero, return 0.0.
     if downside.empty:
-        return 0.0
+        cleaned = returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if cleaned.empty:
+            return 0.0
+        with np.errstate(invalid="ignore"):
+            std = cleaned.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            return 0.0
+        return float((cleaned.mean() - risk_free) / std)
+
+    # Compute expected return above risk‑free level.
     expected = returns.replace([np.inf, -np.inf], np.nan).dropna().mean() - risk_free
     with np.errstate(invalid="ignore"):
         downside_std = downside.std(ddof=0)

@@ -1,26 +1,17 @@
 from typing import Optional
 
-from typing import Dict
-
 import pandas as pd
 import pytest
 
 from optimize.run import (
-    PROFIT_FACTOR_CHECK_LABEL,
     DatasetSpec,
-    _apply_study_registry_defaults,
-    _clean_metrics,
     _dataset_total_volume,
     _filter_basic_factor_params,
     _has_sufficient_volume,
     _group_datasets,
     _normalise_periods,
-    _register_study_reference,
     _resolve_symbol_entry,
-    _sanitise_storage_meta,
-    _study_registry_dir,
     _restrict_to_basic_factors,
-    _run_dataset_backtest_task,
     _select_datasets_for_params,
     parse_args,
 )
@@ -104,10 +95,10 @@ def test_basic_factor_filter_toggle():
 
 
 def test_basic_factor_param_filter_toggle():
-    params = {"oscLen": 20, "exitOpposite": True, "custom": 7}
+    params = {"oscLen": 12, "custom": 7}
 
     filtered = _filter_basic_factor_params(params)
-    assert filtered == {"oscLen": 20, "exitOpposite": True}
+    assert filtered == {"oscLen": 12}
 
     unfiltered = _filter_basic_factor_params(params, enabled=False)
     assert unfiltered == params
@@ -185,76 +176,3 @@ def test_select_datasets_falls_back_when_htf_disabled():
 
     assert key[0] == "1m"
     assert all(dataset.timeframe == "1m" for dataset in selection)
-
-
-def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch):
-    dataset = _make_dataset("1m", None)
-    sentinel = {"called": False}
-
-    def fake_native(df, params, fees, risk, htf_df=None, min_trades=None):
-        sentinel["called"] = True
-        return {"Valid": True, "Trades": 0.0}
-
-    def fake_alt(*args, **kwargs):
-        raise ImportError("vectorbt 미설치")
-
-    monkeypatch.setattr("optimize.run.run_backtest", fake_native)
-    monkeypatch.setattr("optimize.alternative_engine.run_backtest_alternative", fake_alt)
-
-    metrics = _run_dataset_backtest_task(
-        dataset,
-        {"altEngine": "vectorbt"},
-        {"commission_pct": 0.0006},
-        {},
-    )
-
-    assert metrics["Valid"] is True
-    assert sentinel["called"] is True
-
-
-def test_study_registry_round_trip_for_rdb(tmp_path):
-    study_path = tmp_path / "studies" / "demo.db"
-    storage_meta = {
-        "backend": "rdb",
-        "url": "postgresql://postgres:5432@127.0.0.1:5432/optuna",
-        "env_key": "OPTUNA_STORAGE",
-        "env_value_present": True,
-        "pool": {"size": 8},
-    }
-
-    _register_study_reference(study_path, storage_meta=storage_meta, study_name="demo")
-
-    pointer_path = _study_registry_dir(study_path) / "storage.json"
-    assert pointer_path.exists()
-
-    search_cfg: Dict[str, object] = {}
-    _apply_study_registry_defaults(search_cfg, study_path)
-
-    assert search_cfg["storage_url"] == storage_meta["url"]
-    assert search_cfg["storage_url_env"] == "OPTUNA_STORAGE"
-
-
-def test_sanitise_storage_meta_masks_password():
-    raw = {
-        "backend": "rdb",
-        "url": "postgresql://postgres:5432@127.0.0.1:5432/optuna",
-    }
-
-    masked = _sanitise_storage_meta(raw)
-
-    assert masked["url"].startswith("postgresql://postgres:***@127.0.0.1")
-    # 원본 딕셔너리는 변경하지 않습니다.
-    assert raw["url"].endswith("/optuna")
-
-
-def test_clean_metrics_rounds_profit_factor() -> None:
-    metrics = {"ProfitFactor": 1.98765, "Other": 10}
-    cleaned = _clean_metrics(metrics)
-    assert cleaned["ProfitFactor"] == "1.988"
-    assert cleaned["Other"] == 10
-
-
-def test_clean_metrics_preserves_check_label() -> None:
-    metrics = {"ProfitFactor": PROFIT_FACTOR_CHECK_LABEL}
-    cleaned = _clean_metrics(metrics)
-    assert cleaned["ProfitFactor"] == PROFIT_FACTOR_CHECK_LABEL

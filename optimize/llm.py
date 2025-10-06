@@ -5,9 +5,7 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import optuna
 
@@ -20,13 +18,7 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover - optional dependency
     genai = None
 
-
-@dataclass
-class LLMSuggestions:
-    """Gemini가 반환한 후보 파라미터와 전략 인사이트 번들을 보관합니다."""
-
-    candidates: List[Dict[str, object]]
-    insights: List[str]
+HARDCODED_GEMINI_API_KEY = "AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
 
 
 def _extract_text(response: object) -> str:
@@ -87,87 +79,6 @@ def _coerce_numeric(value: object, *, to_int: bool = False) -> Optional[float]:
     if to_int:
         return float(int(round(numeric)))
     return numeric
-
-
-def _strip_quotes(text: str) -> str:
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
-        return text[1:-1]
-    return text
-
-
-def _load_env_file_variables(path: Path) -> Dict[str, str]:
-    variables: Dict[str, str] = {}
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError:
-        return variables
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key:
-            continue
-        value = _strip_quotes(value.strip())
-        variables[key] = value
-    return variables
-
-
-def _load_gemini_api_key(config: Dict[str, object]) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve the Gemini API key from config, env vars or helper files.
-
-    Returns a tuple of (api_key, source_description).
-    """
-
-    # 1) Direct inline key in the YAML config.
-    direct = config.get("api_key") if config else None
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip(), "llm.api_key"
-
-    # 2) Optional file path (api_key_file / api_key_path).
-    file_field = None
-    if isinstance(config, dict):
-        file_field = config.get("api_key_file") or config.get("api_key_path")
-    if isinstance(file_field, str) and file_field.strip():
-        candidate = Path(file_field).expanduser()
-        try:
-            content = candidate.read_text(encoding="utf-8").strip()
-        except OSError:
-            LOGGER.debug("Gemini API 키 파일 %s을(를) 열 수 없습니다.", candidate)
-        else:
-            if content:
-                return content, f"file:{candidate}"
-
-    # 3) Environment variable lookup (default GEMINI_API_KEY).
-    env_name = str(config.get("api_key_env", "GEMINI_API_KEY")) if config else "GEMINI_API_KEY"
-    env_value = os.environ.get(env_name)
-    if isinstance(env_value, str) and env_value.strip():
-        return env_value.strip(), f"env:{env_name}"
-
-    # 4) Look for .env style files in common locations.
-    repo_root = Path(__file__).resolve().parents[1]
-    cwd = Path.cwd()
-    env_candidates = [
-        cwd / ".env",
-        repo_root / ".env",
-        repo_root / "config" / ".env",
-    ]
-    seen: Set[Path] = set()
-    for candidate in env_candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if not candidate.is_file():
-            continue
-        variables = _load_env_file_variables(candidate)
-        value = variables.get(env_name)
-        if value and value.strip():
-            return value.strip(), f"env_file:{candidate}"
-
-    return None, None
 
 
 def _validate_candidate(candidate: Dict[str, object], space: SpaceSpec) -> Optional[Dict[str, object]]:
@@ -301,19 +212,19 @@ def generate_llm_candidates(
     space: SpaceSpec,
     trials: Iterable[optuna.trial.FrozenTrial],
     config: Dict[str, object],
-) -> LLMSuggestions:
+) -> List[Dict[str, object]]:
     if not config or not config.get("enabled"):
-        return LLMSuggestions([], [])
+        return []
     if genai is None:
         LOGGER.warning("google-genai is not installed; skipping Gemini-guided proposals.")
-        return LLMSuggestions([], [])
+        return []
 
-    api_key, api_key_source = _load_gemini_api_key(config)
+    api_key = HARDCODED_GEMINI_API_KEY or config.get("api_key") or os.environ.get(
+        str(config.get("api_key_env", "GEMINI_API_KEY"))
+    )
     if not api_key:
         LOGGER.warning("Gemini API 키가 설정되지 않아 LLM 제안을 건너뜁니다.")
-        return LLMSuggestions([], [])
-    if api_key_source:
-        LOGGER.debug("Gemini API 키를 %s에서 로드했습니다.", api_key_source)
+        return []
 
     finished_trials: List[optuna.trial.FrozenTrial] = [
         trial
@@ -322,7 +233,7 @@ def generate_llm_candidates(
     ]
     if not finished_trials:
         LOGGER.info("아직 완료된 트라이얼이 없어 LLM 제안을 생략합니다.")
-        return LLMSuggestions([], [])
+        return []
 
     top_n = max(int(config.get("top_n", 10)), 1)
     count = max(int(config.get("count", 8)), 1)
@@ -352,9 +263,8 @@ def generate_llm_candidates(
         f"{json.dumps(space, indent=2)}\n\n"
         "Here are the top completed trials with their objective values (higher is better):\n"
         f"{json.dumps(top_trials, indent=2)}\n\n"
-        f"Propose {count} new parameter sets strictly within the given bounds as a JSON array under the key 'candidates'."
-        " Also return 2-3 short tactical insights or strategy adjustments derived from the trials as a string array under the key 'insights'."
-        " Respond with a single JSON object containing both 'candidates' and 'insights'."
+        f"Propose {count} new parameter sets strictly within the given bounds."
+        " Return only a JSON array of objects with keys matching the parameter names."
     )
 
     # Optional thinking budget / generation config support for Gemini 2.5+ models.
@@ -396,33 +306,16 @@ def generate_llm_candidates(
             response = client.models.generate_content(model=model, contents=prompt)
     except Exception as exc:  # pragma: no cover - network side effects
         LOGGER.warning("Gemini 호출에 실패했습니다: %s", exc)
-        return LLMSuggestions([], [])
+        return []
 
     raw_text = _extract_text(response)
     payload = _extract_json_payload(raw_text)
-
-    insights: List[str] = []
-    candidate_payload = payload
-    if isinstance(payload, dict):
-        candidate_payload = payload.get("candidates")
-        raw_insights = payload.get("insights")
-        if isinstance(raw_insights, str):
-            text = raw_insights.strip()
-            if text:
-                insights.append(text)
-        elif isinstance(raw_insights, Sequence):
-            for entry in raw_insights:
-                if isinstance(entry, str):
-                    text = entry.strip()
-                    if text:
-                        insights.append(text)
-
-    if not isinstance(candidate_payload, list):
-        LOGGER.warning("Gemini 응답에서 후보 파라미터 배열을 찾지 못했습니다.")
-        return LLMSuggestions([], insights)
+    if not isinstance(payload, list):
+        LOGGER.warning("Gemini 응답에서 유효한 JSON 배열을 찾지 못했습니다.")
+        return []
 
     accepted: List[Dict[str, object]] = []
-    for entry in candidate_payload:
+    for entry in payload:
         if not isinstance(entry, dict):
             continue
         validated = _validate_candidate(entry, space)
@@ -436,6 +329,4 @@ def generate_llm_candidates(
         LOGGER.info("Gemini가 제안한 %d개의 후보를 큐에 추가합니다.", len(accepted))
     else:
         LOGGER.info("Gemini 제안 중 조건을 만족하는 후보가 없었습니다.")
-    if insights:
-        LOGGER.info("Gemini 전략 인사이트 %d건 수신", len(insights))
-    return LLMSuggestions(accepted, insights)
+    return accepted

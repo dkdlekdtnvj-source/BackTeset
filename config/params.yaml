@@ -1,24 +1,15 @@
 version: 1
 
-overrides:
-  altEngine: vectorbt
-
 search:
   algo: bayes
   n_trials: 1000
   seed: 42
   top_k: 5
+  n_jobs: 4
+  dataset_jobs: 2
   dataset_executor: process
-  allow_sqlite_parallel: false   # true=병렬 허용을 명시, false=병렬 유지하되 잠금 충돌 시 자동 재시도(경고 출력)
-  # 기본 병렬: 스토리지 타입에 맞춰 run.py에서 CPU 코어 수 기반으로 자동 설정됩니다.
-  storage_url_env: OPTUNA_STORAGE   # 외부 RDB URL을 환경변수로 전달하면 SQLite 대신 사용합니다.
-  storage_pool_size: 8                  # PostgreSQL 풀 커넥션 수 (기본 8)
-  storage_max_overflow: 16              # 풀 초과 시 임시 커넥션 수
-  storage_pool_timeout: 30              # 풀에서 커넥션을 기다리는 최대 초 (0=무제한)
-  storage_pool_recycle: 1800            # 커넥션 재생성 주기(초)
-  storage_connect_timeout: 10           # DB 커넥션 시도 타임아웃(초)
-  storage_statement_timeout_ms: 300000  # 쿼리 타임아웃(밀리초). 0 또는 비우면 비활성화
-  storage_isolation_level: READ COMMITTED  # PostgreSQL 권장 격리 수준
+  allow_sqlite_parallel: false   # true로 설정하면 SQLite에서도 n_jobs 병렬을 유지 (잠금 충돌 가능)
+  # 기본 병렬: run.py에서 자동 설정(n_jobs=자동)
 
 # === 엔진/성능 옵션 ===
 useNumba: true          # Numba JIT 사용 (없으면 기본 false)
@@ -36,33 +27,39 @@ constraints:
   max_dd_pct: 70        # MaxDD 70% 초과면 패널티
 
 space:
-  # === Squeeze Momentum Deluxe 로직에 맞춘 최적화 공간 ===
+  # Optimisation search space tuned for the Squeeze Momentum Deluxe strategy.
+  #
+  # Only the core oscillator, signal, volatility channel and fade‑exit
+  # parameters are swept.  All other features (filters, dynamic thresholds,
+  # alternative exits) remain at their default values.  See `optimize/run.py`
+  # for the basic factor key set used by `--basic-factors-only`.
 
-  # --- 1. 핵심 오실레이터 설정 ---
-  # Deluxe 로직에서는 oscLen이 모멘텀 채널과 스퀴즈 계산 모두에 영향을 줌
-  oscLen:         { type: int,   min: 10,  max: 40, step: 2 }
-  signalLen:      { type: int,   min: 2,   max: 12, step: 1 }
+  # --- Oscillator & signal lengths ---
+  oscLen:         { type: int,   min: 8,   max: 48, step: 2 }
+  signalLen:      { type: int,   min: 1,   max: 12, step: 1 }
 
-  # --- 2. 스퀴즈 감지용 KC 채널 ---
-  # Deluxe 로직은 BB 대신 KC와 ATR만으로 스퀴즈를 감지함
-  kcLen:          { type: int,   min: 10,  max: 30, step: 2 }
-  kcMult:         { type: float, min: 1.0, max: 2.5, step: 0.1 }
+  # --- Volatility channels (Bollinger & Keltner) ---
+  bbLen:          { type: int,   min: 12, max: 30, step: 2 }
+  bbMult:         { type: float, min: 1.5, max: 2.5, step: 0.25 }
+  kcLen:          { type: int,   min: 12, max: 30, step: 2 }
+  kcMult:         { type: float, min: 1.0, max: 2.0, step: 0.2 }
 
-  # --- 3. 방향성 플럭스 ---
-  fluxLen:        { type: int,   min: 10,  max: 40, step: 2 }
-  fluxSmoothLen:  { type: int,   min: 1,   max: 7,  step: 1 }
+  # --- Directional flux ---
+  fluxLen:        { type: int,   min: 8,   max: 40, step: 2 }
+  fluxSmoothLen:  { type: int,   min: 1,   max: 10, step: 1 }
   useFluxHeikin:  { type: bool }
 
-  # --- 4. 동적 임계값 및 진입 조건 ---
+  # --- Dynamic threshold & momentum gate ---
   useDynamicThresh:     { type: bool }
   useSymThreshold:      { type: bool }
   statThreshold:        { type: float, min: 20.0, max: 80.0, step: 2.0 }
   buyThreshold:         { type: float, min: 20.0, max: 60.0, step: 2.0 }
   sellThreshold:        { type: float, min: 20.0, max: 60.0, step: 2.0 }
-  dynLen:               { type: int,   min: 15,  max: 60, step: 5 }
-  dynMult:              { type: float, min: 0.8, max: 2.0, step: 0.1 }
+  dynLen:               { type: int,   min: 10,  max: 60, step: 1 }
+  dynMult:              { type: float, min: 0.8, max: 1.8, step: 0.05 }
+  requireMomentumCross: { type: bool }
 
-  # --- 5. 청산 로직 ---
+  # --- Exit logic ---
   exitOpposite:   { type: bool }
   useMomFade:     { type: bool }
   momFadeRegLen:  { type: int,   min: 10, max: 40, step: 2 }
@@ -81,22 +78,17 @@ risk:
 
 # --- LLM assistant configuration ---
 # To enable Gemini‑assisted parameter proposals, set `enabled: true` and provide
-# a valid API key. The loader checks the following keys in order: `api_key`,
-# `api_key_file`/`api_key_path`, `api_key_env` (defaults to `GEMINI_API_KEY`),
-# and `.env` files located in the working directory, repository root, or
-# `config/.env`. The default model points to the latest Gemini 2.5 Flash
-# preview; override it if Google renames the model after the preview phase.
-# `initial_trials` controls how many Optuna trials are executed before
-# consulting the LLM. `top_n` determines how many top trials are summarised,
-# and `count` sets the number of candidate suggestions to enqueue.
-# `thinking_budget` is optional and applies only to Gemini 2.5 models, tuning
-# the internal reasoning cost (0 disables thinking; higher values allow deeper
-# reasoning but increase latency/cost).
+# a valid API key via `api_key` or `api_key_env`. The default model points to
+# the latest Gemini 2.5 Flash preview; override it if Google renames the model
+# after the preview phase. `initial_trials` controls how many Optuna trials are
+# executed before consulting the LLM. `top_n` determines how many top trials
+# are summarised, and `count` sets the number of candidate suggestions to
+# enqueue. `thinking_budget` is optional and applies only to Gemini 2.5 models,
+# tuning the internal reasoning cost (0 disables thinking; higher values allow
+# deeper reasoning but increase latency/cost).
 llm:
-  enabled: true
+  enabled: false
   api_key_env: GEMINI_API_KEY
-  # api_key: "..."               # 직접 입력 (권장 X)
-  # api_key_file: ~/.secrets/gemini.key
   model: gemini-2.5-flash-preview-04-17
   top_n: 10
   count: 8

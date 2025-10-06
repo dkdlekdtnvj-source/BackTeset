@@ -34,7 +34,6 @@
      ```
    - `--no-simple-metrics` 옵션을 사용하면 점수 스케일이 왜곡되지 않습니다.
    - 실행 시 생성되는 로그와 리포트는 `reports` 폴더 아래 자동으로 분류됩니다.
-   - SQLite 잠금 오류가 반복되면 `docs/postgresql_스토리지_전환_가이드.md`를 참고해 PostgreSQL 스토리지로 전환하세요. `config/params.yaml`에 기본 풀/타임아웃 값이 포함되어 있습니다.
 
 6. 경로 관련 오류 방지 (2025-10-02 오류 대응)
    - 최신 코드에서는 `reports/<런ID>/trials` 폴더가 자동 생성됩니다.
