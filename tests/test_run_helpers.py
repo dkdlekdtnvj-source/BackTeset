@@ -1,4 +1,3 @@
-from typing import Optional
 
 from typing import Dict
 
@@ -113,7 +112,7 @@ def test_basic_factor_param_filter_toggle():
     assert unfiltered == params
 
 
-def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
+def _make_dataset(timeframe: str) -> DatasetSpec:
     idx = pd.date_range("2024-01-01", periods=3, freq="1min")
     df = pd.DataFrame(
         {
@@ -132,13 +131,13 @@ def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
         end="2024-01-02",
         df=df,
         htf=None,
-        htf_timeframe=htf,
+        htf_timeframe=None,
         source_symbol="BINANCE:TESTUSDT",
     )
 
 
 def test_dataset_total_volume_sums_numeric_values():
-    dataset = _make_dataset("1m", None)
+    dataset = _make_dataset("1m")
 
     total = _dataset_total_volume(dataset)
 
@@ -146,7 +145,7 @@ def test_dataset_total_volume_sums_numeric_values():
 
 
 def test_dataset_total_volume_handles_missing_volume_column():
-    dataset = _make_dataset("1m", None)
+    dataset = _make_dataset("1m")
     dataset.df = dataset.df.drop(columns=["volume"])
 
     total = _dataset_total_volume(dataset)
@@ -155,7 +154,7 @@ def test_dataset_total_volume_handles_missing_volume_column():
 
 
 def test_has_sufficient_volume_detects_shortfall():
-    dataset = _make_dataset("1m", None)
+    dataset = _make_dataset("1m")
 
     meets, total = _has_sufficient_volume(dataset, 100.0)
 
@@ -163,35 +162,35 @@ def test_has_sufficient_volume_detects_shortfall():
     assert total == pytest.approx(33.0)
 
 
-def test_select_datasets_respects_timeframe_and_htf_choice():
-    datasets = [_make_dataset("1m", "15m"), _make_dataset("3m", "1h")]
+def test_select_datasets_prefers_requested_timeframe():
+    datasets = [_make_dataset("1m"), _make_dataset("3m")]
     groups, timeframe_groups, default_key = _group_datasets(datasets)
-    params_cfg = {"timeframe": "1m", "htf_timeframes": ["15m", "1h"]}
-    params = {"timeframe": "3m", "htf": "1h"}
+    params_cfg = {"timeframe": "1m"}
+    params = {"timeframe": "3m"}
 
     key, selection = _select_datasets_for_params(params_cfg, groups, timeframe_groups, default_key, params)
 
-    assert key == ("3m", "1h")
+    assert key == ("3m", None)
     assert selection == [datasets[1]]
 
 
-def test_select_datasets_falls_back_when_htf_disabled():
-    datasets = [_make_dataset("1m", "15m"), _make_dataset("1m", None)]
+def test_select_datasets_falls_back_to_default_when_missing():
+    datasets = [_make_dataset("1m")]
     groups, timeframe_groups, default_key = _group_datasets(datasets)
-    params_cfg = {"timeframe": "1m", "htf_timeframes": ["15m"]}
-    params = {"timeframe": "1m", "htf": "none"}
+    params_cfg = {"timeframe": "3m"}
+    params = {"timeframe": "5m"}
 
     key, selection = _select_datasets_for_params(params_cfg, groups, timeframe_groups, default_key, params)
 
-    assert key[0] == "1m"
-    assert all(dataset.timeframe == "1m" for dataset in selection)
+    assert key == default_key
+    assert selection == groups[default_key]
 
 
 def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch):
-    dataset = _make_dataset("1m", None)
+    dataset = _make_dataset("1m")
     sentinel = {"called": False}
 
-    def fake_native(df, params, fees, risk, htf_df=None, min_trades=None):
+    def fake_native(df, params, fees, risk, min_trades=None):
         sentinel["called"] = True
         return {"Valid": True, "Trades": 0.0}
 

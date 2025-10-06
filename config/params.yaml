@@ -51,7 +51,9 @@ space:
   # --- 3. 방향성 플럭스 ---
   fluxLen:        { type: int,   min: 10,  max: 40, step: 2 }
   fluxSmoothLen:  { type: int,   min: 1,   max: 7,  step: 1 }
+  fluxSmoothType: { type: choice, values: ["기본", "EMA", "HMA"] }
   useFluxHeikin:  { type: bool }
+  maType:         { type: choice, values: ["기본", "EMA", "HMA"] }
 
   # --- 4. 동적 임계값 및 진입 조건 ---
   useDynamicThresh:     { type: bool }
