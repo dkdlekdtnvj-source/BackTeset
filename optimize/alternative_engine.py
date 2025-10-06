@@ -25,9 +25,13 @@ from optimize.strategy_model import (  # 재사용 가능한 보조 함수들
     _atr,
     _bars_since_mask,
     _directional_flux,
+    _dmi,
+    _ema,
     _heikin_ashi,
+    _hma,
     _linreg,
     _rma,
+    _resolve_ma_type,
     _sma,
     _std,
 )
@@ -323,18 +327,31 @@ def _compute_indicators(
     flux_len = max(_coerce_int(params.get("fluxLen"), 14), 1)
     flux_smooth_len = max(_coerce_int(params.get("fluxSmoothLen"), 1), 1)
     flux_use_ha = _coerce_bool(params.get("useFluxHeikin"), True)
+    use_mod_flux = _coerce_bool(params.get("useModFlux"), False)
+    use_mod_squeeze = _coerce_bool(params.get("useModSqueeze"), False)
+    ma_type = _resolve_ma_type(params.get("maType", "SMA"))
 
     hl2 = (df["high"] + df["low"]) / 2.0
-    atr_kc = _atr(df, kc_len).replace(0.0, np.nan)
+    atr_primary = _atr(df, kc_len)
+    atr_safe = atr_primary.replace(0.0, np.nan)
     kc_basis = _sma(hl2, kc_len)
-    kc_range = atr_kc * kc_mult
+    kc_range = atr_primary * kc_mult
     kc_upper = kc_basis + kc_range
     kc_lower = kc_basis - kc_range
     kc_average = (kc_upper + kc_lower) / 2.0
     midline = (hl2 + kc_average) / 2.0
-    norm = (df["close"] - midline) / atr_kc * 100.0
-    momentum = _linreg(norm, osc_len)
-    mom_signal = _sma(momentum, sig_len)
+    norm_orig = df["close"] - midline
+    norm_mod = norm_orig.divide(atr_safe)
+    norm_series = norm_mod if use_mod_squeeze else norm_orig
+    norm_series = (norm_series * 100.0).fillna(0.0)
+    momentum = _linreg(norm_series, osc_len)
+
+    if ma_type == "EMA":
+        mom_signal = _ema(momentum, sig_len)
+    elif ma_type == "HMA":
+        mom_signal = _hma(momentum, sig_len)
+    else:
+        mom_signal = _sma(momentum, sig_len)
 
     prev_mom = momentum.shift(1).fillna(momentum)
     prev_sig = mom_signal.shift(1).fillna(mom_signal)
@@ -342,11 +359,21 @@ def _compute_indicators(
     cross_down = (prev_mom >= prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
-    if flux_smooth_len > 1:
-        flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+    if use_mod_flux:
+        plus_di, minus_di, _ = _dmi(flux_df, flux_len)
+        flux_denom = (plus_di + minus_di).replace(0.0, np.nan)
+        mod_flux_ratio = (plus_di - minus_di).divide(flux_denom)
+        mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        flux_half = max(int(round(flux_len / 2.0)), 1)
+        mod_flux_core = _rma(mod_flux_ratio, flux_half) * 100.0
+        if flux_smooth_len > 1:
+            flux_hist = mod_flux_core.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+        else:
+            flux_hist = mod_flux_core
     else:
-        flux_hist = flux_raw
+        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len)
+
+    flux_hist = flux_hist.fillna(0.0)
 
     return momentum, mom_signal, cross_up.astype(bool), cross_down.astype(bool), flux_hist
 
