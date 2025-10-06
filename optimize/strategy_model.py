@@ -154,6 +154,33 @@ def _sma(series: pd.Series, length: int) -> pd.Series:
     return series.rolling(length, min_periods=length).mean()
 
 
+def _resolve_ma_type(value: object) -> str:
+    """모멘텀 신호선 이동평균 타입 문자열을 정규화합니다."""
+
+    if value is None:
+        return "SMA"
+
+    text = str(value).strip()
+    if not text:
+        return "SMA"
+
+    upper = text.upper()
+    if upper in {"SMA", "EMA", "HMA"}:
+        return upper
+
+    lower = text.lower()
+    if lower in {"기본", "sma", "default", "basic"}:
+        return "SMA"
+
+    if lower == "ema":
+        return "EMA"
+    if lower == "hma":
+        return "HMA"
+
+    LOGGER.warning("알 수 없는 모멘텀 신호선 타입 '%s'을(를) SMA로 대체합니다.", text)
+    return "SMA"
+
+
 def _std(series: pd.Series, length: int) -> pd.Series:
     length = max(int(length), 1)
     return series.rolling(length, min_periods=length).std(ddof=0)
@@ -780,7 +807,8 @@ def run_backtest(
     # 모디파이드 플럭스 및 스퀴즈 사용 여부와 신호선 타입
     use_mod_flux = bool_param("useModFlux", False)
     use_mod_squeeze = bool_param("useModSqueeze", False)
-    ma_type = str_param("maType", "SMA")
+    ma_type_input = str_param("maType", "SMA")
+    ma_type = _resolve_ma_type(ma_type_input)
 
     use_dynamic_thresh = bool_param("useDynamicThresh", True)
     use_sym_threshold = bool_param("useSymThreshold", False)
@@ -1064,10 +1092,9 @@ def run_backtest(
     norm_series = (norm_series * 100.0).fillna(0.0)
     momentum = _linreg(norm_series, osc_len)
     # 모멘텀 신호선 유형 선택
-    mt = (ma_type or "SMA").lower()
-    if mt == "ema":
+    if ma_type == "EMA":
         mom_signal = _ema(momentum, sig_len)
-    elif mt == "hma":
+    elif ma_type == "HMA":
         mom_signal = _hma(momentum, sig_len)
     else:
         mom_signal = _sma(momentum, sig_len)
@@ -1112,11 +1139,9 @@ def run_backtest(
         else:
             flux_hist = mod_flux_core
     else:
-        flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
-        if flux_smooth_len > 1:
-            flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
-        else:
-            flux_hist = flux_raw
+        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len)
+
+    flux_hist = flux_hist.fillna(0.0)
 
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)

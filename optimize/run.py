@@ -167,7 +167,7 @@ DEFAULT_REPORT_ROOT = Path("reports")
 STUDY_ROOT = Path("studies")
 NON_FINITE_PENALTY = -1e12
 PF_ANOMALY_THRESHOLD = 50.0
-MIN_VOLUME_THRESHOLD = 100.0
+MIN_VOLUME_THRESHOLD = 70.0
 # 최소 트레이드 수 요구를 비활성화합니다. 원본에서는 적은 트레이드 수로 인해 과도한 패널티가 발생했습니다.
 MIN_TRADES_ENFORCED = 0
 PROFIT_FACTOR_CHECK_LABEL = "체크 필요"
