@@ -409,40 +409,32 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Series:
-    """Squeeze Momentum Deluxe 방식의 방향성 플럭스를 계산합니다."""
+def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
+    """Squeeze Momentum Deluxe 방식의 방향성 플럭스 코어 값을 계산합니다."""
 
     length = max(int(length), 1)
-    smooth_len = max(int(smooth_len), 1)
 
-    # 기본 TR 및 ATR 계산
     atr = _rma(_true_range(df), length).replace(0.0, np.nan)
 
-    # 상승/하락 움직임을 RMA 로 스무딩
-    up_move = _rma(df["high"].diff().clip(lower=0.0), length)
-    down_move = _rma((-df["low"].diff()).clip(lower=0.0), length)
+    prev_high = df["high"].shift().fillna(df["high"])
+    prev_low = df["low"].shift().fillna(df["low"])
 
-    up = up_move.divide(atr).replace([np.inf, -np.inf], np.nan)
-    dn = down_move.divide(atr).replace([np.inf, -np.inf], np.nan)
+    up_move = (df["high"] - prev_high).clip(lower=0.0)
+    down_move = (prev_low - df["low"]).clip(lower=0.0)
 
-    flux_base = (up - dn).divide((up + dn).replace(0.0, np.nan))
-    flux_base = flux_base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    up_rma = _rma(up_move, length)
+    down_rma = _rma(down_move, length)
 
-    return _rma(flux_base, smooth_len) * 100.0
+    up = up_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
+    dn = down_rma.divide(atr).replace([np.inf, -np.inf], np.nan)
 
+    flux_denom = (up + dn).replace(0.0, np.nan)
+    flux_ratio = ((up - dn) / flux_denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-def _squeeze_momentum_norm(df: pd.DataFrame, length: int, atr_series: pd.Series) -> pd.Series:
-    """Squeeze Momentum Deluxe 지표의 정규화된 모멘텀 입력값을 계산합니다."""
+    flux_half = max(int(round(length / 2.0)), 1)
+    flux_core = _rma(flux_ratio, flux_half) * 100.0
 
-    length = max(int(length), 1)
-
-    hl2 = (df["high"] + df["low"]) / 2.0
-    channel_mean = _sma(hl2, length)
-
-    channel_center = (hl2 + channel_mean) / 2.0
-    norm = ((df["close"] - channel_center) / atr_series.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    return (norm * 100.0).fillna(0.0)
+    return flux_core
 
 
 @dataclass
@@ -983,9 +975,17 @@ def run_backtest(
     slip_value = tick_size * slippage_ticks
 
     atr_len_series = _atr(df, osc_len)
-    norm = _squeeze_momentum_norm(df, osc_len, atr_len_series)
+    bb_dev = _std(df["close"], bb_len) * bb_mult
+    atr_primary = _atr(df, kc_len)
+    kc_range = atr_primary * kc_mult
+    hl2 = (df["high"] + df["low"]) / 2.0
+    kc_basis = _sma(hl2, kc_len)
+    midline = (hl2 + kc_basis) / 2.0
+    norm = ((df["close"] - midline) / atr_primary.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    norm = (norm * 100.0).fillna(0.0)
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
+    squeeze_on = (bb_dev < kc_range).fillna(False)
     # -------------------------------------------------------------------------
     # Precompute momentum cross-over/-under booleans once.
     # Calculating cross overs inside the main bar loop can be expensive and
@@ -1015,11 +1015,11 @@ def run_backtest(
         _cross_dn_series = (_prev_mom >= _prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
+    flux_core = _directional_flux(flux_df, flux_len)
     if flux_smooth_len > 1:
-        flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+        flux_hist = _sma(flux_core, flux_smooth_len)
     else:
-        flux_hist = flux_raw
+        flux_hist = flux_core
 
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
@@ -1048,11 +1048,7 @@ def run_backtest(
     mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
-    source_for_squeeze = df["close"]
-    basis_sq = _sma(source_for_squeeze, kc_len)
-    dev_sq = _std(source_for_squeeze, kc_len)
-    atr_val_for_squeeze = _atr(df, kc_len)
-    gate_sq_on = (dev_sq < atr_val_for_squeeze).fillna(False).astype(bool)
+    gate_sq_on = squeeze_on.astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
