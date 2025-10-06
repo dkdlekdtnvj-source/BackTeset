@@ -23,6 +23,7 @@ import pandas as pd
 from optimize.metrics import Trade, aggregate_metrics
 from optimize.strategy_model import (  # 재사용 가능한 보조 함수들
     _atr,
+    _apply_ma,
     _bars_since_mask,
     _directional_flux,
     _dmi,
@@ -73,7 +74,6 @@ class _ParsedInputs:
     """전처리된 입력 및 파생 설정 값 컨테이너."""
 
     df: pd.DataFrame
-    htf_df: Optional[pd.DataFrame]
     start_ts: pd.Timestamp
     commission_pct: float
     slippage_ticks: float
@@ -204,12 +204,9 @@ def _parse_core_settings(
     risk: Dict[str, float],
     *,
     min_trades: Optional[int],
-    htf_df: Optional[pd.DataFrame],
 ) -> _ParsedInputs:
     df = _ensure_datetime_index(df, "가격")
     df = _normalise_ohlcv(df, "가격")
-    if htf_df is not None:
-        htf_df = _normalise_ohlcv(_ensure_datetime_index(htf_df, "HTF"), "HTF")
 
     start_raw = params.get("startDate")
     try:
@@ -254,7 +251,6 @@ def _parse_core_settings(
 
     return _ParsedInputs(
         df=df,
-        htf_df=htf_df,
         start_ts=start_ts,
         commission_pct=float(abs(commission_pct)),
         slippage_ticks=float(abs(slippage_ticks)),
@@ -326,6 +322,7 @@ def _compute_indicators(
 
     flux_len = max(_coerce_int(params.get("fluxLen"), 14), 1)
     flux_smooth_len = max(_coerce_int(params.get("fluxSmoothLen"), 1), 1)
+    flux_smooth_type = _resolve_ma_type(params.get("fluxSmoothType", "SMA"))
     flux_use_ha = _coerce_bool(params.get("useFluxHeikin"), True)
     use_mod_flux = _coerce_bool(params.get("useModFlux"), False)
     use_mod_squeeze = _coerce_bool(params.get("useModSqueeze"), False)
@@ -366,12 +363,9 @@ def _compute_indicators(
         mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         flux_half = max(int(round(flux_len / 2.0)), 1)
         mod_flux_core = _rma(mod_flux_ratio, flux_half) * 100.0
-        if flux_smooth_len > 1:
-            flux_hist = mod_flux_core.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
-        else:
-            flux_hist = mod_flux_core
+        flux_hist = _apply_ma(mod_flux_core, flux_smooth_len, flux_smooth_type)
     else:
-        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len)
+        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len, flux_smooth_type)
 
     flux_hist = flux_hist.fillna(0.0)
 
@@ -911,7 +905,6 @@ def run_backtest_alternative(
     params: Dict[str, object],
     fees: Dict[str, float],
     risk: Dict[str, float],
-    htf_df: Optional[pd.DataFrame] = None,
     min_trades: Optional[int] = None,
     *,
     engine: str = "vectorbt",
@@ -925,7 +918,6 @@ def run_backtest_alternative(
         fees,
         risk,
         min_trades=min_trades,
-        htf_df=htf_df,
     )
 
     if engine_name in _SUPPORTED_ENGINES:

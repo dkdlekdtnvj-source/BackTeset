@@ -816,7 +816,6 @@ def _run_dataset_backtest_task(
                 params,
                 fees,
                 risk,
-                htf_df=dataset.htf,
                 min_trades=min_trades,
                 engine=str(engine),
             )
@@ -833,7 +832,6 @@ def _run_dataset_backtest_task(
         params,
         fees,
         risk,
-        htf_df=dataset.htf,
         min_trades=min_trades,
     )
 
@@ -890,16 +888,15 @@ def _parse_timeframe_grid(raw: Optional[str]) -> List[Tuple[str, Optional[str]]]
         if not candidate:
             continue
         if "@" in candidate:
-            ltf, htf = candidate.split("@", 1)
+            ltf, _ = candidate.split("@", 1)
         elif ":" in candidate:
-            ltf, htf = candidate.split(":", 1)
+            ltf, _ = candidate.split(":", 1)
         else:
-            ltf, htf = candidate, None
+            ltf = candidate
         ltf = ltf.strip()
-        htf = htf.strip() if htf is not None else None
         if not ltf:
             continue
-        combos.append((ltf, htf or None))
+        combos.append((ltf, None))
     return combos
 
 
@@ -1548,15 +1545,6 @@ def prepare_datasets(
             if not ltf_candidates:
                 raise ValueError(f"{symbol_value} 데이터셋에 최소 하나의 ltf/timeframe 이 필요합니다.")
 
-            htf_candidates = _to_list(
-                entry.get("htf")
-                or entry.get("htfs")
-                or entry.get("htf_timeframes")
-                or entry.get("htf_timeframe")
-            )
-            if not htf_candidates:
-                htf_candidates = [None]
-
             start_value = entry.get("start") or entry.get("from") or base_period.get("from")
             end_value = entry.get("end") or entry.get("to") or base_period.get("to")
             if not start_value or not end_value:
@@ -1569,34 +1557,26 @@ def prepare_datasets(
             )
             for timeframe in ltf_candidates:
                 timeframe_text = str(timeframe)
-                for htf_tf in htf_candidates or [None]:
-                    htf_text = str(htf_tf) if htf_tf else None
-                    LOGGER.info(
-                        "Preparing dataset %s %s (HTF %s) %s→%s",
-                        symbol_log,
-                        timeframe_text,
-                        htf_text or "-",
-                        start,
-                        end,
+                LOGGER.info(
+                    "Preparing dataset %s %s %s→%s",
+                    symbol_log,
+                    timeframe_text,
+                    start,
+                    end,
+                )
+                df = cache.get(source_symbol, timeframe_text, start, end)
+                datasets.append(
+                    DatasetSpec(
+                        symbol=display_symbol,
+                        timeframe=timeframe_text,
+                        start=start,
+                        end=end,
+                        df=df,
+                        htf=None,
+                        htf_timeframe=None,
+                        source_symbol=source_symbol,
                     )
-                    df = cache.get(source_symbol, timeframe_text, start, end)
-                    htf_df = (
-                        cache.get(source_symbol, htf_text, start, end, allow_partial=True)
-                        if htf_text
-                        else None
-                    )
-                    datasets.append(
-                        DatasetSpec(
-                            symbol=display_symbol,
-                            timeframe=timeframe_text,
-                            start=start,
-                            end=end,
-                            df=df,
-                            htf=htf_df,
-                            htf_timeframe=htf_text,
-                            source_symbol=source_symbol,
-                        )
-                    )
+                )
         if not datasets:
             raise ValueError("backtest.datasets 설정에서 어떤 데이터셋도 생성되지 않았습니다.")
         return datasets
@@ -1625,20 +1605,12 @@ def prepare_datasets(
             "Backtest configuration must specify symbol(s), timeframe(s), and at least one period with 'from'/'to' dates."
         )
 
-    htf_candidates = _to_list(params_cfg.get("htf_timeframes"))
-    if not htf_candidates:
-        htf_candidates = _to_list(params_cfg.get("htf_timeframe"))
-    if not htf_candidates:
-        htf_candidates = _to_list(backtest_cfg.get("htf_timeframes"))
-    if not htf_candidates:
-        htf_candidates = _to_list(backtest_cfg.get("htf_timeframe"))
-    if not htf_candidates:
-        htf_candidates = [None]
+    htf_candidates: List[Optional[str]] = [None]
 
     symbol_pairs = [_resolve_symbol_entry(symbol, alias_map) for symbol in symbols]
 
     datasets: List[DatasetSpec] = []
-    for (display_symbol, source_symbol), timeframe, period, htf_tf in product(
+    for (display_symbol, source_symbol), timeframe, period, _ in product(
         symbol_pairs, timeframes, periods, htf_candidates
     ):
         start = str(period["from"])
@@ -1647,19 +1619,13 @@ def prepare_datasets(
             display_symbol if display_symbol == source_symbol else f"{display_symbol}→{source_symbol}"
         )
         LOGGER.info(
-            "Preparing dataset %s %s (HTF %s) %s→%s",
+            "Preparing dataset %s %s %s→%s",
             symbol_log,
             timeframe,
-            htf_tf or "-",
             start,
             end,
         )
         df = cache.get(source_symbol, timeframe, start, end)
-        htf = (
-            cache.get(source_symbol, str(htf_tf), start, end, allow_partial=True)
-            if htf_tf
-            else None
-        )
         datasets.append(
             DatasetSpec(
                 symbol=display_symbol,
@@ -1667,8 +1633,8 @@ def prepare_datasets(
                 start=start,
                 end=end,
                 df=df,
-                htf=htf,
-                htf_timeframe=str(htf_tf) if htf_tf else None,
+                htf=None,
+                htf_timeframe=None,
                 source_symbol=source_symbol,
             )
         )
@@ -3156,7 +3122,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="직접 심볼 지정 (예: BINANCE:ETHUSDT). 지정 시 top50 무시",
     )
     parser.add_argument("--timeframe", type=str, help="Override lower timeframe")
-    parser.add_argument("--htf", type=str, help="Override higher timeframe for confirmations")
     parser.add_argument(
         "--timeframe-grid",
         type=str,
@@ -3385,23 +3350,9 @@ def _execute_single(
 
     symbol_choices = list(dict.fromkeys(backtest_cfg.get("symbols") or ([params_cfg.get("symbol")] if params_cfg.get("symbol") else [])))
 
-    def _collect_htfs(cfg: Dict[str, object]) -> List[str]:
-        values: List[str] = []
-        raw = cfg.get("htf_timeframes")
-        if isinstance(raw, (list, tuple)):
-            values.extend(str(item) for item in raw if item)
-        single = cfg.get("htf_timeframe")
-        if single:
-            values.append(str(single))
-        return values
-
-    htf_choices = list(dict.fromkeys(_collect_htfs(backtest_cfg) or _collect_htfs(params_cfg)))
-
     selected_symbol = args.symbol or params_cfg.get("symbol") or (symbol_choices[0] if symbol_choices else None)
     selected_timeframe: Optional[str] = args.timeframe
-    selected_htf: Optional[str] = args.htf if args.htf else None
     timeframe_overridden = args.timeframe is not None
-    htf_overridden = args.htf is not None
     all_timeframes_requested = False
 
     if (
@@ -3428,14 +3379,10 @@ def _execute_single(
         params_cfg["timeframe"] = selected_timeframe
         backtest_cfg["timeframes"] = [selected_timeframe]
         _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
-    if htf_overridden and selected_htf is not None:
-        params_cfg["htf_timeframes"] = [selected_htf]
-        backtest_cfg["htf_timeframes"] = [selected_htf]
-    elif htf_choices:
-        params_cfg["htf_timeframes"] = htf_choices
-        backtest_cfg["htf_timeframes"] = htf_choices
     params_cfg.pop("htf_timeframe", None)
+    params_cfg.pop("htf_timeframes", None)
     backtest_cfg.pop("htf_timeframe", None)
+    backtest_cfg.pop("htf_timeframes", None)
 
     backtest_periods = backtest_cfg.get("periods") or []
     params_backtest = _ensure_dict(params_cfg, "backtest")
@@ -3771,7 +3718,6 @@ def _execute_single(
         train_bars=int(walk_cfg.get("train_bars", 5000)),
         test_bars=int(walk_cfg.get("test_bars", 2000)),
         step=int(walk_cfg.get("step", 2000)),
-        htf_df=primary_dataset.htf,
         min_trades=primary_min_trades,
     )
 
@@ -3788,7 +3734,6 @@ def _execute_single(
             risk,
             k=cv_k,
             embargo=cv_embargo,
-            htf_df=primary_dataset.htf,
             min_trades=primary_min_trades,
         )
         wf_summary["purged_kfold"] = cv_summary
@@ -3839,7 +3784,6 @@ def _execute_single(
                 train_bars=int(walk_cfg.get("train_bars", 5000)),
                 test_bars=int(walk_cfg.get("test_bars", 2000)),
                 step=int(walk_cfg.get("step", 2000)),
-                htf_df=candidate_dataset.htf,
                 min_trades=candidate_min_trades,
             )
             wf_cache[record["trial"]] = candidate_wf
@@ -4110,21 +4054,18 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
     symbol_text = str(base_symbol) if base_symbol else "study"
     symbol_slug = _slugify_symbol(symbol_text)
     total = len(combos)
-    combo_summary = ", ".join(f"{ltf}/{htf or '-'}" for ltf, htf in combos)
+    combo_summary = ", ".join(ltf for ltf, _ in combos)
     LOGGER.info("타임프레임 그리드 %d건 실행: %s", total, combo_summary)
 
-    for index, (ltf, htf) in enumerate(combos, start=1):
+    for index, (ltf, _) in enumerate(combos, start=1):
         batch_args = argparse.Namespace(**vars(args))
         batch_args.timeframe = ltf
-        batch_args.htf = htf
-        suffix = f"{_slugify_timeframe(ltf)}_{_slugify_timeframe(htf)}".strip("_")
+        suffix = _slugify_timeframe(ltf)
         context = {
             "index": index,
             "total": total,
             "ltf": ltf,
-            "htf": htf,
             "ltf_slug": _slugify_timeframe(ltf),
-            "htf_slug": _slugify_timeframe(htf),
             "symbol": symbol_text,
             "symbol_slug": symbol_slug,
             "suffix": suffix,
@@ -4134,13 +4075,7 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
             "study_template": getattr(args, "study_template", None),
         }
         batch_args._batch_context = context  # type: ignore[attr-defined]
-        LOGGER.info(
-            "(%d/%d) LTF=%s, HTF=%s 조합 최적화 시작",
-            index,
-            total,
-            ltf,
-            htf or "없음",
-        )
+        LOGGER.info("(%d/%d) LTF=%s 조합 최적화 시작", index, total, ltf)
         _execute_single(batch_args, params_cfg, backtest_cfg, argv)
 
 

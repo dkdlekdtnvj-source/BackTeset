@@ -181,6 +181,19 @@ def _resolve_ma_type(value: object) -> str:
     return "SMA"
 
 
+def _apply_ma(series: pd.Series, length: int, mode: str) -> pd.Series:
+    length = max(int(length), 1)
+    if length <= 1:
+        return series
+
+    upper = (mode or "SMA").upper()
+    if upper == "EMA":
+        return _ema(series, length)
+    if upper == "HMA":
+        return _hma(series, length)
+    return _sma(series, length)
+
+
 def _std(series: pd.Series, length: int) -> pd.Series:
     length = max(int(length), 1)
     return series.rolling(length, min_periods=length).std(ddof=0)
@@ -469,7 +482,9 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Series:
+def _directional_flux(
+    df: pd.DataFrame, length: int, smooth_len: int, smooth_mode: str = "SMA"
+) -> pd.Series:
     """Squeeze Momentum Deluxe 방식의 방향성 플럭스를 계산합니다."""
 
     length = max(int(length), 1)
@@ -511,10 +526,7 @@ def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Seri
     flux_half = max(int(np.round(length / 2.0)), 1)
     flux_core = _rma(flux_ratio, flux_half) * 100.0
 
-    if smooth_len > 1:
-        flux_val = flux_core.rolling(smooth_len, min_periods=smooth_len).mean()
-    else:
-        flux_val = flux_core
+    flux_val = _apply_ma(flux_core, smooth_len, smooth_mode)
 
     return flux_val.fillna(0.0)
 
@@ -571,7 +583,6 @@ def run_backtest(
     params: Dict[str, float | bool | str],
     fees: Dict[str, float],
     risk: Dict[str, float | bool],
-    htf_df: Optional[pd.DataFrame] = None,
     min_trades: Optional[int] = None,
 ) -> Dict[str, float]:
     """TradingView `매직1분VN` 최종본과 동등한 파이썬 백테스트."""
@@ -610,8 +621,6 @@ def run_backtest(
         )
 
     df = _ensure_datetime_index(df, "가격")
-    if htf_df is not None:
-        htf_df = _ensure_datetime_index(htf_df, "HTF")
 
     def _normalise_ohlcv(frame: pd.DataFrame, label: str) -> pd.DataFrame:
         frame = frame.copy()
@@ -665,8 +674,6 @@ def run_backtest(
     # the entire dataset and returning zero trades.
     if not isinstance(start_ts, pd.Timestamp) or pd.isna(start_ts) or start_ts < df.index[0]:
         start_ts = df.index[0]
-    if htf_df is not None:
-        htf_df = _normalise_ohlcv(htf_df, "HTF")
 
     def _coerce_bool(value: object, default: bool) -> bool:
         if value is None:
@@ -802,6 +809,8 @@ def run_backtest(
 
     flux_len = int_param("fluxLen", 14)
     flux_smooth_len = int_param("fluxSmoothLen", 1)
+    flux_smooth_type_input = str_param("fluxSmoothType", "SMA")
+    flux_smooth_type = _resolve_ma_type(flux_smooth_type_input)
     flux_use_ha = bool_param("useFluxHeikin", True)
 
     # 모디파이드 플럭스 및 스퀴즈 사용 여부와 신호선 타입
@@ -964,9 +973,6 @@ def run_backtest(
     use_obv = bool_param("useObv", False)
     obv_smooth_len = int_param("obvSmoothLen", 3, enabled=use_obv)
     adx_atr_tf = str_param("adxAtrTf", "5", enabled=use_adx or use_atr_diff)
-    use_htf_trend = bool_param("useHtfTrend", False)
-    htf_trend_tf = str_param("htfTrendTf", "240", enabled=use_htf_trend)
-    htf_ma_len = int_param("htfMaLen", 20, enabled=use_htf_trend)
     use_hma_filter = bool_param("useHmaFilter", False)
     hma_len = int_param("hmaLen", 20, enabled=use_hma_filter)
     use_range_filter = bool_param("useRangeFilter", False)
@@ -975,11 +981,6 @@ def run_backtest(
     range_percent = float_param("rangePercent", 1.0, enabled=use_range_filter)
     use_event_filter = False  # 이벤트 필터는 안정성 문제로 비활성화
 
-    use_regime_filter = bool_param("useRegimeFilter", False)
-    ctx_htf_tf = str_param("ctxHtfTf", "240", enabled=use_regime_filter)
-    ctx_htf_ema_len = int_param("ctxHtfEmaLen", 120, enabled=use_regime_filter)
-    ctx_htf_adx_len = int_param("ctxHtfAdxLen", 14, enabled=use_regime_filter)
-    ctx_htf_adx_th = float_param("ctxHtfAdxTh", 22.0, enabled=use_regime_filter)
     use_slope_filter = bool_param("useSlopeFilter", False)
     slope_lookback = int_param("slopeLookback", 8, enabled=use_slope_filter)
     slope_min_pct = float_param("slopeMinPct", 0.06, enabled=use_slope_filter)
@@ -1033,7 +1034,6 @@ def run_backtest(
     breakeven_mult = float_param("breakevenMult", 1.0, enabled=use_breakeven_stop)
     use_pivot_stop = bool_param("usePivotStop", False)
     pivot_len = int_param("pivotLen", 5, enabled=use_pivot_stop)
-    use_pivot_htf = bool_param("usePivotHtf", False, enabled=use_pivot_stop)
     pivot_tf = str_param("pivotTf", "5", enabled=use_pivot_stop)
     use_atr_profit = bool_param("useAtrProfit", False)
     atr_profit_mult = float_param("atrProfitMult", 2.0, enabled=use_atr_profit)
@@ -1134,12 +1134,9 @@ def run_backtest(
         mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         flux_half = max(int(np.round(flux_len / 2.0)), 1)
         mod_flux_core = _rma(mod_flux_ratio, flux_half) * 100.0
-        if flux_smooth_len > 1:
-            flux_hist = mod_flux_core.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
-        else:
-            flux_hist = mod_flux_core
+        flux_hist = _apply_ma(mod_flux_core, flux_smooth_len, flux_smooth_type)
     else:
-        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len)
+        flux_hist = _directional_flux(flux_df, flux_len, flux_smooth_len, flux_smooth_type)
 
     flux_hist = flux_hist.fillna(0.0)
 
@@ -1244,15 +1241,6 @@ def run_backtest(
     stoch_rsi_val = _stoch_rsi(df["close"], stoch_len) if use_stoch_rsi else pd.Series(50.0, index=df.index)
     obv_slope = _obv_slope(df["close"], df["volume"], obv_smooth_len) if use_obv else pd.Series(0.0, index=df.index)
 
-    if use_htf_trend:
-        htf_ma = _security_series(df, htf_trend_tf, lambda data: _ema(data["close"], htf_ma_len))
-        htf_trend_up = df["close"] > htf_ma
-        htf_trend_down = df["close"] < htf_ma
-    else:
-        htf_ma = df["close"]
-        htf_trend_up = pd.Series(True, index=df.index)
-        htf_trend_down = pd.Series(True, index=df.index)
-
     hma_value = _ema(df["close"], hma_len) if use_hma_filter else df["close"]
 
     if use_range_filter:
@@ -1306,15 +1294,6 @@ def run_backtest(
 
     kasa_rsi = _rsi(df["close"], kasa_rsi_len) if use_kasa else pd.Series(50.0, index=df.index)
 
-    if use_regime_filter:
-        ctx_close = _security_series(df, ctx_htf_tf, lambda data: data["close"])
-        ctx_ema = _security_series(df, ctx_htf_tf, lambda data: _ema(data["close"], ctx_htf_ema_len))
-        ctx_adx = _security_series(df, ctx_htf_tf, lambda data: _dmi(data, ctx_htf_adx_len)[2])
-        regime_long_ok = (ctx_close > ctx_ema) & (ctx_adx > ctx_htf_adx_th)
-        regime_short_ok = (ctx_close < ctx_ema) & (ctx_adx > ctx_htf_adx_th)
-    else:
-        regime_long_ok = pd.Series(True, index=df.index)
-        regime_short_ok = pd.Series(True, index=df.index)
 
     # 구조 게이트 ------------------------------------------------------------
     if use_structure_gate:
@@ -1389,16 +1368,6 @@ def run_backtest(
     swing_high_series = (
         df["high"].rolling(stop_lookback).max() if use_stop_loss else pd.Series(np.nan, index=df.index)
     )
-    if use_pivot_stop and use_pivot_htf:
-        pivot_low_htf = _security_series(
-            df, pivot_tf, lambda data: _pivot_series(data["low"], pivot_len, pivot_len, False)
-        )
-        pivot_high_htf = _security_series(
-            df, pivot_tf, lambda data: _pivot_series(data["high"], pivot_len, pivot_len, True)
-        )
-    else:
-        pivot_low_htf = pd.Series(np.nan, index=df.index)
-        pivot_high_htf = pd.Series(np.nan, index=df.index)
 
     if use_shock:
         atr_fast = _atr(df, atr_fast_len)
@@ -1705,9 +1674,6 @@ def run_backtest(
         if use_atr_diff:
             long_ok &= atr_diff.iloc[idx] > 0
             short_ok &= atr_diff.iloc[idx] > 0
-        if use_htf_trend:
-            long_ok &= bool(htf_trend_up.iloc[idx])
-            short_ok &= bool(htf_trend_down.iloc[idx])
         if use_hma_filter:
             long_ok &= row["close"] > hma_value.iloc[idx]
             short_ok &= row["close"] < hma_value.iloc[idx]
@@ -1728,8 +1694,6 @@ def run_backtest(
             eq_slope = _linreg(equity_window, min(eq_slope_len, len(equity_window))).iloc[-1]
             long_ok &= eq_slope >= 0
             short_ok &= eq_slope <= 0
-        long_ok &= bool(regime_long_ok.iloc[idx])
-        short_ok &= bool(regime_short_ok.iloc[idx])
 
         structure_require_all = structure_gate_mode == "모두 충족"
         structure_long_pass = True
@@ -1887,7 +1851,7 @@ def run_backtest(
                 swing_low = swing_low_series.iloc[idx]
                 stop_long = _max_ignore_nan(stop_long, swing_low)
                 if use_pivot_stop:
-                    pivot_ref = pivot_low_htf.iloc[idx] if use_pivot_htf else pivot_low_series.iloc[idx]
+                    pivot_ref = pivot_low_series.iloc[idx]
                     stop_long = _max_ignore_nan(stop_long, pivot_ref)
             if use_breakeven_stop and not np.isnan(highest_since_entry) and not np.isnan(atr_trail_series.iloc[idx]):
                 move = highest_since_entry - position.avg_price
@@ -1914,7 +1878,7 @@ def run_backtest(
                 swing_high = swing_high_series.iloc[idx]
                 stop_short = _min_ignore_nan(stop_short, swing_high)
                 if use_pivot_stop:
-                    pivot_ref = pivot_high_htf.iloc[idx] if use_pivot_htf else pivot_high_series.iloc[idx]
+                    pivot_ref = pivot_high_series.iloc[idx]
                     stop_short = _min_ignore_nan(stop_short, pivot_ref)
             if use_breakeven_stop and not np.isnan(lowest_since_entry) and not np.isnan(atr_trail_series.iloc[idx]):
                 move = position.avg_price - lowest_since_entry
@@ -1942,7 +1906,7 @@ def run_backtest(
                     if not np.isnan(swing_low):
                         stop_hint = max(stop_hint, row["close"] - swing_low) if not np.isnan(stop_hint) else row["close"] - swing_low
                     if use_pivot_stop:
-                        pivot_ref = pivot_low_htf.iloc[idx] if use_pivot_htf else pivot_low_series.iloc[idx]
+                        pivot_ref = pivot_low_series.iloc[idx]
                         if not np.isnan(pivot_ref):
                             dist_pivot = row["close"] - pivot_ref
                             stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
@@ -1971,7 +1935,7 @@ def run_backtest(
                     if not np.isnan(swing_high):
                         stop_hint = max(stop_hint, swing_high - row["close"]) if not np.isnan(stop_hint) else swing_high - row["close"]
                     if use_pivot_stop:
-                        pivot_ref = pivot_high_htf.iloc[idx] if use_pivot_htf else pivot_high_series.iloc[idx]
+                        pivot_ref = pivot_high_series.iloc[idx]
                         if not np.isnan(pivot_ref):
                             dist_pivot = pivot_ref - row["close"]
                             stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
