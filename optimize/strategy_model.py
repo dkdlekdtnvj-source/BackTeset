@@ -415,32 +415,68 @@ def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Seri
     length = max(int(length), 1)
     smooth_len = max(int(smooth_len), 1)
 
-    # 기본 TR 및 ATR 계산
-    atr = _rma(_true_range(df), length).replace(0.0, np.nan)
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
-    # 상승/하락 움직임을 RMA 로 스무딩
-    up_move = _rma(df["high"].diff().clip(lower=0.0), length)
-    down_move = _rma((-df["low"].diff()).clip(lower=0.0), length)
+    prev_high = high.shift(1).fillna(high)
+    prev_low = low.shift(1).fillna(low)
+    prev_close = close.shift(1).fillna(close)
 
-    up = up_move.divide(atr).replace([np.inf, -np.inf], np.nan)
-    dn = down_move.divide(atr).replace([np.inf, -np.inf], np.nan)
+    up_move = (high - prev_high).clip(lower=0.0)
+    down_move = (prev_low - low).clip(lower=0.0)
 
-    flux_base = (up - dn).divide((up + dn).replace(0.0, np.nan))
-    flux_base = flux_base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    tr_raw = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    return _rma(flux_base, smooth_len) * 100.0
+    tr = _rma(tr_raw, length)
+    atr_safe = tr.replace(0.0, np.nan)
+
+    up_rma = _rma(up_move, length)
+    down_rma = _rma(down_move, length)
+
+    up = up_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+    dn = down_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+
+    flux_denom = (up + dn).replace(0.0, np.nan)
+    flux_ratio = (up - dn).divide(flux_denom)
+    flux_ratio = flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    flux_half = max(int(np.round(length / 2.0)), 1)
+    flux_core = _rma(flux_ratio, flux_half) * 100.0
+
+    if smooth_len > 1:
+        flux_val = flux_core.rolling(smooth_len, min_periods=smooth_len).mean()
+    else:
+        flux_val = flux_core
+
+    return flux_val.fillna(0.0)
 
 
-def _squeeze_momentum_norm(df: pd.DataFrame, length: int, atr_series: pd.Series) -> pd.Series:
+def _squeeze_momentum_norm(
+    df: pd.DataFrame, length: int, atr_series: pd.Series, kc_mult: float
+) -> pd.Series:
     """Squeeze Momentum Deluxe 지표의 정규화된 모멘텀 입력값을 계산합니다."""
 
     length = max(int(length), 1)
 
     hl2 = (df["high"] + df["low"]) / 2.0
-    channel_mean = _sma(hl2, length)
+    kc_basis = _sma(hl2, length)
+    kc_range = atr_series * float(kc_mult)
+    kc_upper = kc_basis + kc_range
+    kc_lower = kc_basis - kc_range
+    kc_average = (kc_upper + kc_lower) / 2.0
+    midline = (hl2 + kc_average) / 2.0
 
-    channel_center = (hl2 + channel_mean) / 2.0
-    norm = ((df["close"] - channel_center) / atr_series.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    atr_safe = atr_series.replace(0.0, np.nan)
+    norm = (df["close"] - midline).divide(atr_safe)
+    norm = norm.replace([np.inf, -np.inf], np.nan)
 
     return (norm * 100.0).fillna(0.0)
 
@@ -972,7 +1008,8 @@ def run_backtest(
     slip_value = tick_size * slippage_ticks
 
     atr_len_series = _atr(df, osc_len)
-    norm = _squeeze_momentum_norm(df, osc_len, atr_len_series)
+    atr_primary = _atr(df, kc_len)
+    norm = _squeeze_momentum_norm(df, kc_len, atr_primary, kc_mult)
     momentum = _linreg(norm, osc_len)
     mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------
@@ -1036,11 +1073,9 @@ def run_backtest(
     mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
-    source_for_squeeze = df["close"]
-    basis_sq = _sma(source_for_squeeze, kc_len)
-    dev_sq = _std(source_for_squeeze, kc_len)
-    atr_val_for_squeeze = _atr(df, kc_len)
-    gate_sq_on = (dev_sq < atr_val_for_squeeze).fillna(False).astype(bool)
+    bb_dev = _std(df["close"], bb_len) * bb_mult
+    kc_range = atr_primary * kc_mult
+    gate_sq_on = (bb_dev < kc_range).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
