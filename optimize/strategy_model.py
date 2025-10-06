@@ -111,6 +111,36 @@ def _sma(series: pd.Series, length: int) -> pd.Series:
     return series.rolling(length, min_periods=length).mean()
 
 
+def _wma(series: pd.Series, length: int) -> pd.Series:
+    length = max(int(length), 1)
+    if length == 1:
+        return series.copy()
+
+    weights = np.arange(1, length + 1, dtype=float)
+    weight_sum = float(weights.sum()) if weights.size else 1.0
+
+    def _calc(values: np.ndarray) -> float:
+        if np.isnan(values).any():
+            return np.nan
+        return float(np.dot(values, weights) / weight_sum)
+
+    return series.rolling(length, min_periods=length).apply(_calc, raw=True)
+
+
+def _hma(series: pd.Series, length: int) -> pd.Series:
+    length = max(int(length), 1)
+    if length == 1:
+        return series.copy()
+
+    half_len = max(length // 2, 1)
+    sqrt_len = max(int(np.sqrt(length)), 1)
+
+    wma_half = _wma(series, half_len)
+    wma_full = _wma(series, length)
+    hull_input = 2.0 * wma_half - wma_full
+    return _wma(hull_input, sqrt_len)
+
+
 def _std(series: pd.Series, length: int) -> pd.Series:
     length = max(int(length), 1)
     return series.rolling(length, min_periods=length).std(ddof=0)
@@ -366,7 +396,7 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
+def _dmi_components(df: pd.DataFrame, length: int) -> Tuple[pd.Series, pd.Series]:
     length = max(int(length), 1)
     high = df["high"]
     low = df["low"]
@@ -374,14 +404,30 @@ def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
     prev_low = low.shift()
     up_move = high - prev_high
     down_move = prev_low - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = _rma(pd.Series(plus_dm, index=df.index), length)
-    minus_dm = _rma(pd.Series(minus_dm, index=df.index), length)
-    atr = _atr(df, length).replace(0, np.nan)
-    plus_di = 100 * (plus_dm / atr)
-    minus_di = 100 * (minus_dm / atr)
-    return plus_di - minus_di
+    plus_dm_raw = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm_raw = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = _rma(pd.Series(plus_dm_raw, index=df.index), length)
+    minus_dm = _rma(pd.Series(minus_dm_raw, index=df.index), length)
+    atr = _atr(df, length).replace(0.0, np.nan)
+    plus_di = 100.0 * (plus_dm / atr)
+    minus_di = 100.0 * (minus_dm / atr)
+    di_diff = plus_di - minus_di
+    di_sum = plus_di + minus_di
+    return di_diff, di_sum
+
+
+def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
+    di_diff, _ = _dmi_components(df, length)
+    return di_diff.fillna(0.0)
+
+
+def _directional_flux_adx(df: pd.DataFrame, length: int) -> pd.Series:
+    di_diff, di_sum = _dmi_components(df, length)
+    di_diff = di_diff.fillna(0.0)
+    di_sum = di_sum.replace(0.0, np.nan)
+    dx = (di_diff.abs() / di_sum).fillna(0.0) * 100.0
+    adx = _rma(dx, length)
+    return (di_diff * (adx / 100.0)).fillna(0.0)
 
 
 @dataclass
@@ -672,6 +718,9 @@ def run_backtest(
     flux_len = int_param("fluxLen", 14)
     flux_smooth_len = int_param("fluxSmoothLen", 1)
     flux_use_ha = bool_param("useFluxHeikin", True)
+    use_mod_flux = bool_param("useModFlux", False)
+    use_mod_squeeze = bool_param("useModSqueeze", False)
+    ma_type_param = str_param("maType", "SMA")
 
     use_dynamic_thresh = bool_param("useDynamicThresh", True)
     use_sym_threshold = bool_param("useSymThreshold", False)
@@ -936,19 +985,24 @@ def run_backtest(
     tick_size = _estimate_tick(df["close"])
     slip_value = tick_size * slippage_ticks
 
-    hl2 = (df["high"] + df["low"]) / 2.0
-    bb_len_eff = osc_len if use_same_len else bb_len
     kc_len_eff = osc_len if use_same_len else kc_len
+    highest = df["high"].rolling(kc_len_eff, min_periods=kc_len_eff).max()
+    lowest = df["low"].rolling(kc_len_eff, min_periods=kc_len_eff).min()
+    midline = (highest + lowest) / 2.0
+    squeeze_input = df["close"] - midline
+    if use_mod_squeeze:
+        atr_norm = _atr(df, kc_len_eff).replace(0.0, np.nan)
+        squeeze_input = squeeze_input / atr_norm
+    squeeze_input = squeeze_input * 100.0
+    momentum = _linreg(squeeze_input, osc_len)
 
-    bb_basis = _sma(hl2, bb_len_eff)
-    highest = df["high"].rolling(osc_len, min_periods=osc_len).max()
-    lowest = df["low"].rolling(osc_len, min_periods=osc_len).min()
-    channel_mid = (highest + lowest) / 2.0
-    avg_line = (bb_basis + channel_mid) / 2.0
-    atr_primary = _atr(df, osc_len).replace(0.0, np.nan)
-    norm = (df["close"] - avg_line) / atr_primary * 100.0
-    momentum = _linreg(norm, osc_len)
-    mom_signal = _sma(momentum, sig_len)
+    ma_type_key = ma_type_param.strip().upper()
+    if ma_type_key == "EMA":
+        mom_signal = _ema(momentum, sig_len)
+    elif ma_type_key == "HMA":
+        mom_signal = _hma(momentum, sig_len)
+    else:
+        mom_signal = _sma(momentum, sig_len)
     # -------------------------------------------------------------------------
     # Precompute momentum cross-over/-under booleans once.
     # Calculating cross overs inside the main bar loop can be expensive and
@@ -978,7 +1032,10 @@ def run_backtest(
         _cross_dn_series = (_prev_mom >= _prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len)
+    if use_mod_flux:
+        flux_raw = _directional_flux_adx(flux_df, flux_len)
+    else:
+        flux_raw = _directional_flux(flux_df, flux_len)
     if flux_smooth_len > 1:
         flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
     else:
