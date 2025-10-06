@@ -732,7 +732,7 @@ def run_backtest(
         return str(value) if value is not None else str(default)
 
     # Pine 입력 매핑 -----------------------------------------------------------------
-    osc_len = int_param("oscLen", 12)
+    osc_len = int_param("oscLen", 20)
     sig_len = int_param("signalLen", 3)
     use_same_len = bool_param("useSameLen", False)
     bb_len = osc_len if use_same_len else int_param("bbLen", 20)
@@ -751,6 +751,7 @@ def run_backtest(
     sell_threshold = float_param("sellThreshold", 36.0)
     dyn_len = int_param("dynLen", 21, enabled=use_dynamic_thresh)
     dyn_mult = float_param("dynMult", 1.1, enabled=use_dynamic_thresh)
+    # 전략 명세에 따라 모멘텀 교차 필터는 항상 사용한다.
     require_momentum_cross = True
     # Optional toggle: enable Numba-accelerated cross calculations.  When
     # ``useNumba`` is True and Numba is installed in the environment,

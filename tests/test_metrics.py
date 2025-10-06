@@ -40,7 +40,7 @@ from optimize.strategy_model import run_backtest
 
 def _base_params(**overrides):
     params = {
-        "oscLen": 12,
+        "oscLen": 20,
         "signalLen": 3,
         "bbLen": 20,
         "kcLen": 18,

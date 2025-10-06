@@ -104,10 +104,10 @@ def test_basic_factor_filter_toggle():
 
 
 def test_basic_factor_param_filter_toggle():
-    params = {"oscLen": 12, "custom": 7}
+    params = {"oscLen": 20, "exitOpposite": True, "custom": 7}
 
     filtered = _filter_basic_factor_params(params)
-    assert filtered == {"oscLen": 12}
+    assert filtered == {"oscLen": 20, "exitOpposite": True}
 
     unfiltered = _filter_basic_factor_params(params, enabled=False)
     assert unfiltered == params
