@@ -23,10 +23,15 @@ from .metrics import (
 # still runs without modification.  The ``NUMBA_AVAILABLE`` flag signals
 # whether accelerated paths can be used.
 try:
-    from numba import njit
+    # Import njit and prange for optional JIT acceleration.  prange enables
+    # automatic parallelisation of loops when ``parallel=True`` is passed to
+    # @njit.  If these imports fail (e.g. Numba is not installed), the
+    # fallback decorators defined below will be used instead.
+    from numba import njit, prange
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
+    # Define a fallback njit decorator and prange function when Numba isn't available.
     def njit(*args, **kwargs):  # type: ignore[override]
         """Fallback decorator used when Numba is unavailable.  It simply
         returns the original function unchanged.  This allows decorated
@@ -38,9 +43,12 @@ except ImportError:
         def decorator(func):
             return func
         return decorator
+    # prange will behave the same as range in the absence of Numba
+    def prange(*args, **kwargs):  # type: ignore[override]
+        return range(*args, **kwargs)
 
 
-@njit  # type: ignore[misc]
+@njit(parallel=True)  # type: ignore[misc]
 def _compute_cross_series_numba(momentum_array: np.ndarray, signal_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute cross-over and cross-under boolean arrays using a Numba-accelerated
@@ -72,7 +80,8 @@ def _compute_cross_series_numba(momentum_array: np.ndarray, signal_array: np.nda
     # Initialise previous values with the first element to avoid out-of-bounds
     prev_mom = momentum_array[0]
     prev_sig = signal_array[0]
-    for i in range(n):
+    # Use prange to enable automatic parallelisation over the array indices.
+    for i in prange(n):
         m = momentum_array[i]
         s = signal_array[i]
         # cross-over: previously below or equal and now above
@@ -90,6 +99,40 @@ LOGGER = logging.getLogger(__name__)
 # =====================================================================================
 # === 보조 계산 함수들 ===============================================================
 # =====================================================================================
+
+
+@njit(parallel=True)  # type: ignore[misc]
+def _rolling_rma_last(values: np.ndarray, length: int) -> np.ndarray:
+    """슬라이딩 윈도우에 대해 Wilder RMA의 마지막 값을 계산합니다."""
+
+    n = len(values)
+    result = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        result[i] = np.nan
+
+    if length <= 0:
+        return result
+
+    # Outer loop parallelised using prange.  Each iteration computes the last RMA
+    # for the window ending at ``idx`` independently of other indices.
+    for idx in prange(length - 1, n):
+        start = idx - length + 1
+        acc = values[start]
+        for j in range(start + 1, idx + 1):
+            acc = (acc * (length - 1) + values[j]) / length
+        result[idx] = acc
+
+    return result
+
+
+def _bars_since_mask(mask: pd.Series) -> pd.Series:
+    mask_values = mask.fillna(False).to_numpy(dtype=bool)
+    indices = np.arange(mask_values.shape[0], dtype=np.int64)
+    last_true = np.where(mask_values, indices, -1)
+    last_true = np.maximum.accumulate(last_true)
+    counts = indices.astype(float) - last_true.astype(float)
+    counts[last_true < 0] = np.inf
+    return pd.Series(counts, index=mask.index, dtype=float)
 
 
 def _ensure_series(values: Iterable[float], index: pd.Index) -> pd.Series:
@@ -111,39 +154,42 @@ def _sma(series: pd.Series, length: int) -> pd.Series:
     return series.rolling(length, min_periods=length).mean()
 
 
-def _wma(series: pd.Series, length: int) -> pd.Series:
+def _std(series: pd.Series, length: int) -> pd.Series:
     length = max(int(length), 1)
-    if length == 1:
-        return series.copy()
+    return series.rolling(length, min_periods=length).std(ddof=0)
 
+def _wma(series: pd.Series, length: int) -> pd.Series:
+    """
+    Compute the weighted moving average (WMA) of a series.
+    Later used for Hull MA.
+    """
+    length = max(int(length), 1)
     weights = np.arange(1, length + 1, dtype=float)
-    weight_sum = float(weights.sum()) if weights.size else 1.0
 
     def _calc(values: np.ndarray) -> float:
         if np.isnan(values).any():
             return np.nan
-        return float(np.dot(values, weights) / weight_sum)
+        return float(np.dot(values, weights) / weights.sum())
 
     return series.rolling(length, min_periods=length).apply(_calc, raw=True)
 
 
 def _hma(series: pd.Series, length: int) -> pd.Series:
+    """
+    Compute the Hull moving average of a series.
+    HMA is defined as WMA(2*WMA(series, n/2) - WMA(series, n), sqrt(n)).
+    """
     length = max(int(length), 1)
-    if length == 1:
-        return series.copy()
-
-    half_len = max(length // 2, 1)
-    sqrt_len = max(int(np.sqrt(length)), 1)
-
-    wma_half = _wma(series, half_len)
-    wma_full = _wma(series, length)
-    hull_input = 2.0 * wma_half - wma_full
-    return _wma(hull_input, sqrt_len)
-
-
-def _std(series: pd.Series, length: int) -> pd.Series:
-    length = max(int(length), 1)
-    return series.rolling(length, min_periods=length).std(ddof=0)
+    half_len = int(length / 2)
+    sqrt_len = int(np.sqrt(length))
+    if half_len < 1:
+        half_len = 1
+    if sqrt_len < 1:
+        sqrt_len = 1
+    wma1 = _wma(series, half_len)
+    wma2 = _wma(series, length)
+    diff = 2.0 * wma1 - wma2
+    return _wma(diff, sqrt_len)
 
 
 def _true_range(df: pd.DataFrame) -> pd.Series:
@@ -396,38 +442,76 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def _dmi_components(df: pd.DataFrame, length: int) -> Tuple[pd.Series, pd.Series]:
+def _directional_flux(df: pd.DataFrame, length: int, smooth_len: int) -> pd.Series:
+    """Squeeze Momentum Deluxe 방식의 방향성 플럭스를 계산합니다."""
+
     length = max(int(length), 1)
+    smooth_len = max(int(smooth_len), 1)
+
     high = df["high"]
     low = df["low"]
-    prev_high = high.shift()
-    prev_low = low.shift()
-    up_move = high - prev_high
-    down_move = prev_low - low
-    plus_dm_raw = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm_raw = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = _rma(pd.Series(plus_dm_raw, index=df.index), length)
-    minus_dm = _rma(pd.Series(minus_dm_raw, index=df.index), length)
-    atr = _atr(df, length).replace(0.0, np.nan)
-    plus_di = 100.0 * (plus_dm / atr)
-    minus_di = 100.0 * (minus_dm / atr)
-    di_diff = plus_di - minus_di
-    di_sum = plus_di + minus_di
-    return di_diff, di_sum
+    close = df["close"]
+
+    prev_high = high.shift(1).fillna(high)
+    prev_low = low.shift(1).fillna(low)
+    prev_close = close.shift(1).fillna(close)
+
+    up_move = (high - prev_high).clip(lower=0.0)
+    down_move = (prev_low - low).clip(lower=0.0)
+
+    tr_raw = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    tr = _rma(tr_raw, length)
+    atr_safe = tr.replace(0.0, np.nan)
+
+    up_rma = _rma(up_move, length)
+    down_rma = _rma(down_move, length)
+
+    up = up_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+    dn = down_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+
+    flux_denom = (up + dn).replace(0.0, np.nan)
+    flux_ratio = (up - dn).divide(flux_denom)
+    flux_ratio = flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    flux_half = max(int(np.round(length / 2.0)), 1)
+    flux_core = _rma(flux_ratio, flux_half) * 100.0
+
+    if smooth_len > 1:
+        flux_val = flux_core.rolling(smooth_len, min_periods=smooth_len).mean()
+    else:
+        flux_val = flux_core
+
+    return flux_val.fillna(0.0)
 
 
-def _directional_flux(df: pd.DataFrame, length: int) -> pd.Series:
-    di_diff, _ = _dmi_components(df, length)
-    return di_diff.fillna(0.0)
+def _squeeze_momentum_norm(
+    df: pd.DataFrame, length: int, atr_series: pd.Series, kc_mult: float
+) -> pd.Series:
+    """Squeeze Momentum Deluxe 지표의 정규화된 모멘텀 입력값을 계산합니다."""
 
+    length = max(int(length), 1)
 
-def _directional_flux_adx(df: pd.DataFrame, length: int) -> pd.Series:
-    di_diff, di_sum = _dmi_components(df, length)
-    di_diff = di_diff.fillna(0.0)
-    di_sum = di_sum.replace(0.0, np.nan)
-    dx = (di_diff.abs() / di_sum).fillna(0.0) * 100.0
-    adx = _rma(dx, length)
-    return (di_diff * (adx / 100.0)).fillna(0.0)
+    hl2 = (df["high"] + df["low"]) / 2.0
+    kc_basis = _sma(hl2, length)
+    kc_range = atr_series * float(kc_mult)
+    kc_upper = kc_basis + kc_range
+    kc_lower = kc_basis - kc_range
+    kc_average = (kc_upper + kc_lower) / 2.0
+    midline = (hl2 + kc_average) / 2.0
+
+    atr_safe = atr_series.replace(0.0, np.nan)
+    norm = (df["close"] - midline).divide(atr_safe)
+    norm = norm.replace([np.inf, -np.inf], np.nan)
+
+    return (norm * 100.0).fillna(0.0)
 
 
 @dataclass
@@ -468,32 +552,6 @@ def run_backtest(
     required_cols = {"open", "high", "low", "close", "volume"}
     if not required_cols.issubset(df.columns):
         raise ValueError("DataFrame must contain OHLCV columns")
-
-    # ---------------------------------------------------------------------
-    # Disable high‑timeframe and other complex filters.
-    #
-    # Many hyperparameters in the strategy enable filters such as HTF trend,
-    # range, regime, HMA, slope, distance guard, equity slope, pivot HTF,
-    # squeeze gates and structure gates.  These features dramatically
-    # increase runtime and are not used by the user in their Python
-    # backtests.  To ensure they are never triggered, copy the incoming
-    # parameter dictionary and set these keys to ``False``.  This patch
-    # prevents the backtest engine from even constructing the related
-    # indicators, thereby speeding up the optimisation process.
-    params = dict(params or {})
-    for _disable_key in [
-        "useHtfTrend",
-        "useRangeFilter",
-        "useRegimeFilter",
-        "useHmaFilter",
-        "useSlopeFilter",
-        "useDistanceGuard",
-        "useEquitySlopeFilter",
-        "usePivotHtf",
-        "useSqzGate",
-        "useStructureGate",
-    ]:
-        params[_disable_key] = False
 
     def _ensure_datetime_index(frame: pd.DataFrame, label: str) -> pd.DataFrame:
         if isinstance(frame.index, pd.DatetimeIndex):
@@ -707,7 +765,7 @@ def run_backtest(
         return str(value) if value is not None else str(default)
 
     # Pine 입력 매핑 -----------------------------------------------------------------
-    osc_len = int_param("oscLen", 12)
+    osc_len = int_param("oscLen", 20)
     sig_len = int_param("signalLen", 3)
     use_same_len = bool_param("useSameLen", False)
     bb_len = osc_len if use_same_len else int_param("bbLen", 20)
@@ -718,9 +776,11 @@ def run_backtest(
     flux_len = int_param("fluxLen", 14)
     flux_smooth_len = int_param("fluxSmoothLen", 1)
     flux_use_ha = bool_param("useFluxHeikin", True)
+
+    # 모디파이드 플럭스 및 스퀴즈 사용 여부와 신호선 타입
     use_mod_flux = bool_param("useModFlux", False)
     use_mod_squeeze = bool_param("useModSqueeze", False)
-    ma_type_param = str_param("maType", "SMA")
+    ma_type = str_param("maType", "SMA")
 
     use_dynamic_thresh = bool_param("useDynamicThresh", True)
     use_sym_threshold = bool_param("useSymThreshold", False)
@@ -729,7 +789,8 @@ def run_backtest(
     sell_threshold = float_param("sellThreshold", 36.0)
     dyn_len = int_param("dynLen", 21, enabled=use_dynamic_thresh)
     dyn_mult = float_param("dynMult", 1.1, enabled=use_dynamic_thresh)
-    require_momentum_cross = bool_param("requireMomentumCross", True)
+    # 전략 명세에 따라 모멘텀 교차 필터는 항상 사용한다.
+    require_momentum_cross = True
     # Optional toggle: enable Numba-accelerated cross calculations.  When
     # ``useNumba`` is True and Numba is installed in the environment,
     # momentum/signal cross-over arrays will be computed using a
@@ -985,21 +1046,28 @@ def run_backtest(
     tick_size = _estimate_tick(df["close"])
     slip_value = tick_size * slippage_ticks
 
-    kc_len_eff = osc_len if use_same_len else kc_len
-    highest = df["high"].rolling(kc_len_eff, min_periods=kc_len_eff).max()
-    lowest = df["low"].rolling(kc_len_eff, min_periods=kc_len_eff).min()
-    midline = (highest + lowest) / 2.0
-    squeeze_input = df["close"] - midline
-    if use_mod_squeeze:
-        atr_norm = _atr(df, kc_len_eff).replace(0.0, np.nan)
-        squeeze_input = squeeze_input / atr_norm
-    squeeze_input = squeeze_input * 100.0
-    momentum = _linreg(squeeze_input, osc_len)
-
-    ma_type_key = ma_type_param.strip().upper()
-    if ma_type_key == "EMA":
+    atr_len_series = _atr(df, osc_len)
+    atr_primary = _atr(df, kc_len)
+    # 스퀴즈 모멘텀 입력값 계산: 기본은 midline 차이, 모디파이드는 ATR 로 정규화
+    # KC midline 계산을 위해 중간값들을 선계산
+    hl2 = (df["high"] + df["low"]) / 2.0
+    kc_basis = _sma(hl2, kc_len)
+    kc_range_series = atr_primary * float(kc_mult)
+    kc_upper = kc_basis + kc_range_series
+    kc_lower = kc_basis - kc_range_series
+    kc_average = (kc_upper + kc_lower) / 2.0
+    midline = (hl2 + kc_average) / 2.0
+    # 기본과 모디파이드 입력값 계산
+    norm_mod = (df["close"] - midline).divide(atr_primary.replace(0.0, np.nan))
+    norm_orig = df["close"] - midline
+    norm_series = norm_mod if use_mod_squeeze else norm_orig
+    norm_series = (norm_series * 100.0).fillna(0.0)
+    momentum = _linreg(norm_series, osc_len)
+    # 모멘텀 신호선 유형 선택
+    mt = (ma_type or "SMA").lower()
+    if mt == "ema":
         mom_signal = _ema(momentum, sig_len)
-    elif ma_type_key == "HMA":
+    elif mt == "hma":
         mom_signal = _hma(momentum, sig_len)
     else:
         mom_signal = _sma(momentum, sig_len)
@@ -1033,17 +1101,25 @@ def run_backtest(
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
     if use_mod_flux:
-        flux_raw = _directional_flux_adx(flux_df, flux_len)
+        plus_di, minus_di, _ = _dmi(flux_df, flux_len)
+        flux_denom = (plus_di + minus_di).replace(0.0, np.nan)
+        mod_flux_ratio = (plus_di - minus_di).divide(flux_denom)
+        mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        flux_half = max(int(np.round(flux_len / 2.0)), 1)
+        mod_flux_core = _rma(mod_flux_ratio, flux_half) * 100.0
+        if flux_smooth_len > 1:
+            flux_hist = mod_flux_core.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+        else:
+            flux_hist = mod_flux_core
     else:
-        flux_raw = _directional_flux(flux_df, flux_len)
-    if flux_smooth_len > 1:
-        flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
-    else:
-        flux_hist = flux_raw
+        flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
+        if flux_smooth_len > 1:
+            flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+        else:
+            flux_hist = flux_raw
 
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
-    mom_fade_dev = _std(mom_fade_source, mom_fade_bb_len) * mom_fade_bb_mult
     prev_close = df["close"].shift().fillna(df["close"])
     if mom_fade_use_true_range:
         tr = pd.concat(
@@ -1063,10 +1139,14 @@ def run_backtest(
     mom_fade_abs = mom_fade_hist.abs()
     mom_fade_abs_prev = mom_fade_abs.shift().fillna(mom_fade_abs)
     mom_fade_abs_prev2 = mom_fade_abs.shift(2).fillna(mom_fade_abs_prev)
+    mom_fade_nonpos = mom_fade_hist.le(0)
+    mom_fade_nonneg = mom_fade_hist.ge(0)
+    mom_fade_since_nonpos = _bars_since_mask(mom_fade_nonpos)
+    mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
-    gate_dev = mom_fade_dev
-    gate_atr = mom_range
-    gate_sq_on = (gate_dev < gate_atr).fillna(False).astype(bool)
+    bb_dev = _std(df["close"], bb_len) * bb_mult
+    kc_range = atr_primary * kc_mult
+    gate_sq_on = (bb_dev < kc_range).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
@@ -1092,7 +1172,20 @@ def run_backtest(
         buy_thresh_series = pd.Series(buy_val, index=df.index)
         sell_thresh_series = pd.Series(sell_val, index=df.index)
 
-    atr_len_series = _atr(df, osc_len)
+    vol_guard_atr_pct = pd.Series(0.0, index=df.index)
+    if use_volatility_guard:
+        atr_window = max(volatility_lookback, 1)
+        tr_values = _true_range(df).to_numpy(dtype=float)
+        atr_series_values = _rolling_rma_last(tr_values, atr_window)
+        close_values = df["close"].to_numpy(dtype=float)
+        atr_pct_array = np.zeros(len(df), dtype=float)
+        for pos in range(len(df)):
+            if pos >= atr_window:
+                atr_val = atr_series_values[pos]
+                close_val = close_values[pos]
+                if not np.isnan(atr_val) and close_val != 0.0:
+                    atr_pct_array[pos] = atr_val / close_val * 100.0
+        vol_guard_atr_pct = pd.Series(atr_pct_array, index=df.index)
 
     # 보조 필터 선계산 --------------------------------------------------------------
     if use_adx or use_atr_diff:
@@ -1425,14 +1518,6 @@ def run_backtest(
                 recent_trade_results.pop(0)
         reentry_countdown = reentry_bars
 
-    def bars_since(series: pd.Series, idx: int, condition: callable) -> int:
-        count = 0
-        for lookback in range(idx, -1, -1):
-            if condition(series.iloc[lookback]):
-                return count
-            count += 1
-        return int(1e9)
-
     prev_guard_state = guard_frozen
 
     for idx, ts in enumerate(df.index):
@@ -1478,13 +1563,7 @@ def run_backtest(
         loss_count_breached = max_daily_losses > 0 and daily_losses >= max_daily_losses
         guard_fire_limit = max_guard_fires > 0 and guard_fired_total >= max_guard_fires
 
-        atr_pct_val = 0.0
-        if use_volatility_guard:
-            atr_window = max(volatility_lookback, 1)
-            if idx >= atr_window:
-                atr_pct_val = _atr(df.iloc[idx - atr_window + 1 : idx + 1], atr_window).iloc[-1] / row["close"] * 100.0
-            else:
-                atr_pct_val = 0.0
+        atr_pct_val = vol_guard_atr_pct.iloc[idx] if use_volatility_guard else 0.0
         is_vol_ok = (not use_volatility_guard) or (
             volatility_lower_pct <= atr_pct_val <= volatility_upper_pct
         )
@@ -1700,7 +1779,10 @@ def run_backtest(
                 mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
                 and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
             )
-            fade_delay_long = mom_fade_zero_delay <= 0 or bars_since(mom_fade_hist, idx, lambda v: v <= 0) > mom_fade_zero_delay
+            fade_delay_long = (
+                mom_fade_zero_delay <= 0
+                or mom_fade_since_nonpos.iloc[idx] > mom_fade_zero_delay
+            )
             fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (
@@ -1730,7 +1812,10 @@ def run_backtest(
                 mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
                 and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
             )
-            fade_delay_short = mom_fade_zero_delay <= 0 or bars_since(mom_fade_hist, idx, lambda v: v >= 0) > mom_fade_zero_delay
+            fade_delay_short = (
+                mom_fade_zero_delay <= 0
+                or mom_fade_since_nonneg.iloc[idx] > mom_fade_zero_delay
+            )
             fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (

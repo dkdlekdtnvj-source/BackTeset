@@ -6,21 +6,22 @@
 
 `n_jobs>1`은 파이썬 스레드 기반이어서 GIL 영향을 받습니다. CPU 바운드 최적화에서는 **프로세스/노드 병렬**이 필수이며, 이를 위해 Optuna 스터디를 외부 RDB에 저장해야 합니다. 2025년 9월 이후 버전부터는 개별 데이터셋 백테스트도 `search.dataset_jobs`와 `search.dataset_executor`(thread/process) 설정으로 병렬화할 수 있으니, 단일 트라이얼이 여러 기간·심볼을 동시에 평가할 때 적극 활용하세요.
 
-- 로컬 SQLite를 반드시 병렬로 사용해야 한다면 `config/params.yaml`에서 `search.allow_sqlite_parallel: true`로 설정하거나 CLI 플래그 `--allow-sqlite-parallel`을 지정할 수 있습니다. Optuna worker 수를 강제로 유지하지만, SQLite 특성상 `database is locked` 재시도가 발생할 수 있으니 모니터링을 권장합니다.
+- 로컬 SQLite에서 병렬을 사용하면 기본적으로 경고만 출력한 뒤 잠금 충돌을 자동 재시도하면서 진행합니다. 명시적으로 병렬 사용을 허용했다고 표시하고 싶다면 `config/params.yaml`의 `search.allow_sqlite_parallel: true` 또는 CLI `--allow-sqlite-parallel`을 지정하세요. SQLite 특성상 `database is locked` 재시도가 발생할 수 있으니 모니터링을 권장합니다.
 - YAML에서 해당 옵션을 켜둔 상태라도 특정 실행을 직렬화하고 싶다면 CLI `--force-sqlite-serial`로 즉시 1 worker 제한을 적용할 수 있습니다.
+- PostgreSQL로 이전하면 Optuna가 내부적으로 커넥션 풀을 사용하며 잠금 충돌 없이 수십~수백개의 병렬 트라이얼을 안정적으로 처리할 수 있습니다. 전환 절차와 권장 설정은 `docs/postgresql_스토리지_전환_가이드.md`를 참고하세요.
 
 1. 데이터베이스 준비 (예: PostgreSQL)
    ```bash
-   createdb pine_optuna
-   psql pine_optuna -c "CREATE USER pine_optuna WITH PASSWORD 'pine_optuna';"
-   psql pine_optuna -c "GRANT ALL PRIVILEGES ON DATABASE pine_optuna TO pine_optuna;"
+   createdb optuna
+   psql optuna -c "ALTER USER postgres WITH PASSWORD '5432';"
    ```
 2. 접속 URL을 환경 변수로 등록합니다.
    ```bash
-   export OPTUNA_STORAGE_URL="postgresql+psycopg://pine_optuna:pine_optuna@localhost:5432/pine_optuna"
+   export OPTUNA_STORAGE="postgresql://postgres:5432@127.0.0.1:5432/optuna"
    ```
-3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE_URL`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>_<htf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql+psycopg://...` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
-4. 동일한 스터디 이름(`search.study_name` 또는 CLI `--study-name`)을 공유하는 여러 프로세스를 실행하면 Optuna가 트라이얼 분배를 조율합니다.
+3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`, `storage_connect_timeout`, `storage_statement_timeout_ms`, `storage_isolation_level` 항목으로 PostgreSQL 풀과 타임아웃 정책을 조절할 수 있습니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>_<htf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql://postgres:5432@127.0.0.1:5432/optuna` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
+4. 심볼/타임프레임/필터를 차례대로 고르고 싶다면 리포지토리 루트에서 `./시작` 명령을 실행하세요. 내부적으로 `python -m optimize.run --interactive`를 호출하므로 동일한 플래그를 그대로 전달할 수 있습니다.
+5. 동일한 스터디 이름(`search.study_name` 또는 CLI `--study-name`)을 공유하는 여러 프로세스를 실행하면 Optuna가 트라이얼 분배를 조율합니다.
 
 ## 2. 타임프레임 조합 × 1,000회 실행 전략
 

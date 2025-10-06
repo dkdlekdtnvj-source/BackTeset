@@ -48,12 +48,14 @@ dfl          = input.int (14  , title="Flux Length"           , group=gDF, minva
 dfSmoothLen  = input.int (1   , title="플럭스 스무딩"          , group=gDF, minval=1 , maxval=50)
 dfh          = input.bool(true, title="Heikin-Ashi 변환 사용" , group=gDF)
 
-// --- 2-1. 모디파이드 옵션 ---
-gMod = "2-1. 모디파이드 옵션"
-useModFlux    = input.bool(false, title="모디파이드 플럭스 (DMI/ADX)"      , group=gMod)
-useModSqueeze = input.bool(false, title="모디 스퀴즈 모멘텀 (ATR 정규화)", group=gMod)
-maType        = input.string("기본", title="모멘텀 신호선 유형", options=["기본", "EMA", "HMA"], group=gMod)
-
+// --- 6. 모디파이드 옵션 ---
+gMod = "6. 모디파이드"
+// 모디파이드 DMI/ADX 기반 방향성 플럭스 사용 여부
+useModFlux   = input.bool(false, title="모디파이드 플럭스(DMI/ADX) 사용" , group=gMod)
+// 모디파이드 스퀴즈 모멘텀(ATR 정규화) 사용 여부
+useModSqueeze = input.bool(false, title="모디파이드 스퀴즈모멘텀(ATR) 사용" , group=gMod)
+// 모멘텀 신호선 이평선 종류: 기본(SMA), EMA, HMA
+maType       = input.string("기본", title="모멘텀 신호선 타입", options=["기본","EMA","HMA"], group=gMod)
 // --- 3. 청산 옵션 ---
 gExit = "3. 청산 옵션"
 exitOpposite = input.bool(true , title="반대 신호 청산"      , group=gExit)
@@ -103,28 +105,38 @@ float haHigh = math.max(high, math.max(haOpen, haClose))
 float haLow  = math.min(low,  math.min(haOpen, haClose))
 
 float srcClose = dfh ? haClose : close
-float srcHigh  = dfh ? haHigh  : high
-float srcLow   = dfh ? haLow   : low
 
-// --- 플럭스 계산 ---
-float fluxRaw = ta.linreg(srcClose - nz(srcClose[1]), dfl, 0)
-float upMove = srcHigh - nz(srcHigh[1])
-float downMove = nz(srcLow[1]) - srcLow
-float plusDm = (upMove > downMove and upMove > 0) ? upMove : 0.0
-float minusDm = (downMove > upMove and downMove > 0) ? downMove : 0.0
-float smoothPlusDm = ta.rma(plusDm, dfl)
-float smoothMinusDm = ta.rma(minusDm, dfl)
-float fluxTr = ta.tr(srcHigh, srcLow, srcClose)
-float fluxAtr = ta.rma(fluxTr, dfl)
-float plusDi = fluxAtr != 0 ? smoothPlusDm / fluxAtr * 100.0 : 0.0
-float minusDi = fluxAtr != 0 ? smoothMinusDm / fluxAtr * 100.0 : 0.0
-float diDiff = plusDi - minusDi
-float diSum = plusDi + minusDi
-float dx = diSum != 0 ? math.abs(diDiff) / diSum * 100.0 : 0.0
-float adx = ta.rma(dx, dfl)
-float fluxModRaw = diDiff * (nz(adx) / 100.0)
-float fluxBase = useModFlux ? fluxModRaw : fluxRaw
-float fluxVal = dfSmoothLen > 1 ? ta.sma(fluxBase, dfSmoothLen) : fluxBase
+// --- 플럭스 계산 (Deluxe 방식) ---
+float fluxHigh   = dfh ? haHigh : high
+float fluxLow    = dfh ? haLow  : low
+float fluxClose  = srcClose
+float prevClose  = nz(fluxClose[1], fluxClose)
+float upMove     = fluxHigh - nz(fluxHigh[1], fluxHigh)
+float downMove   = nz(fluxLow[1], fluxLow) - fluxLow
+float trRaw      = math.max(fluxHigh - fluxLow, math.max(math.abs(fluxHigh - prevClose), math.abs(fluxLow - prevClose)))
+float tr         = ta.rma(trRaw, dfl)
+float upRma      = ta.rma(math.max(upMove, 0.0), dfl)
+float downRma    = ta.rma(math.max(downMove, 0.0), dfl)
+float trSafe     = tr == 0.0 ? na : tr
+float up         = not na(trSafe) ? upRma / trSafe : 0.0
+float dn         = not na(trSafe) ? downRma / trSafe : 0.0
+float fluxDenom  = up + dn
+float fluxRatio  = fluxDenom != 0 ? (up - dn) / fluxDenom : 0.0
+int   fluxHalf   = math.max(int(math.round(dfl / 2.0)), 1)
+float fluxCore   = ta.rma(fluxRatio, fluxHalf) * 100.0
+float fluxValOriginal = dfSmoothLen > 1 ? ta.sma(fluxCore, dfSmoothLen) : fluxCore
+
+// 모디파이드 방향성 플럭스 (DMI/ADX) 계산
+float pdi       = ta.plus_di(dfl)
+float ndi       = ta.minus_di(dfl)
+float dden      = pdi + ndi
+float modFluxRatio = dden != 0 ? (pdi - ndi) / dden : 0.0
+int   modFluxHalf   = math.max(int(math.round(dfl / 2.0)), 1)
+float modFluxCore   = ta.rma(modFluxRatio, modFluxHalf) * 100.0
+float modFluxVal    = dfSmoothLen > 1 ? ta.sma(modFluxCore, dfSmoothLen) : modFluxCore
+
+// 최종 사용될 플럭스
+float fluxVal    = useModFlux ? modFluxVal : fluxValOriginal
 
 // --- 스퀴즈 모멘텀 계산 ---
 float bbBasis = ta.sma(close, bbLen)
@@ -132,19 +144,27 @@ float bbDev   = ta.stdev(close, bbLen) * bbMult
 float kcRange = ta.atr(kcLen) * kcMult
 bool squeezeOn = bbDev < kcRange
 
-float highestHigh = ta.highest(high, kcLen)
-float lowestLow   = ta.lowest(low, kcLen)
-float midline     = (highestHigh + lowestLow) / 2.0
-float squeezeInput = close - midline
-if useModSqueeze
-    float atrNorm = ta.atr(kcLen)
-    squeezeInput := atrNorm != 0 ? squeezeInput / atrNorm : 0.0
-squeezeInput *= 100.0
-float momentum    = ta.linreg(squeezeInput, len, 0)
-float momSignal = switch maType
-    "EMA" => ta.ema(momentum, sig)
-    "HMA" => ta.hma(momentum, sig)
-    => ta.sma(momentum, sig)
+float hl2         = (high + low) / 2.0
+float kcBasis     = ta.sma(hl2, kcLen)
+float kcUpper     = kcBasis + kcRange
+float kcLower     = kcBasis - kcRange
+float kcAverage   = (kcUpper + kcLower) / 2.0
+float midline     = math.avg(hl2, kcAverage)
+float atrPrimary  = ta.atr(kcLen)
+// 기본/모디파이드 스퀴즈 모멘텀 입력값
+float normOriginal = (close - midline)
+float normMod      = atrPrimary > 0 ? (close - midline) / atrPrimary : 0.0
+float normSel      = useModSqueeze ? normMod : normOriginal
+// 100 배율을 맞춰 비교적 일관된 크기를 유지
+float momentum    = ta.linreg(normSel * 100.0, len, 0)
+// 모멘텀 신호선 타입별 계산
+float momSignal   = na
+if maType == "EMA"
+    momSignal := ta.ema(momentum, sig)
+else if maType == "HMA"
+    momSignal := ta.hma(momentum, sig)
+else
+    momSignal := ta.sma(momentum, sig)
 
 // --- 페이드 감지 ---
 int fadeWindow = 1
@@ -157,24 +177,25 @@ bool fadeLongCond  = fadeMode == "VN" ? fadeLongCond_vn  : fadeLongCond_lg
 bool fadeShortCond = fadeMode == "VN" ? fadeShortCond_vn : fadeShortCond_lg
 
 // --- 상위봉 필터 ---
-float htfMa = na
-bool htfTrendUp = true
-bool htfTrendDown = true
+// 상위봉 필터는 사용 시에만 계산
+float htfMa      = na
+bool htfTrendUp  = false
+bool htfTrendDown= false
 if useHtfTrend
-    htfMa := request.security(syminfo.tickerid, htfTrendTf, ta.ema(close, htfMaLen), lookahead=barmerge.lookahead_off)
+    htfMa      := request.security(syminfo.tickerid, htfTrendTf, ta.ema(close, htfMaLen), lookahead=barmerge.lookahead_off)
     htfTrendUp   := close > htfMa
     htfTrendDown := close < htfMa
 
 // --- 레인지 필터 ---
-float rangeHigh = na
-float rangeLow  = na
-float rangePerc = na
-bool inRangeBox = false
+float rangeHigh   = na
+float rangeLow    = na
+float rangePerc   = na
+bool  inRangeBox  = false
 if useRangeFilter
-    rangeHigh := request.security(syminfo.tickerid, rangeTf, ta.highest(high, rangeBars), lookahead=barmerge.lookahead_off)
-    rangeLow  := request.security(syminfo.tickerid, rangeTf, ta.lowest(low, rangeBars),  lookahead=barmerge.lookahead_off)
-    rangePerc := rangeLow != 0 ? (rangeHigh - rangeLow) / rangeLow * 100.0 : na
-    inRangeBox := not na(rangePerc) and rangePerc <= rangePercent
+    rangeHigh   := request.security(syminfo.tickerid, rangeTf, ta.highest(high, rangeBars), lookahead=barmerge.lookahead_off)
+    rangeLow    := request.security(syminfo.tickerid, rangeTf, ta.lowest(low, rangeBars),  lookahead=barmerge.lookahead_off)
+    rangePerc   := rangeLow != 0 ? (rangeHigh - rangeLow) / rangeLow * 100.0 : 0.0
+    inRangeBox  := rangePerc <= rangePercent
 
 float pivotLow = ta.valuewhen(not na(ta.pivotlow(low, pivotLen, pivotLen)), ta.pivotlow(low, pivotLen, pivotLen), 0)
 float pivotHigh = ta.valuewhen(not na(ta.pivothigh(high, pivotLen, pivotLen)), ta.pivothigh(high, pivotLen, pivotLen), 0)

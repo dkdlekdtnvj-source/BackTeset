@@ -68,8 +68,8 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 0,
             "score": 1.0,
-            "params": {"oscLen": 12, "statThreshold": 38.0},
-            "metrics": {"NetProfit": 0.25, "Sortino": 1.8},
+            "params": {"oscLen": 20, "statThreshold": 38.0},
+            "metrics": {"NetProfit": 0.25, "Sortino": 1.8, "ProfitFactor": 1.6},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_a),
                 _make_dataset("BINANCE:ENAUSDT", "3m", "1h", dataset_metrics_b),
@@ -78,8 +78,8 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 1,
             "score": 1.2,
-            "params": {"oscLen": 14, "statThreshold": 42.0},
-            "metrics": {"NetProfit": 0.3, "Sortino": 1.7},
+            "params": {"oscLen": 22, "statThreshold": 42.0},
+            "metrics": {"NetProfit": 0.3, "Sortino": 1.7, "ProfitFactor": 1.4},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_c),
                 _make_dataset("BINANCE:ENAUSDT", "5m", None, dataset_metrics_d),
@@ -87,20 +87,32 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         },
     ]
 
-    best = {"params": {"oscLen": 12, "statThreshold": 38.0}, "metrics": {"NetProfit": 0.25}, "score": 1.0}
+    best = {
+        "params": {"oscLen": 20, "statThreshold": 38.0},
+        "metrics": {"NetProfit": 0.25, "ProfitFactor": 1.6},
+        "score": 1.0,
+    }
     wf_summary = {}
 
     generate_reports(results, best, wf_summary, ["NetProfit"], tmp_path)
 
+    results_path = tmp_path / "results.csv"
     summary_path = tmp_path / "results_timeframe_summary.csv"
     ranking_path = tmp_path / "results_timeframe_rankings.csv"
 
+    assert results_path.exists()
     assert summary_path.exists()
     assert ranking_path.exists()
 
+    results_df = pd.read_csv(results_path, keep_default_na=False)
     summary_df = pd.read_csv(summary_path, keep_default_na=False)
     ranking_df = pd.read_csv(ranking_path, keep_default_na=False)
 
+    assert results_df.columns[0] == "ProfitFactor"
+    assert results_df.columns[1] == "Sortino"
+    osc_idx = results_df.columns.get_loc("oscLen")
+    stat_idx = results_df.columns.get_loc("statThreshold")
+    assert osc_idx < stat_idx
     assert {"timeframe", "htf_timeframe"}.issubset(summary_df.columns)
     assert (summary_df["timeframe"] == "1m").any()
     assert "Sortino_mean" in ranking_df.columns
