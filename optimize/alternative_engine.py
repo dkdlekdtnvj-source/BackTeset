@@ -227,6 +227,7 @@ def _parse_core_settings(
 
     allow_long = _coerce_bool(params.get("allowLongEntry"), True)
     allow_short = _coerce_bool(params.get("allowShortEntry"), True)
+    # 전략 요구사항: 모멘텀 교차 필터는 항상 활성화한다.
     require_cross = True
     exit_opposite = _coerce_bool(params.get("exitOpposite"), True)
 

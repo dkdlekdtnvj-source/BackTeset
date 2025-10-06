@@ -68,7 +68,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 0,
             "score": 1.0,
-            "params": {"oscLen": 12, "statThreshold": 38.0},
+            "params": {"oscLen": 20, "statThreshold": 38.0},
             "metrics": {"NetProfit": 0.25, "Sortino": 1.8, "ProfitFactor": 1.6},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_a),
@@ -78,7 +78,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
         {
             "trial": 1,
             "score": 1.2,
-            "params": {"oscLen": 14, "statThreshold": 42.0},
+            "params": {"oscLen": 22, "statThreshold": 42.0},
             "metrics": {"NetProfit": 0.3, "Sortino": 1.7, "ProfitFactor": 1.4},
             "datasets": [
                 _make_dataset("BINANCE:ENAUSDT", "1m", "15m", dataset_metrics_c),
@@ -88,7 +88,7 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
     ]
 
     best = {
-        "params": {"oscLen": 12, "statThreshold": 38.0},
+        "params": {"oscLen": 20, "statThreshold": 38.0},
         "metrics": {"NetProfit": 0.25, "ProfitFactor": 1.6},
         "score": 1.0,
     }

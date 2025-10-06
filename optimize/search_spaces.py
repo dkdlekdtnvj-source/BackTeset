@@ -196,7 +196,6 @@ def get_search_spaces() -> List[Dict[str, object]]:
                         "step": 0.1,
                         "requires": {"name": "useDynamicThresh", "equals": True},
                     },
-                    "requireMomentumCross": {"type": "bool"},
                     "exitOpposite": {"type": "bool"},
                     "useMomFade": {"type": "bool"},
                     "momFadeRegLen": {
