@@ -1,12 +1,35 @@
 """Helpers for translating YAML search spaces to Optuna."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import optuna
 
 SpaceSpec = Dict[str, Dict[str, object]]
+
+
+@dataclass(frozen=True)
+class CategoricalDistribution:
+    name: str
+    choices: Sequence[object]
+
+
+@dataclass(frozen=True)
+class IntDistribution:
+    name: str
+    low: int
+    high: int
+    step: int = 1
+
+
+@dataclass(frozen=True)
+class FloatDistribution:
+    name: str
+    low: float
+    high: float
+    step: float = 0.1
 
 
 def build_space(space: SpaceSpec) -> SpaceSpec:
@@ -138,3 +161,46 @@ def mutate_around(
         else:
             continue
     return mutated
+
+
+def get_search_spaces() -> List[object]:
+    """Optuna 탐색에 사용할 기본 파라미터 공간을 반환합니다."""
+
+    spaces = [
+        # 1. Squeeze Momentum
+        CategoricalDistribution(name="use_squeeze_momentum", choices=[True]),
+        IntDistribution(name="len", low=5, high=40, step=1),
+        IntDistribution(name="sig", low=1, high=20, step=1),
+        IntDistribution(name="bbLen", low=10, high=100, step=1),
+        FloatDistribution(name="bbMult", low=0.5, high=3.0, step=0.1),
+        IntDistribution(name="kcLen", low=10, high=100, step=1),
+        FloatDistribution(name="kcMult", low=0.5, high=3.0, step=0.1),
+
+        # 2. Directional Flux
+        CategoricalDistribution(name="use_directional_flux", choices=[True]),
+        IntDistribution(name="dfl", low=5, high=50, step=1),
+        IntDistribution(name="dfSmoothLen", low=1, high=20, step=1),
+        CategoricalDistribution(name="dfh", choices=[True, False]),
+
+        # 3. Exit Options
+        CategoricalDistribution(name="exitOpposite", choices=[True, False]),
+        CategoricalDistribution(name="useMomFade", choices=[True, False]),
+        CategoricalDistribution(name="fadeMode", choices=["VN", "Legacy"]),
+        CategoricalDistribution(name="useAtrStop", choices=[True, False]),
+        FloatDistribution(name="atrStopMult", low=0.5, high=5.0, step=0.1),
+        CategoricalDistribution(name="useFixedStop", choices=[True, False]),
+        FloatDistribution(name="fixedStopPct", low=0.5, high=5.0, step=0.1),
+        CategoricalDistribution(name="useStopLoss", choices=[True, False]),
+        IntDistribution(name="stopLookback", low=2, high=50, step=1),
+        CategoricalDistribution(name="usePivotStop", choices=[True, False]),
+        IntDistribution(name="pivotLen", low=2, high=20, step=1),
+        CategoricalDistribution(name="useAtrTrail", choices=[True, False]),
+        IntDistribution(name="atrTrailLen", low=5, high=100, step=1),
+        FloatDistribution(name="atrTrailMult", low=1.0, high=7.0, step=0.1),
+        CategoricalDistribution(name="useBreakeven", choices=[True, False]),
+        FloatDistribution(name="breakevenMult", low=0.5, high=5.0, step=0.1),
+        CategoricalDistribution(name="useTimeStop", choices=[True, False]),
+        IntDistribution(name="maxHoldBars", low=5, high=100, step=1),
+    ]
+
+    return spaces
