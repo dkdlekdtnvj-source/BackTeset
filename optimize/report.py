@@ -164,6 +164,8 @@ def export_results(
     )
     agg_df.to_csv(output_dir / "results.csv", index=False)
     if not dataset_df.empty:
+        if "htf_timeframe" in dataset_df.columns:
+            dataset_df = dataset_df.drop(columns=["htf_timeframe"])
         dataset_df = _reorder_table(
             dataset_df,
             param_order,
@@ -177,7 +179,6 @@ def export_results(
                 "MaxDD",
                 "dataset",
                 "timeframe",
-                "htf_timeframe",
                 "trial",
             ),
         )
@@ -250,14 +251,11 @@ def _flatten_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
 def export_timeframe_summary(dataset_df: pd.DataFrame, output_dir: Path) -> None:
     if dataset_df.empty:
         return
-    if "timeframe" not in dataset_df.columns or "htf_timeframe" not in dataset_df.columns:
+    if "timeframe" not in dataset_df.columns:
         return
 
     df = dataset_df.copy()
     df["timeframe"] = df["timeframe"].astype(str)
-    df["htf_timeframe"] = (
-        df["htf_timeframe"].fillna("None").replace({"": "None"}).astype(str)
-    )
 
     metrics = [
         "NetProfit",
@@ -273,7 +271,7 @@ def export_timeframe_summary(dataset_df: pd.DataFrame, output_dir: Path) -> None
         return
 
     summary = (
-        df.groupby(["timeframe", "htf_timeframe"], dropna=False)[present]
+        df.groupby(["timeframe"], dropna=False)[present]
         .agg(["mean", "median", "max"])
         .sort_index()
     )
@@ -436,7 +434,6 @@ def write_trials_dataframe(
         "Value": values,
         "Completed": completed,
         "Timeframe": dataset_meta.apply(lambda meta: meta.get("timeframe") if isinstance(meta, dict) else None),
-        "HTF": dataset_meta.apply(lambda meta: meta.get("htf_timeframe") if isinstance(meta, dict) else None),
     }
 
     summary_df = pd.DataFrame(summary_columns)
