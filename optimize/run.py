@@ -1497,6 +1497,117 @@ def _group_datasets(
     return groups, timeframe_groups, default_key
 
 
+def _configure_parallel_workers(
+    search_cfg: Dict[str, object],
+    dataset_groups: Mapping[Tuple[str, Optional[str]], List[DatasetSpec]],
+    *,
+    available_cpu: int,
+    n_jobs: int,
+) -> Tuple[int, int, str, Optional[str]]:
+    dataset_executor = str(search_cfg.get("dataset_executor", "thread") or "thread").lower()
+    if dataset_executor not in {"thread", "process"}:
+        LOGGER.warning(
+            "알 수 없는 dataset_executor '%s' 가 지정되어 thread 모드로 대체합니다.",
+            dataset_executor,
+        )
+        dataset_executor = "thread"
+
+    dataset_start_method_raw = search_cfg.get("dataset_start_method")
+    dataset_start_method = (
+        str(dataset_start_method_raw).lower() if dataset_start_method_raw else None
+    )
+
+    max_parallel_datasets = max((len(group) for group in dataset_groups.values()), default=1)
+    auto_dataset_jobs = min(max_parallel_datasets, max(1, available_cpu))
+
+    legacy_dataset_jobs = search_cfg.get("dataset_n_jobs")
+    if legacy_dataset_jobs is not None and "dataset_jobs" not in search_cfg:
+        search_cfg["dataset_jobs"] = legacy_dataset_jobs
+
+    search_cfg.setdefault("dataset_jobs", auto_dataset_jobs)
+
+    raw_dataset_jobs = search_cfg.get("dataset_jobs")
+    try:
+        dataset_jobs = max(1, int(raw_dataset_jobs))
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "search.dataset_jobs 값 '%s' 을 해석할 수 없어 %d로 대체합니다.",
+            raw_dataset_jobs,
+            auto_dataset_jobs,
+        )
+        dataset_jobs = auto_dataset_jobs
+
+    dataset_jobs = min(dataset_jobs, max(1, available_cpu))
+
+    dataset_parallel_capable = max_parallel_datasets > 1
+    if not dataset_parallel_capable:
+        if dataset_jobs != 1:
+            LOGGER.info("단일 티커 구성으로 dataset_jobs %d→1로 비활성화합니다.", dataset_jobs)
+        dataset_jobs = 1
+    else:
+        if dataset_jobs <= 1 and auto_dataset_jobs > 1:
+            dataset_jobs = auto_dataset_jobs
+            LOGGER.info(
+                "데이터셋 병렬 worker %d개 자동 설정 (가용 CPU=%d, 최대 병렬=%d)",
+                dataset_jobs,
+                available_cpu,
+                max_parallel_datasets,
+            )
+        elif dataset_jobs > auto_dataset_jobs:
+            LOGGER.info(
+                "데이터셋 병렬 worker 수를 %d→%d로 제한합니다. (최대 병렬=%d)",
+                dataset_jobs,
+                auto_dataset_jobs,
+                max_parallel_datasets,
+            )
+            dataset_jobs = auto_dataset_jobs
+
+    dataset_jobs = max(1, dataset_jobs)
+    search_cfg["dataset_jobs"] = dataset_jobs
+
+    if dataset_parallel_capable and dataset_jobs > 1:
+        optuna_budget = max(1, available_cpu // dataset_jobs)
+        if optuna_budget < n_jobs:
+            LOGGER.info(
+                "데이터셋 병렬(%d worker) 활성화로 Optuna worker %d→%d 조정",
+                dataset_jobs,
+                n_jobs,
+                optuna_budget,
+            )
+            n_jobs = optuna_budget
+            search_cfg["n_jobs"] = n_jobs
+        LOGGER.info(
+            "보조 데이터셋 병렬 worker %d개 (%s) 사용",
+            dataset_jobs,
+            dataset_executor,
+        )
+        if dataset_executor == "process" and dataset_start_method:
+            LOGGER.info("프로세스 start method=%s", dataset_start_method)
+    elif not dataset_parallel_capable:
+        LOGGER.info(
+            "단일 티커/데이터셋 구성이라 데이터셋 병렬화를 비활성화하고 Optuna worker %d개를 유지합니다.",
+            n_jobs,
+        )
+        dataset_jobs = 1
+    else:
+        LOGGER.info(
+            "설정상 데이터셋 병렬 worker 1개라 Optuna 병렬(worker=%d)만 사용합니다.",
+            n_jobs,
+        )
+        dataset_jobs = 1
+
+    LOGGER.info(
+        "최종 병렬 전략: Optuna worker=%d (우선), 데이터셋 worker=%d (%s, 보조)",
+        n_jobs,
+        dataset_jobs,
+        dataset_executor,
+    )
+
+    search_cfg["dataset_jobs"] = dataset_jobs
+
+    return n_jobs, dataset_jobs, dataset_executor, dataset_start_method
+
+
 def _select_datasets_for_params(
     params_cfg: Dict[str, object],
     dataset_groups: Dict[Tuple[str, Optional[str]], List[DatasetSpec]],
@@ -2216,64 +2327,20 @@ def optimisation_loop(
     if not force_sqlite_serial and n_jobs <= 1 and auto_jobs > n_jobs:
         n_jobs = auto_jobs
         search_cfg["n_jobs"] = n_jobs
-        LOGGER.info("기본 팩터 프로파일: Optuna worker %d개 자동 할당", n_jobs)
+        LOGGER.info("가용 자원에 맞춰 Optuna worker %d개를 자동 할당했습니다.", n_jobs)
 
     if n_jobs > 1:
         LOGGER.info("Optuna 병렬 worker %d개를 사용합니다.", n_jobs)
-
-    raw_dataset_jobs = search_cfg.get("dataset_jobs") or search_cfg.get("dataset_n_jobs", 1)
-    try:
-        dataset_jobs = max(1, int(raw_dataset_jobs))
-    except (TypeError, ValueError):
-        LOGGER.warning(
-            "search.dataset_jobs 값 '%s' 을 해석할 수 없어 1로 대체합니다.", raw_dataset_jobs
-        )
-        dataset_jobs = 1
-    if dataset_jobs <= 1:
-        max_parallel = min(len(datasets) or 1, max(1, available_cpu))
-        if max_parallel > 1:
-            dataset_jobs = max_parallel
-            search_cfg["dataset_jobs"] = dataset_jobs
-            LOGGER.info(
-                "기본 팩터 프로파일: dataset_jobs=%d 자동 설정 (총 CPU=%d)",
-                dataset_jobs,
-                available_cpu,
-            )
-
-    dataset_executor = str(search_cfg.get("dataset_executor", "thread") or "thread").lower()
-    if dataset_executor not in {"thread", "process"}:
-        LOGGER.warning(
-            "알 수 없는 dataset_executor '%s' 가 지정되어 thread 모드로 대체합니다.",
-            dataset_executor,
-        )
-        dataset_executor = "thread"
-
-    dataset_start_method_raw = search_cfg.get("dataset_start_method")
-    dataset_start_method = (
-        str(dataset_start_method_raw).lower() if dataset_start_method_raw else None
-    )
-
-    if dataset_jobs > 1:
-        optuna_budget = max(1, available_cpu // max(1, dataset_jobs))
-        if optuna_budget < n_jobs:
-            LOGGER.info(
-                "데이터셋 병렬화를 위해 Optuna worker 수를 %d→%d 로 조정합니다.",
-                n_jobs,
-                optuna_budget,
-            )
-            n_jobs = optuna_budget
-            search_cfg["n_jobs"] = n_jobs
-        LOGGER.info(
-            "데이터셋 병렬 백테스트 worker %d개 (%s) 사용", dataset_jobs, dataset_executor
-        )
-        if dataset_executor == "process" and dataset_start_method:
-            LOGGER.info("프로세스 start method=%s", dataset_start_method)
-
-    LOGGER.info(
-        "최종 병렬 구성: Optuna worker=%d, 데이터셋 worker=%d (%s)",
+    (
         n_jobs,
         dataset_jobs,
         dataset_executor,
+        dataset_start_method,
+    ) = _configure_parallel_workers(
+        search_cfg,
+        dataset_groups,
+        available_cpu=available_cpu,
+        n_jobs=n_jobs,
     )
 
     algo_raw = search_cfg.get("algo", "bayes")
