@@ -1,5 +1,6 @@
 from typing import Optional
 
+from pathlib import Path
 from typing import Dict
 
 import pandas as pd
@@ -7,6 +8,7 @@ import pytest
 
 from optimize.run import (
     PROFIT_FACTOR_CHECK_LABEL,
+    DatasetCacheInfo,
     DatasetSpec,
     _apply_study_registry_defaults,
     _clean_metrics,
@@ -15,8 +17,10 @@ from optimize.run import (
     _has_sufficient_volume,
     _group_datasets,
     _normalise_periods,
+    _process_pool_initializer,
     _register_study_reference,
     _resolve_symbol_entry,
+    _serialise_datasets_for_process,
     _sanitise_storage_meta,
     _study_registry_dir,
     _restrict_to_basic_factors,
@@ -210,6 +214,42 @@ def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch)
 
     assert metrics["Valid"] is True
     assert sentinel["called"] is True
+
+
+def test_run_dataset_backtest_task_accepts_dataset_id_via_process_cache(
+    monkeypatch, tmp_path
+):
+    dataset = _make_dataset("1m", None)
+    dataset.cache_info = DatasetCacheInfo(root=tmp_path, futures=False)
+
+    handles = _serialise_datasets_for_process([dataset])
+    _process_pool_initializer(handles)
+
+    class DummyCache:
+        def __init__(self, frame):
+            self.frame = frame
+
+        def get(self, *args, **kwargs):
+            return self.frame
+
+    dummy_cache = DummyCache(dataset.df)
+    monkeypatch.setattr("optimize.run._resolve_process_cache", lambda *args, **kwargs: dummy_cache)
+
+    sentinel = {"called": False}
+
+    def fake_native(df, params, fees, risk, htf_df=None, min_trades=None):
+        sentinel["called"] = True
+        assert df.equals(dataset.df)
+        return {"Valid": True}
+
+    monkeypatch.setattr("optimize.run.run_backtest", fake_native)
+
+    result = _run_dataset_backtest_task(handles[0]["id"], {}, {}, {})
+
+    assert result == {"Valid": True}
+    assert sentinel["called"] is True
+
+    _process_pool_initializer([])
 
 
 def test_study_registry_round_trip_for_rdb(tmp_path):
