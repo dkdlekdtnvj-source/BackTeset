@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -93,10 +93,12 @@ def apply_lossless_anomaly(
 ) -> Optional[Tuple[str, float, float, float, float]]:
     """
     Detect and record lossless or micro-loss anomalies on the provided metric
-    dictionary ``target``.  If a lossless or near-loss condition is
-    detected, set the ``ProfitFactor`` entry to the literal string
-    ``"overfactor"``.  This string conveys that the profit factor is
-    mathematically undefined or excessively large due to a lack of losses.
+    dictionary ``target``.  Lossless 케이스에서는 ``ProfitFactor`` 열을 문자열
+    ``"overfactor"`` 로 교체해 사용자에게 비정상 상태임을 알리고, 원본 수치는
+    ``LosslessProfitFactorValue`` 와 ``DisplayedProfitFactor`` 에 각각 보존한다.
+    ``DisplayedProfitFactor`` 는 학습·정량 비교용으로 항상 부동소수 값(기본 0)
+    을 유지하며, ``ProfitFactor`` 는 사용자 뷰에서 원래 계산값 또는 표시용
+    문자열을 노출한다.
 
     Parameters
     ----------
@@ -104,7 +106,8 @@ def apply_lossless_anomaly(
         The metric dictionary to annotate.  It must contain keys such as
         ``Trades``, ``Wins``, ``Losses``, and ``GrossLoss``.  This
         function will update ``AnomalyFlags``, ``LosslessGrossLossThreshold``,
-        and ``ProfitFactor`` in place if an anomaly is detected.
+        ``LosslessProfitFactorValue``, ``DisplayedProfitFactor`` 및
+        ``ProfitFactor`` in place if an anomaly is detected.
     trades, wins, losses, gross_loss : optional
         Overrides for the corresponding values found in ``target``.  If
         ``None``, values will be extracted from ``target`` instead.
@@ -165,14 +168,21 @@ def apply_lossless_anomaly(
         flags.append(flag)
     target["AnomalyFlags"] = flags
 
-    # Preserve the original profit factor for reference and reset the
-    # public-facing value to a finite placeholder.  Downstream reports
-    # surface ``LosslessProfitFactor`` so 사용자는 손실이 없는 구간임을 알 수 있고,
-    # 기본 ``ProfitFactor`` 열은 항상 수치형(0)으로 유지됩니다.
-    original_pf = target.get("ProfitFactor", "overfactor")
+    # Profit factor 를 강제로 0 으로 덮어쓰지 않고 원본 값을 보존한다. 사용자가
+    # 확인할 수 있도록 ``LosslessProfitFactorValue`` 에는 원본 수치를, 학습·정량
+    # 비교 용도로 사용할 ``DisplayedProfitFactor`` 에는 안전한 수치 값을 기록한다.
+    original_pf = target.get("ProfitFactor")
+    if original_pf is None:
+        original_pf = float("nan")
+
     target["LosslessProfitFactorValue"] = original_pf
     target["LosslessProfitFactor"] = True
-    target["ProfitFactor"] = 0.0
+    target["DisplayedProfitFactor"] = 0.0
+
+    if flag == LOSSLESS_ANOMALY_FLAG:
+        target["ProfitFactor"] = "overfactor"
+    else:
+        target["ProfitFactor"] = original_pf
 
     return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
 
@@ -343,7 +353,7 @@ def aggregate_metrics(
     wins = sum(1 for trade in trades if trade.profit > 0)
     losses = sum(1 for trade in trades if trade.profit < 0)
 
-    fallback_keys = ("ProfitFactor", "Sortino", "Sharpe")
+    fallback_keys = ("Sortino", "Sharpe")
 
     # Nested helper declared below within aggregate_metrics.
 
@@ -375,13 +385,13 @@ def aggregate_metrics(
             flag, trades_val, wins_val, abs_loss, threshold = result
             if flag == LOSSLESS_ANOMALY_FLAG:
                 LOGGER.info(
-                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
                     int(trades_val),
                     int(wins_val),
                 )
             else:
                 LOGGER.warning(
-                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
                     abs_loss,
                     threshold,
                     int(trades_val),
@@ -432,13 +442,13 @@ def aggregate_metrics(
         flag, trades_val, wins_val, abs_loss, threshold = result
         if flag == LOSSLESS_ANOMALY_FLAG:
             LOGGER.info(
-                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
                 int(trades_val),
                 int(wins_val),
             )
         else:
             LOGGER.warning(
-                "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
                 abs_loss,
                 threshold,
                 int(trades_val),

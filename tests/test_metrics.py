@@ -76,8 +76,12 @@ def test_aggregate_metrics_basic():
     assert metrics["NetProfit"] != 0
     assert metrics["Trades"] == pytest.approx(2.0)
     assert metrics["WinRate"] == 1.0
-    assert metrics["ProfitFactor"] >= 0
+    assert metrics["ProfitFactor"] == "overfactor"
     assert metrics.get("LosslessProfitFactor")
+    assert metrics.get("DisplayedProfitFactor") == pytest.approx(0.0)
+    lossless_value = metrics.get("LosslessProfitFactorValue")
+    assert isinstance(lossless_value, float)
+    assert math.isinf(lossless_value)
     assert "WeeklyNetProfit" in metrics
     assert "Expectancy" in metrics
 
@@ -127,7 +131,9 @@ def test_aggregate_metrics_no_losses_is_finite():
     returns = pd.Series([0.01, 0.015, 0.02], index=pd.date_range("2023-01-01", periods=3, freq="D"))
     metrics = aggregate_metrics(trades, returns)
 
-    assert math.isfinite(metrics["ProfitFactor"])
+    assert metrics["ProfitFactor"] == "overfactor"
+    assert metrics.get("DisplayedProfitFactor") == pytest.approx(0.0)
+    assert math.isinf(metrics["LosslessProfitFactorValue"])
     assert math.isfinite(metrics["Sortino"])
     assert math.isfinite(metrics["Sharpe"])
 
@@ -165,7 +171,10 @@ def test_aggregate_metrics_micro_loss_flagged():
 
     metrics = aggregate_metrics(trades, returns)
 
-    assert metrics["ProfitFactor"] == pytest.approx(0.0)
+    expected_pf = (0.02) / abs(-0.0005)
+    assert metrics["ProfitFactor"] == pytest.approx(expected_pf)
+    assert metrics["LosslessProfitFactorValue"] == pytest.approx(expected_pf)
+    assert metrics.get("DisplayedProfitFactor") == pytest.approx(0.0)
     assert metrics.get("LosslessProfitFactor") is True
 
     flags = metrics.get("AnomalyFlags") or []
@@ -217,7 +226,10 @@ def test_lossless_threshold_respects_initial_capital():
     result = apply_lossless_anomaly(metrics, threshold=base_threshold)
 
     assert result is not None
-    assert metrics["ProfitFactor"] == pytest.approx(0.0)
+    expected_pf = metrics.get("LosslessProfitFactorValue")
+    assert expected_pf == pytest.approx(20.0)
+    assert metrics["ProfitFactor"] == pytest.approx(20.0)
+    assert metrics.get("DisplayedProfitFactor") == pytest.approx(0.0)
     assert metrics.get("LosslessProfitFactor") is True
     assert metrics["LosslessGrossLossThreshold"] == pytest.approx(1_000_000.0)
 
