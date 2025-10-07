@@ -1,5 +1,6 @@
 from typing import Optional
 
+import logging
 from pathlib import Path
 from typing import Dict
 
@@ -10,6 +11,7 @@ from optimize.run import (
     PROFIT_FACTOR_CHECK_LABEL,
     DatasetCacheInfo,
     DatasetSpec,
+    _configure_parallel_workers,
     _apply_study_registry_defaults,
     _clean_metrics,
     _dataset_total_volume,
@@ -298,3 +300,46 @@ def test_clean_metrics_preserves_check_label() -> None:
     metrics = {"ProfitFactor": PROFIT_FACTOR_CHECK_LABEL}
     cleaned = _clean_metrics(metrics)
     assert cleaned["ProfitFactor"] == PROFIT_FACTOR_CHECK_LABEL
+
+
+def test_configure_parallel_workers_single_dataset(caplog):
+    dataset = _make_dataset("1m", None)
+    dataset_groups, _, _ = _group_datasets([dataset])
+    search_cfg: Dict[str, object] = {"n_jobs": 4}
+
+    caplog.set_level(logging.INFO, logger="optimize")
+    n_jobs, dataset_jobs, _, _ = _configure_parallel_workers(
+        search_cfg,
+        dataset_groups,
+        available_cpu=8,
+        n_jobs=4,
+    )
+
+    assert n_jobs == 4
+    assert dataset_jobs == 1
+    assert search_cfg["dataset_jobs"] == 1
+    assert any(
+        "단일 티커/데이터셋 구성" in message for message in caplog.messages
+    )
+
+
+def test_configure_parallel_workers_multiple_datasets_reduce_optuna(caplog):
+    dataset_a = _make_dataset("1m", None)
+    dataset_b = _make_dataset("1m", None)
+    dataset_groups, _, _ = _group_datasets([dataset_a, dataset_b])
+    search_cfg: Dict[str, object] = {"n_jobs": 6}
+
+    caplog.set_level(logging.INFO, logger="optimize")
+    n_jobs, dataset_jobs, _, _ = _configure_parallel_workers(
+        search_cfg,
+        dataset_groups,
+        available_cpu=4,
+        n_jobs=6,
+    )
+
+    assert dataset_jobs == 2
+    assert n_jobs == 2
+    assert search_cfg["n_jobs"] == 2
+    assert any(
+        "보조 데이터셋 병렬 worker" in message for message in caplog.messages
+    )
