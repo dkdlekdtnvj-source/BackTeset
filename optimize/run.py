@@ -789,7 +789,7 @@ def _resolve_dataset_min_trades(
 
 
 def _run_dataset_backtest_task(
-    dataset: "DatasetSpec",
+    dataset_ref: object,
     params: Dict[str, object],
     fees: Dict[str, float],
     risk: Dict[str, float],
@@ -797,8 +797,10 @@ def _run_dataset_backtest_task(
 ) -> Dict[str, float]:
     """Execute ``run_backtest`` for a single dataset.
 
-    This helper is defined at module level so it can be pickled when ``ProcessPoolExecutor``
-    is used for parallel evaluation.
+    ``dataset_ref`` may be a :class:`DatasetSpec` (thread executor) or 문자열 ID
+    (process executor). When a string ID is provided, 워커 초기화 시 등록된 전역
+    캐시를 통해 DataFrame을 최초 한 번만 로드합니다. 이 함수는 모듈 레벨에
+    존재해야 ``ProcessPoolExecutor``에서 피클링할 수 있습니다.
     """
 
     # Determine if an alternative engine is requested.  The ``engine``
@@ -807,6 +809,8 @@ def _run_dataset_backtest_task(
     # engine is available, attempt to delegate the backtest accordingly.  In
     # the event of missing dependencies or unimplemented integration, fall
     # back to the native run_backtest implementation.
+    dataset = _resolve_dataset_reference(dataset_ref)
+
     engine = None
     try:
         engine = params.get("altEngine") or params.get("engine")
@@ -1287,6 +1291,15 @@ def _ensure_dict(root: Dict[str, object], key: str) -> Dict[str, object]:
     return value
 
 
+@dataclass(frozen=True)
+class DatasetCacheInfo:
+    root: Path
+    futures: bool = False
+
+    def serialise(self) -> Dict[str, object]:
+        return {"root": str(self.root), "futures": self.futures}
+
+
 @dataclass
 class DatasetSpec:
     symbol: str
@@ -1297,6 +1310,7 @@ class DatasetSpec:
     htf: Optional[pd.DataFrame]
     htf_timeframe: Optional[str] = None
     source_symbol: Optional[str] = None
+    cache_info: Optional[DatasetCacheInfo] = None
 
     @property
     def name(self) -> str:
@@ -1316,6 +1330,118 @@ class DatasetSpec:
             "to": self.end,
             "htf_timeframe": self.htf_timeframe or "",
         }
+
+
+_PROCESS_DATASET_REGISTRY: Dict[str, Dict[str, object]] = {}
+_PROCESS_DATASET_OBJECTS: Dict[str, DatasetSpec] = {}
+_PROCESS_DATASET_CACHES: Dict[Tuple[str, bool], DataCache] = {}
+_PROCESS_DATASET_LOCK = Lock()
+
+
+def _register_process_datasets(handles: Sequence[Dict[str, object]]) -> None:
+    global _PROCESS_DATASET_REGISTRY, _PROCESS_DATASET_OBJECTS, _PROCESS_DATASET_CACHES
+    _PROCESS_DATASET_REGISTRY = {entry["id"]: entry for entry in handles}
+    _PROCESS_DATASET_OBJECTS = {}
+    _PROCESS_DATASET_CACHES = {}
+
+
+def _process_pool_initializer(handles: Sequence[Dict[str, object]]) -> None:
+    _register_process_datasets(handles)
+
+
+def _resolve_process_cache(root: str, futures: bool) -> DataCache:
+    key = (root, futures)
+    cache = _PROCESS_DATASET_CACHES.get(key)
+    if cache is not None:
+        return cache
+
+    with _PROCESS_DATASET_LOCK:
+        cache = _PROCESS_DATASET_CACHES.get(key)
+        if cache is not None:
+            return cache
+        cache = DataCache(Path(root), futures=futures)
+        _PROCESS_DATASET_CACHES[key] = cache
+        return cache
+
+
+def _load_process_dataset(dataset_id: str) -> DatasetSpec:
+    handle = _PROCESS_DATASET_REGISTRY.get(dataset_id)
+    if handle is None:
+        raise KeyError(f"등록되지 않은 데이터셋 ID: {dataset_id}")
+
+    cache_root = handle.get("cache_root")
+    if not cache_root:
+        raise RuntimeError("process executor에서 데이터셋을 로드할 캐시 경로가 설정되지 않았습니다.")
+    futures_flag = bool(handle.get("cache_futures", False))
+    cache = _resolve_process_cache(str(cache_root), futures_flag)
+
+    source_symbol = str(handle.get("source_symbol"))
+    timeframe = str(handle.get("timeframe"))
+    start = str(handle.get("start"))
+    end = str(handle.get("end"))
+    df = cache.get(source_symbol, timeframe, start, end)
+
+    htf_timeframe = handle.get("htf_timeframe") or None
+    htf_df: Optional[pd.DataFrame] = None
+    if htf_timeframe:
+        try:
+            htf_df = cache.get(source_symbol, str(htf_timeframe), start, end)
+        except Exception as exc:
+            LOGGER.warning("HTF 데이터 로드 실패(%s): %s", dataset_id, exc)
+            htf_df = None
+
+    dataset = DatasetSpec(
+        symbol=str(handle.get("symbol")),
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        df=df,
+        htf=htf_df,
+        htf_timeframe=htf_timeframe,
+        source_symbol=source_symbol,
+        cache_info=DatasetCacheInfo(Path(str(cache_root)), futures=futures_flag),
+    )
+    _PROCESS_DATASET_OBJECTS[dataset_id] = dataset
+    return dataset
+
+
+def _resolve_dataset_reference(dataset_ref: object) -> DatasetSpec:
+    if isinstance(dataset_ref, DatasetSpec):
+        return dataset_ref
+    if isinstance(dataset_ref, str):
+        cached = _PROCESS_DATASET_OBJECTS.get(dataset_ref)
+        if cached is not None:
+            return cached
+        with _PROCESS_DATASET_LOCK:
+            cached = _PROCESS_DATASET_OBJECTS.get(dataset_ref)
+            if cached is not None:
+                return cached
+            return _load_process_dataset(dataset_ref)
+    raise TypeError(f"dataset_ref 타입을 처리할 수 없습니다: {type(dataset_ref)!r}")
+
+
+def _serialise_datasets_for_process(datasets: Sequence[DatasetSpec]) -> List[Dict[str, object]]:
+    handles: List[Dict[str, object]] = []
+    for dataset in datasets:
+        if not dataset.cache_info:
+            raise RuntimeError(
+                "process executor를 사용하려면 DatasetSpec.cache_info 가 필요합니다."
+            )
+        cache_data = dataset.cache_info.serialise()
+        handles.append(
+            {
+                "id": dataset.name,
+                "symbol": dataset.symbol,
+                "source_symbol": dataset.source_symbol or dataset.symbol,
+                "timeframe": dataset.timeframe,
+                "start": dataset.start,
+                "end": dataset.end,
+                "htf_timeframe": dataset.htf_timeframe,
+                "cache_root": cache_data["root"],
+                "cache_futures": cache_data["futures"],
+            }
+        )
+    return handles
 
 
 def _dataset_total_volume(dataset: "DatasetSpec") -> float:
@@ -1507,6 +1633,7 @@ def prepare_datasets(
         if cache_override:
             cache_root = Path(cache_override).expanduser()
     cache = DataCache(cache_root, futures=futures_flag)
+    cache_info = DatasetCacheInfo(root=cache_root, futures=futures_flag)
 
     base_symbol = str(params_cfg.get("symbol")) if params_cfg.get("symbol") else ""
     base_timeframe = str(params_cfg.get("timeframe")) if params_cfg.get("timeframe") else ""
@@ -1577,6 +1704,7 @@ def prepare_datasets(
                         htf=None,
                         htf_timeframe=None,
                         source_symbol=source_symbol,
+                        cache_info=cache_info,
                     )
                 )
         if not datasets:
@@ -1636,6 +1764,7 @@ def prepare_datasets(
                 htf=None,
                 htf_timeframe=None,
                 source_symbol=source_symbol,
+                cache_info=cache_info,
             )
         )
     return datasets
@@ -2111,7 +2240,7 @@ def optimisation_loop(
                 available_cpu,
             )
 
-    dataset_executor = str(search_cfg.get("dataset_executor", "process") or "process").lower()
+    dataset_executor = str(search_cfg.get("dataset_executor", "thread") or "thread").lower()
     if dataset_executor not in {"thread", "process"}:
         LOGGER.warning(
             "알 수 없는 dataset_executor '%s' 가 지정되어 thread 모드로 대체합니다.",
@@ -2818,6 +2947,7 @@ def optimisation_loop(
         if parallel_enabled:
             executor_kwargs: Dict[str, object] = {"max_workers": dataset_jobs}
             if dataset_executor == "process":
+                handles = _serialise_datasets_for_process(selected_datasets)
                 try:
                     ctx = (
                         multiprocessing.get_context(dataset_start_method)
@@ -2832,12 +2962,16 @@ def optimisation_loop(
                     ctx = multiprocessing.get_context("spawn")
                 executor_cls = ProcessPoolExecutor
                 executor_kwargs["mp_context"] = ctx
+                executor_kwargs["initializer"] = _process_pool_initializer
+                executor_kwargs["initargs"] = (handles,)
+                dataset_refs: Sequence[object] = [handle["id"] for handle in handles]
             else:
                 executor_cls = ThreadPoolExecutor
+                dataset_refs = list(selected_datasets)
 
             futures = []
             with executor_cls(**executor_kwargs) as executor:
-                for dataset in selected_datasets:
+                for dataset, dataset_ref in zip(selected_datasets, dataset_refs):
                     min_trades_requirement = _resolve_dataset_min_trades(
                         dataset,
                         constraints=constraints_cfg,
@@ -2846,7 +2980,7 @@ def optimisation_loop(
                     futures.append(
                         executor.submit(
                             _run_dataset_backtest_task,
-                            dataset,
+                            dataset_ref,
                             params,
                             fees,
                             risk,
@@ -3173,12 +3307,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-jobs",
         type=int,
         default=DEFAULT_DATASET_JOBS,
-        help="데이터셋 병렬 워커 수 (process). 기본=코어수 절반",
+        help="데이터셋 병렬 워커 수. 기본=코어수 절반",
     )
     parser.add_argument(
         "--dataset-executor",
         choices=["thread", "process"],
-        help="데이터셋 병렬 백테스트 실행기를 지정합니다",
+        help="데이터셋 병렬 백테스트 실행기를 지정합니다 (기본 thread)",
     )
     parser.add_argument(
         "--dataset-start-method",
@@ -3254,7 +3388,7 @@ def _execute_single(
 
     search_cfg = _ensure_dict(params_cfg, "search")
 
-    search_cfg.setdefault("dataset_executor", "process")
+    search_cfg.setdefault("dataset_executor", "thread")
     search_cfg.setdefault("allow_sqlite_parallel", False)
 
     batch_ctx = getattr(args, "_batch_context", None)

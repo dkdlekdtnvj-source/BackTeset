@@ -4,7 +4,7 @@
 
 ## 1. RDBStorage 설정으로 프로세스 병렬화 활성화
 
-`n_jobs>1`은 파이썬 스레드 기반이어서 GIL 영향을 받습니다. CPU 바운드 최적화에서는 **프로세스/노드 병렬**이 필수이며, 이를 위해 Optuna 스터디를 외부 RDB에 저장해야 합니다. 2025년 9월 이후 버전부터는 개별 데이터셋 백테스트도 `search.dataset_jobs`와 `search.dataset_executor`(thread/process) 설정으로 병렬화할 수 있으니, 단일 트라이얼이 여러 기간·심볼을 동시에 평가할 때 적극 활용하세요.
+`n_jobs>1`은 파이썬 스레드 기반이어서 GIL 영향을 받습니다. CPU 바운드 최적화에서는 **프로세스/노드 병렬**이 필수이며, 이를 위해 Optuna 스터디를 외부 RDB에 저장해야 합니다. 2025년 9월 이후 버전부터는 개별 데이터셋 백테스트도 `search.dataset_jobs`와 `search.dataset_executor`(thread/process) 설정으로 병렬화할 수 있으니, 단일 트라이얼이 여러 기간·심볼을 동시에 평가할 때 적극 활용하세요. 기본값은 `thread`이며, `process`를 선택하면 워커가 최초 실행 시 데이터 캐시를 자체적으로 로드하여 이후에는 직렬화 없이 동일 메모리를 재사용합니다.
 
 - 로컬 SQLite에서 병렬을 사용하면 기본적으로 경고만 출력한 뒤 잠금 충돌을 자동 재시도하면서 진행합니다. 명시적으로 병렬 사용을 허용했다고 표시하고 싶다면 `config/params.yaml`의 `search.allow_sqlite_parallel: true` 또는 CLI `--allow-sqlite-parallel`을 지정하세요. SQLite 특성상 `database is locked` 재시도가 발생할 수 있으니 모니터링을 권장합니다.
 - YAML에서 해당 옵션을 켜둔 상태라도 특정 실행을 직렬화하고 싶다면 CLI `--force-sqlite-serial`로 즉시 1 worker 제한을 적용할 수 있습니다.
