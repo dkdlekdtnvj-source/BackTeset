@@ -113,8 +113,8 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
     osc_idx = results_df.columns.get_loc("oscLen")
     stat_idx = results_df.columns.get_loc("statThreshold")
     assert osc_idx < stat_idx
-    assert {"timeframe", "htf_timeframe"}.issubset(summary_df.columns)
+    assert "timeframe" in summary_df.columns
+    assert "htf_timeframe" not in summary_df.columns
     assert (summary_df["timeframe"] == "1m").any()
     assert "Sortino_mean" in ranking_df.columns
-    assert (summary_df["htf_timeframe"] == "None").any()
-    assert (ranking_df["htf_timeframe"] == "None").any()
+    assert "htf_timeframe" not in ranking_df.columns

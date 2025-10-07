@@ -165,8 +165,14 @@ def apply_lossless_anomaly(
         flags.append(flag)
     target["AnomalyFlags"] = flags
 
-    # Indicate that the profit factor is beyond a meaningful finite range.
-    target["ProfitFactor"] = "overfactor"
+    # Preserve the original profit factor for reference and reset the
+    # public-facing value to a finite placeholder.  Downstream reports
+    # surface ``LosslessProfitFactor`` so 사용자는 손실이 없는 구간임을 알 수 있고,
+    # 기본 ``ProfitFactor`` 열은 항상 수치형(0)으로 유지됩니다.
+    original_pf = target.get("ProfitFactor", "overfactor")
+    target["LosslessProfitFactorValue"] = original_pf
+    target["LosslessProfitFactor"] = True
+    target["ProfitFactor"] = 0.0
 
     return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
 

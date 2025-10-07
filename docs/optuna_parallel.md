@@ -19,7 +19,7 @@
    ```bash
    export OPTUNA_STORAGE="postgresql://postgres:5432@127.0.0.1:5432/optuna"
    ```
-3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`, `storage_connect_timeout`, `storage_statement_timeout_ms`, `storage_isolation_level` 항목으로 PostgreSQL 풀과 타임아웃 정책을 조절할 수 있습니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>_<htf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql://postgres:5432@127.0.0.1:5432/optuna` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
+3. `config/params.yaml`의 `search.storage_url_env` 키가 기본값으로 `OPTUNA_STORAGE`을 바라보도록 구성되어 있으므로 추가 수정 없이 외부 DB가 사용됩니다. `search.storage_pool_size`, `storage_max_overflow`, `storage_pool_timeout`, `storage_pool_recycle`, `storage_connect_timeout`, `storage_statement_timeout_ms`, `storage_isolation_level` 항목으로 PostgreSQL 풀과 타임아웃 정책을 조절할 수 있습니다. 환경 변수가 비어 있으면 자동으로 로컬 SQLite(`studies/<symbol>_<ltf>.db`)로 돌아갑니다. 필요하면 CLI에서 `--storage-url-env MY_ENV`, `--storage-url postgresql://postgres:5432@127.0.0.1:5432/optuna` 플래그를 사용해 일시적으로 환경 변수 이름이나 URL을 덮어쓸 수 있습니다.
 4. 심볼/타임프레임/필터를 차례대로 고르고 싶다면 리포지토리 루트에서 `./시작` 명령을 실행하세요. 내부적으로 `python -m optimize.run --interactive`를 호출하므로 동일한 플래그를 그대로 전달할 수 있습니다.
 5. 동일한 스터디 이름(`search.study_name` 또는 CLI `--study-name`)을 공유하는 여러 프로세스를 실행하면 Optuna가 트라이얼 분배를 조율합니다.
 
@@ -29,29 +29,28 @@
 
 ### 2.1. 단일 스터디에서 타임프레임을 카테고리로 최적화
 
-- `config/params.yaml`의 `space.timeframe`/`space.htf` 항목이 이미 카테고리 선택으로 등록되어 있습니다.
+- `config/params.yaml`의 `space.timeframe` 항목이 이미 카테고리 선택으로 등록되어 있습니다.
 - 하나의 스터디에서 1,000회 이상 돌리고 싶다면 CLI나 YAML에서 `search.n_trials`을 키워주면 됩니다.
 - 장점: Optuna가 서로 다른 타임프레임 조합을 직접 비교해가며 탐색합니다.
 - 단점: 조합별 성능 로그를 분리하기 어려워집니다. 다중 프로세스에서 동일 스터디를 공유하면 통계가 섞이는 점에 유의하세요.
 
 ### 2.2. 조합별로 스터디 분리 (권장)
 
-1. CLI `--timeframe-grid` 옵션을 사용하면 쉼표/세미콜론으로 구분된 `LTF@HTF` 목록을 한 번에 실행할 수 있습니다.
+1. CLI `--timeframe-grid` 옵션을 사용하면 쉼표/세미콜론으로 구분된 LTF 목록을 한 번에 실행할 수 있습니다.
    ```bash
    python -m optimize.run \
      --params config/params.yaml \
      --backtest config/backtest.yaml \
      --symbol BINANCE:ENAUSDT \
-     --timeframe-grid "1m@15m,1m@1h,3m@15m,3m@1h,5m@15m,5m@1h" \
+     --timeframe-grid "1m,3m,5m" \
      --n-trials 1000 \
-     --enable useHTF \
      --disable useEventFilter \
      --resume-from reports/latest/bank.json \
      --pruner hyperband \
      --top-k 20
    ```
-   - 각 조합은 `reports/<timestamp>_<symbol>_<ltf>_<htf>` 형태로 출력 디렉터리가 생성되고, Optuna 스터디 이름도 `심볼_LTF_HTF_해시` 형식으로 자동 분리됩니다.
-   - 필요 시 `--study-template "{symbol_slug}_{ltf_slug}_{htf_slug}"`, `--run-tag-template "{ltf_slug}_{htf_slug}_{index:02d}"` 처럼 플레이스홀더 템플릿으로 이름 규칙을 제어할 수 있습니다. 사용 가능한 플레이스홀더: `{symbol}`, `{symbol_slug}`, `{ltf}`, `{ltf_slug}`, `{htf}`, `{htf_slug}`, `{index}`, `{total}`, `{suffix}`.
+   - 각 조합은 `reports/<timestamp>_<symbol>_<ltf>` 형태로 출력 디렉터리가 생성되고, Optuna 스터디 이름도 `심볼_LTF_해시` 형식으로 자동 분리됩니다.
+   - 필요 시 `--study-template "{symbol_slug}_{ltf_slug}"`, `--run-tag-template "{ltf_slug}_{index:02d}"`처럼 플레이스홀더 템플릿으로 이름 규칙을 제어할 수 있습니다. 사용 가능한 플레이스홀더: `{symbol}`, `{symbol_slug}`, `{ltf}`, `{ltf_slug}`, `{index}`, `{total}`, `{suffix}`.
 2. 더 큰 규모에서는 위 명령을 `GNU parallel`, `tmux`, Kubernetes 잡 등으로 감싸 동시에 여러 프로세스를 띄우면 됩니다. 동일한 RDB 스토리지를 바라보고 있으면 Optuna가 충돌 없이 트라이얼을 분산합니다.
 
 ## 3. Dask 또는 Ray 통합
@@ -75,7 +74,7 @@
   tuner = tune.Tuner(
       tune.with_resources(train_fn, {"cpu": 2}),
       tune_config=tune.TuneConfig(search_alg=search_alg, num_samples=1000),
-      param_space={"ltf": tune.grid_search(["1m", "3m", "5m"]), "htf": tune.grid_search(["15m", "1h"])}
+      param_space={"ltf": tune.grid_search(["1m", "3m", "5m"])}
   )
   tuner.fit()
   ```

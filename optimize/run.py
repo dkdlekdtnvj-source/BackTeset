@@ -63,6 +63,9 @@ from tenacity import (
     wait_exponential,
 )
 
+
+HTF_ENABLED = False
+
 def fetch_top_usdt_perp_symbols(
     limit: int = 50,
     exclude_symbols: Optional[Sequence[str]] = None,
@@ -483,7 +486,7 @@ def _slugify_symbol(symbol: str) -> str:
 
 def _slugify_timeframe(timeframe: Optional[str]) -> str:
     if not timeframe:
-        return "nohtf"
+        return ""
     return str(timeframe).replace("/", "_").replace(" ", "")
 
 
@@ -591,18 +594,19 @@ def _build_run_tag(
         params_cfg.get("timeframe")
         or (datasets[0].timeframe if datasets else "multi")
     )
-    htf = (
-        params_cfg.get("htf_timeframe")
-        or params_cfg.get("htf")
-        or (datasets[0].htf_timeframe if datasets and datasets[0].htf_timeframe else "nohtf")
-    )
-    if not htf:
-        htf = "nohtf"
+    htf = None
+    if HTF_ENABLED:
+        htf = (
+            params_cfg.get("htf_timeframe")
+            or params_cfg.get("htf")
+            or (datasets[0].htf_timeframe if datasets and datasets[0].htf_timeframe else "nohtf")
+        )
+        if not htf:
+            htf = "nohtf"
     symbol_slug = _slugify_symbol(str(symbol))
     timeframe_slug = str(timeframe).replace("/", "_")
-    htf_slug = str(htf).replace("/", "_")
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
-    parts = [timestamp, symbol_slug, timeframe_slug, htf_slug]
+    parts = [timestamp, symbol_slug, timeframe_slug]
     if run_tag:
         parts.append(run_tag)
     return timestamp, symbol_slug, timeframe_slug, "_".join(filter(None, parts))
@@ -845,8 +849,6 @@ def _resolve_output_directory(
     run_tag: Optional[str],
 ) -> Tuple[Path, Dict[str, str]]:
     ts, symbol_slug, timeframe_slug, tag = _build_run_tag(datasets, params_cfg, run_tag)
-    htf_value = _extract_primary_htf(params_cfg, datasets)
-    htf_slug = _slugify_timeframe(htf_value)
     if base is None:
         root = DEFAULT_REPORT_ROOT
         output = root / tag
@@ -854,13 +856,15 @@ def _resolve_output_directory(
         output = base
     output = _next_available_dir(output)
     output.mkdir(parents=True, exist_ok=False)
-    return output, {
+    manifest = {
         "timestamp": ts,
         "symbol": symbol_slug,
         "timeframe": timeframe_slug,
-        "htf_timeframe": htf_slug,
         "tag": tag,
     }
+    if HTF_ENABLED:
+        manifest["htf_timeframe"] = _slugify_timeframe(_extract_primary_htf(params_cfg, datasets))
+    return output, manifest
 
 
 def _write_manifest(
@@ -880,26 +884,25 @@ def _load_json(path: Path) -> Dict[str, object]:
         return {}
 
 
-def _parse_timeframe_grid(raw: Optional[str]) -> List[Tuple[str, Optional[str]]]:
+def _parse_timeframe_grid(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
-    combos: List[Tuple[str, Optional[str]]] = []
+    combos: List[str] = []
     text = str(raw).replace("\n", ",").replace(";", ",")
     for token in text.split(","):
         candidate = token.strip()
         if not candidate:
             continue
         if "@" in candidate:
-            ltf, htf = candidate.split("@", 1)
+            ltf, _ = candidate.split("@", 1)
         elif ":" in candidate:
-            ltf, htf = candidate.split(":", 1)
+            ltf, _ = candidate.split(":", 1)
         else:
-            ltf, htf = candidate, None
+            ltf = candidate
         ltf = ltf.strip()
-        htf = htf.strip() if htf is not None else None
         if not ltf:
             continue
-        combos.append((ltf, htf or None))
+        combos.append(ltf)
     return combos
 
 
@@ -926,11 +929,7 @@ def _resolve_study_storage(
 ) -> Optional[Path]:
     STUDY_ROOT.mkdir(parents=True, exist_ok=True)
     _, symbol_slug, timeframe_slug, _ = _build_run_tag(datasets, params_cfg, None)
-    htf = params_cfg.get("htf_timeframe") or (
-        datasets[0].htf_timeframe if datasets and datasets[0].htf_timeframe else "nohtf"
-    )
-    htf_slug = str(htf or "nohtf").replace("/", "_")
-    return STUDY_ROOT / f"{symbol_slug}_{timeframe_slug}_{htf_slug}.db"
+    return STUDY_ROOT / f"{symbol_slug}_{timeframe_slug}.db"
 
 
 def _study_registry_dir(storage_path: Path) -> Path:
@@ -1000,6 +999,8 @@ def _extract_primary_htf(
     params_cfg: Dict[str, object],
     datasets: Sequence["DatasetSpec"],
 ) -> Optional[str]:
+    if not HTF_ENABLED:
+        return None
     raw = params_cfg.get("htf_timeframes")
     if isinstance(raw, (list, tuple)) and len(raw) == 1:
         return str(raw[0])
@@ -1017,10 +1018,8 @@ def _default_study_name(
     space_hash: Optional[str] = None,
 ) -> str:
     _, symbol_slug, timeframe_slug, _ = _build_run_tag(datasets, params_cfg, None)
-    htf = _extract_primary_htf(params_cfg, datasets)
-    htf_slug = _slugify_timeframe(htf)
     suffix = f"_{space_hash[:6]}" if space_hash else ""
-    return f"{symbol_slug}_{timeframe_slug}_{htf_slug}{suffix}"
+    return f"{symbol_slug}_{timeframe_slug}{suffix}"
 
 
 def _discover_bank_path(
@@ -1548,15 +1547,6 @@ def prepare_datasets(
             if not ltf_candidates:
                 raise ValueError(f"{symbol_value} 데이터셋에 최소 하나의 ltf/timeframe 이 필요합니다.")
 
-            htf_candidates = _to_list(
-                entry.get("htf")
-                or entry.get("htfs")
-                or entry.get("htf_timeframes")
-                or entry.get("htf_timeframe")
-            )
-            if not htf_candidates:
-                htf_candidates = [None]
-
             start_value = entry.get("start") or entry.get("from") or base_period.get("from")
             end_value = entry.get("end") or entry.get("to") or base_period.get("to")
             if not start_value or not end_value:
@@ -1569,34 +1559,26 @@ def prepare_datasets(
             )
             for timeframe in ltf_candidates:
                 timeframe_text = str(timeframe)
-                for htf_tf in htf_candidates or [None]:
-                    htf_text = str(htf_tf) if htf_tf else None
-                    LOGGER.info(
-                        "Preparing dataset %s %s (HTF %s) %s→%s",
-                        symbol_log,
-                        timeframe_text,
-                        htf_text or "-",
-                        start,
-                        end,
+                LOGGER.info(
+                    "Preparing dataset %s %s %s→%s (LTF only)",
+                    symbol_log,
+                    timeframe_text,
+                    start,
+                    end,
+                )
+                df = cache.get(source_symbol, timeframe_text, start, end)
+                datasets.append(
+                    DatasetSpec(
+                        symbol=display_symbol,
+                        timeframe=timeframe_text,
+                        start=start,
+                        end=end,
+                        df=df,
+                        htf=None,
+                        htf_timeframe=None,
+                        source_symbol=source_symbol,
                     )
-                    df = cache.get(source_symbol, timeframe_text, start, end)
-                    htf_df = (
-                        cache.get(source_symbol, htf_text, start, end, allow_partial=True)
-                        if htf_text
-                        else None
-                    )
-                    datasets.append(
-                        DatasetSpec(
-                            symbol=display_symbol,
-                            timeframe=timeframe_text,
-                            start=start,
-                            end=end,
-                            df=df,
-                            htf=htf_df,
-                            htf_timeframe=htf_text,
-                            source_symbol=source_symbol,
-                        )
-                    )
+                )
         if not datasets:
             raise ValueError("backtest.datasets 설정에서 어떤 데이터셋도 생성되지 않았습니다.")
         return datasets
@@ -1625,21 +1607,11 @@ def prepare_datasets(
             "Backtest configuration must specify symbol(s), timeframe(s), and at least one period with 'from'/'to' dates."
         )
 
-    htf_candidates = _to_list(params_cfg.get("htf_timeframes"))
-    if not htf_candidates:
-        htf_candidates = _to_list(params_cfg.get("htf_timeframe"))
-    if not htf_candidates:
-        htf_candidates = _to_list(backtest_cfg.get("htf_timeframes"))
-    if not htf_candidates:
-        htf_candidates = _to_list(backtest_cfg.get("htf_timeframe"))
-    if not htf_candidates:
-        htf_candidates = [None]
-
     symbol_pairs = [_resolve_symbol_entry(symbol, alias_map) for symbol in symbols]
 
     datasets: List[DatasetSpec] = []
-    for (display_symbol, source_symbol), timeframe, period, htf_tf in product(
-        symbol_pairs, timeframes, periods, htf_candidates
+    for (display_symbol, source_symbol), timeframe, period in product(
+        symbol_pairs, timeframes, periods
     ):
         start = str(period["from"])
         end = str(period["to"])
@@ -1647,19 +1619,13 @@ def prepare_datasets(
             display_symbol if display_symbol == source_symbol else f"{display_symbol}→{source_symbol}"
         )
         LOGGER.info(
-            "Preparing dataset %s %s (HTF %s) %s→%s",
+            "Preparing dataset %s %s %s→%s (LTF only)",
             symbol_log,
             timeframe,
-            htf_tf or "-",
             start,
             end,
         )
         df = cache.get(source_symbol, timeframe, start, end)
-        htf = (
-            cache.get(source_symbol, str(htf_tf), start, end, allow_partial=True)
-            if htf_tf
-            else None
-        )
         datasets.append(
             DatasetSpec(
                 symbol=display_symbol,
@@ -1667,8 +1633,8 @@ def prepare_datasets(
                 start=start,
                 end=end,
                 df=df,
-                htf=htf,
-                htf_timeframe=str(htf_tf) if htf_tf else None,
+                htf=None,
+                htf_timeframe=None,
                 source_symbol=source_symbol,
             )
         )
@@ -3159,11 +3125,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="직접 심볼 지정 (예: BINANCE:ETHUSDT). 지정 시 top50 무시",
     )
     parser.add_argument("--timeframe", type=str, help="Override lower timeframe")
-    parser.add_argument("--htf", type=str, help="Override higher timeframe for confirmations")
     parser.add_argument(
         "--timeframe-grid",
         type=str,
-        help="Comma/semicolon separated LTF@HTF 조합을 일괄 실행 (예: '1m@15m,1m@1h')",
+        help="쉼표/세미콜론으로 구분된 다중 LTF 목록을 일괄 실행 (예: '1m,3m,5m')",
     )
     parser.add_argument("--start", type=str, help="Override backtest start date (ISO8601)")
     parser.add_argument("--end", type=str, help="Override backtest end date (ISO8601)")
@@ -3229,7 +3194,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--study-template",
         type=str,
-        help="--timeframe-grid 사용 시 스터디 이름 템플릿 (예: '{symbol_slug}_{ltf_slug}_{htf_slug}')",
+        help="--timeframe-grid 사용 시 스터디 이름 템플릿 (예: '{symbol_slug}_{ltf_slug}')",
     )
     parser.add_argument("--storage-url", type=str, help="Override Optuna storage URL (sqlite:/// or RDB)")
     parser.add_argument(
@@ -3281,7 +3246,6 @@ def _execute_single(
     params_cfg.setdefault("space", {})
     backtest_cfg.setdefault("symbols", backtest_cfg.get("symbols", []))
     backtest_cfg.setdefault("timeframes", backtest_cfg.get("timeframes", []))
-    backtest_cfg.setdefault("htf_timeframes", backtest_cfg.get("htf_timeframes", []))
 
     cli_tokens = list(argv or [])
 
@@ -3295,9 +3259,7 @@ def _execute_single(
 
     batch_ctx = getattr(args, "_batch_context", None)
     if batch_ctx:
-        suffix = batch_ctx.get("suffix") or (
-            f"{batch_ctx.get('ltf_slug', '')}_{batch_ctx.get('htf_slug', '')}".strip("_")
-        )
+        suffix = batch_ctx.get("suffix") or batch_ctx.get("ltf_slug") or ""
         try:
             args.run_tag = _format_batch_value(
                 batch_ctx.get("run_tag_template"),
@@ -3388,23 +3350,9 @@ def _execute_single(
 
     symbol_choices = list(dict.fromkeys(backtest_cfg.get("symbols") or ([params_cfg.get("symbol")] if params_cfg.get("symbol") else [])))
 
-    def _collect_htfs(cfg: Dict[str, object]) -> List[str]:
-        values: List[str] = []
-        raw = cfg.get("htf_timeframes")
-        if isinstance(raw, (list, tuple)):
-            values.extend(str(item) for item in raw if item)
-        single = cfg.get("htf_timeframe")
-        if single:
-            values.append(str(single))
-        return values
-
-    htf_choices = list(dict.fromkeys(_collect_htfs(backtest_cfg) or _collect_htfs(params_cfg)))
-
     selected_symbol = args.symbol or params_cfg.get("symbol") or (symbol_choices[0] if symbol_choices else None)
     selected_timeframe: Optional[str] = args.timeframe
-    selected_htf: Optional[str] = args.htf if args.htf else None
     timeframe_overridden = args.timeframe is not None
-    htf_overridden = args.htf is not None
     all_timeframes_requested = False
 
     if (
@@ -3431,14 +3379,9 @@ def _execute_single(
         params_cfg["timeframe"] = selected_timeframe
         backtest_cfg["timeframes"] = [selected_timeframe]
         _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
-    if htf_overridden and selected_htf is not None:
-        params_cfg["htf_timeframes"] = [selected_htf]
-        backtest_cfg["htf_timeframes"] = [selected_htf]
-    elif htf_choices:
-        params_cfg["htf_timeframes"] = htf_choices
-        backtest_cfg["htf_timeframes"] = htf_choices
-    params_cfg.pop("htf_timeframe", None)
-    backtest_cfg.pop("htf_timeframe", None)
+    for key in ("htf", "htf_timeframe", "htf_timeframes"):
+        params_cfg.pop(key, None)
+        backtest_cfg.pop(key, None)
 
     backtest_periods = backtest_cfg.get("periods") or []
     params_backtest = _ensure_dict(params_cfg, "backtest")
@@ -4113,21 +4056,20 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
     symbol_text = str(base_symbol) if base_symbol else "study"
     symbol_slug = _slugify_symbol(symbol_text)
     total = len(combos)
-    combo_summary = ", ".join(f"{ltf}/{htf or '-'}" for ltf, htf in combos)
+    combo_summary = ", ".join(combos)
     LOGGER.info("타임프레임 그리드 %d건 실행: %s", total, combo_summary)
 
-    for index, (ltf, htf) in enumerate(combos, start=1):
+    for index, ltf in enumerate(combos, start=1):
         batch_args = argparse.Namespace(**vars(args))
         batch_args.timeframe = ltf
-        batch_args.htf = htf
-        suffix = f"{_slugify_timeframe(ltf)}_{_slugify_timeframe(htf)}".strip("_")
+        suffix = _slugify_timeframe(ltf)
         context = {
             "index": index,
             "total": total,
             "ltf": ltf,
-            "htf": htf,
+            "htf": None,
             "ltf_slug": _slugify_timeframe(ltf),
-            "htf_slug": _slugify_timeframe(htf),
+            "htf_slug": "",
             "symbol": symbol_text,
             "symbol_slug": symbol_slug,
             "suffix": suffix,
@@ -4138,11 +4080,10 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
         }
         batch_args._batch_context = context  # type: ignore[attr-defined]
         LOGGER.info(
-            "(%d/%d) LTF=%s, HTF=%s 조합 최적화 시작",
+            "(%d/%d) LTF=%s 조합 최적화 시작",
             index,
             total,
             ltf,
-            htf or "없음",
         )
         _execute_single(batch_args, params_cfg, backtest_cfg, argv)
 
