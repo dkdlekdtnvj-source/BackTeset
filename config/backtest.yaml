@@ -8,7 +8,8 @@ data:
 
 datasets:
   - ltf: [1m, 3m, 5m]
-    htf: [5m, 15m, 60m]
+    # HTF 조합은 1차 백테스트에서 사용하지 않도록 제거했습니다.
+    # 상위봉 필터가 필요한 경우 params.yaml > overrides 에서 별도 LTF 프로필을 생성하세요.
     start: 2024-01-01
     end:   2025-09-26
 
