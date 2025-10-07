@@ -37,17 +37,16 @@ pip install -r requirements.txt
    ranges automatically).
 2. Adjust optimisation inputs in `config/params.yaml`. The sample profile now sweeps
    the squeeze-momentum core (oscillator length, signal length, BB/KC lengths & multipliers),
-   directional-flux smoothing and the SMA/EMA/HMA selection for both the flux histogram
-   and oscillator signal line, dynamic threshold options,
+   directional-flux smoothing, dynamic threshold options, higher-timeframe confirmation,
    and exit modules (ATR stop, fixed % stop, swing/pivot stops, ATR trail,
    breakeven, time stop). You can also pre-define `overrides` to pin any parameter
    on/off before a run and enable Top-K walk-forward re-ranking via `search.top_k`.
 3. Configure the sweep universe in `config/backtest.yaml`. By default it contains
   nine Binance USDT perpetual pairs (ENA, ETH, BTC, SOL, **XPLA**, **ASTER**, DOGE,
-  XRP, SUI) with lower timeframes 1m/3m/5m and a single 2024-01-01 → 2025-09-25 창.
-  The optimiser now treats the timeframe selections as categorical parameters, so
-  each Optuna trial chooses one interval while the reports highlight which choice
-  delivers the strongest Sortino/Profit Factor.
+  XRP, SUI) with lower timeframes 1m/3m/5m, higher timeframes 15m/1h, and a single
+  2024-01-01 → 2025-09-25 창. The optimiser now treats the LTF/HTF selections as
+  categorical parameters, so each Optuna trial chooses one combination while the
+  reports highlight which pairing delivers the strongest Sortino/Profit Factor.
   The `symbol_aliases` mapping lets you keep the newly-listed ticker names you
   prefer (`XPLUSDT`, `ASTERUSDT`) while the optimiser automatically fetches data
   using Binance's current instruments (`XPLAUSDT`, `ASTRUSDT`).
@@ -70,12 +69,12 @@ pip install -r requirements.txt
   ```
 
    The interactive mode lets you pick the symbol, evaluation window, leverage,
-   position size, and the boolean filters (ATR trail, pivot stops,
+   position size, and the boolean filters (HTF sync, ATR trail, pivot stops,
    breakeven, etc.) from the terminal. Command-line overrides are also
    available:
 
-   - `--symbol`, `--timeframe`, `--start`, `--end`
-   - `--timeframe-grid 1m,3m,5m` 으로 여러 타임프레임을 일괄 실행 (필요 시 `--study-template`, `--run-tag-template` 으로 이름 규칙 지정)
+   - `--symbol`, `--timeframe`, `--htf`, `--start`, `--end`
+   - `--timeframe-grid 1m@15m,3m@1h` 으로 여러 LTF/HTF 조합을 일괄 실행 (필요 시 `--study-template`, `--run-tag-template` 으로 이름 규칙 지정)
    - `--leverage`, `--qty-pct`
    - `--n-trials`
   - `--n-jobs 4` 처럼 Optuna 병렬 worker 수를 지정해 멀티코어를 활용할 수 있습니다. 기본값은 PostgreSQL 스토리지일 때 CPU 코어 수 전체를 활용하도록 자동 설정됩니다.
@@ -83,7 +82,7 @@ pip install -r requirements.txt
    - `--top-k 10` to re-rank the best Optuna trials by walk-forward out-of-sample
      performance.
   - `--storage-url-env OPTUNA_STORAGE` 로 YAML 설정 없이도 Optuna 스토리지 환경 변수를 바꿔 외부 RDB를 가리킬 수 있습니다.
-    - 실행이 한 번 끝나면 `studies/<심볼>_<ltf>_nohtf/storage.json` 파일에 사용된 스토리지 백엔드가 기록됩니다. 이후에는 YAML에 따로 URL을 넣지 않아도 동일한 심볼/타임프레임 조합으로 실행할 때 자동으로 PostgreSQL 설정을 불러옵니다.
+  - 실행이 한 번 끝나면 `studies/<심볼>_<ltf>_<htf>/storage.json` 파일에 사용된 스토리지 백엔드가 기록됩니다. 이후에는 YAML에 따로 URL을 넣지 않아도 동일한 심볼/타임프레임 조합으로 실행할 때 자동으로 PostgreSQL 설정을 불러옵니다.
 
   Outputs are written to `reports/` (`results.csv`, `results_datasets.csv`,
   `results_timeframe_summary.csv`, `results_timeframe_rankings.csv`, `best.json`,
@@ -91,12 +90,12 @@ pip install -r requirements.txt
   `best.yaml`, `trials_final.csv`). These files are flushed after **every** trial so
   you still keep the trail even if the run is interrupted. The `results_datasets.csv`
   file is especially useful for answering
-  “어떤 타임프레임이 가장 좋은가요?” because every dataset row lists the symbol,
-  timeframe, and the full metric set (Net Profit, Sortino, Profit Factor, MaxDD,
+  “어떤 LTF/HTF 조합이 가장 좋은가요?” because every dataset row lists the symbol,
+  LTF, HTF, and the full metric set (Net Profit, Sortino, Profit Factor, MaxDD,
   Win Rate, Weekly Net Profit, 등). The automatically generated
   `results_timeframe_summary.csv`/`results_timeframe_rankings.csv` pair then pivots
   those rows into 평균·중앙값 테이블과 정렬 리스트 so you can immediately compare
-  1m/3m/5m 조합. The `best.json` payload also includes the Top-K candidate
+  1m/3m/5m vs 15m/60m 조합. The `best.json` payload also includes the Top-K candidate
   summary with their walk-forward scores.
 
 ### Quick-start helper
@@ -169,7 +168,7 @@ python -m optimize.run --params config/params.yaml --backtest config/backtest.ya
 
 ## 병렬/대규모 최적화
 
-- `config/params.yaml` 의 `search.study_name` 으로 스터디 이름을 고정하면 여러 프로세스가 같은 스터디를 공유할 수 있습니다. 이름을 지정하지 않으면 자동으로 `심볼_LTF_해시` 형태가 생성돼 배치 실행 시 충돌을 방지합니다.
+- `config/params.yaml` 의 `search.study_name` 으로 스터디 이름을 고정하면 여러 프로세스가 같은 스터디를 공유할 수 있습니다. 이름을 지정하지 않으면 자동으로 `심볼_LTF_HTF_해시` 형태가 생성돼 배치 실행 시 충돌을 방지합니다.
 - `search.storage_url_env`(기본값 `OPTUNA_STORAGE`), CLI `--storage-url-env`, `--storage-url` 로 RDB 접속 정보를 지정하면 Optuna가 프로세스/노드 병렬을 지원합니다. 환경 변수가 없으면 자동으로 `studies/` 아래 SQLite 파일을 사용합니다.
 - 스터디를 처음 생성하면 `studies/<slug>/storage.json` 포인터가 같이 생성됩니다. 여기에는 최근 실행 시 사용된 스토리지 URL(비밀번호 등 민감 정보는 마스킹), 환경 변수 이름, 풀 설정이 기록되며, 다음 실행에서 `search.storage_url`/`storage_url_env` 값이 비어 있을 경우 자동으로 재사용됩니다.
 - CLI `--study-name`/`--storage-url` 플래그는 YAML 설정을 일시적으로 덮어쓰는 용도로 사용할 수 있습니다.

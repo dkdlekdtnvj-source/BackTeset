@@ -91,7 +91,33 @@ def apply_lossless_anomaly(
     gross_loss: float | None = None,
     threshold: float | None = None,
 ) -> Optional[Tuple[str, float, float, float, float]]:
-    """재계산된 손실 무시 감지를 ``target`` 에 적용합니다."""
+    """
+    Detect and record lossless or micro-loss anomalies on the provided metric
+    dictionary ``target``.  If a lossless or near-loss condition is
+    detected, set the ``ProfitFactor`` entry to the literal string
+    ``"overfactor"``.  This string conveys that the profit factor is
+    mathematically undefined or excessively large due to a lack of losses.
+
+    Parameters
+    ----------
+    target : Dict[str, float]
+        The metric dictionary to annotate.  It must contain keys such as
+        ``Trades``, ``Wins``, ``Losses``, and ``GrossLoss``.  This
+        function will update ``AnomalyFlags``, ``LosslessGrossLossThreshold``,
+        and ``ProfitFactor`` in place if an anomaly is detected.
+    trades, wins, losses, gross_loss : optional
+        Overrides for the corresponding values found in ``target``.  If
+        ``None``, values will be extracted from ``target`` instead.
+    threshold : float, optional
+        A custom threshold for micro-loss detection.  If not provided,
+        ``lossless_gross_loss_threshold`` will be used.
+
+    Returns
+    -------
+    Optional[Tuple[str, float, float, float, float]]
+        A tuple of `(flag, trades_val, wins_val, abs_loss, threshold_val)`
+        when an anomaly is detected, otherwise ``None``.
+    """
 
     def _coerce(value: object, default: float = 0.0) -> float:
         if value is None:
@@ -127,6 +153,7 @@ def apply_lossless_anomaly(
     if not flag:
         return None
 
+    # Record the anomaly flag
     existing = target.get("AnomalyFlags")
     if isinstance(existing, str):
         flags = [token.strip() for token in existing.split(",") if token.strip()]
@@ -137,8 +164,10 @@ def apply_lossless_anomaly(
     if flag not in flags:
         flags.append(flag)
     target["AnomalyFlags"] = flags
-    target["ProfitFactor"] = 0.0
-    target["LosslessProfitFactor"] = True
+
+    # Indicate that the profit factor is beyond a meaningful finite range.
+    target["ProfitFactor"] = "overfactor"
+
     return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
 
 
@@ -223,6 +252,22 @@ def sharpe_ratio(returns: pd.Series, risk_free: float = 0.0) -> float:
 
 
 def profit_factor(trades: Iterable[Trade]) -> float:
+    """
+    Compute the profit factor (gross profit divided by absolute gross loss).
+
+    In general the profit factor is defined as
+
+        PF = gross_profit / abs(gross_loss)
+
+    where gross_profit is the sum of all positive trade profits and
+    gross_loss is the sum of all negative trade profits.  If there are no
+    losing trades (i.e. gross_loss == 0), the ratio is mathematically
+    undefined and tends to infinity.  Rather than artificially capping the
+    value or coercing to 0 or 1, this function returns ``np.inf`` in the
+    lossless case.  The caller is responsible for deciding how to handle
+    extremely large or infinite profit factors (e.g. flagging as
+    "overfactor" or recording an anomaly).
+    """
     gross_profit = 0.0
     gross_loss = 0.0
 
@@ -233,8 +278,13 @@ def profit_factor(trades: Iterable[Trade]) -> float:
         else:
             gross_loss += profit
 
-    denominator = max(abs(gross_loss), EPS)
-    return float(gross_profit / denominator)
+    if gross_loss == 0.0:
+        # No losses at all; return infinity to denote undefined ratio.
+        return float('inf') if gross_profit != 0.0 else 0.0
+    denom = abs(gross_loss)
+    if denom == 0.0:
+        return 0.0
+    return float(gross_profit / denom)
 
 
 def win_rate(trades: Sequence[Trade]) -> float:
@@ -443,8 +493,22 @@ def evaluate_objective_values(
     values: List[float] = []
     for spec in objectives:
         raw = metrics.get(spec.name)
+        # Convert the raw metric to a numeric value.  Certain sentinel
+        # strings (e.g. "overfactor" or the ProfitFactor check label) are
+        # intentionally ignored during objective evaluation and treated as
+        # neutral values.  If the value cannot be coerced to float and is
+        # not one of these sentinel values, ``nan`` is used to trigger the
+        # non-finite penalty.
         try:
-            numeric = float(raw)
+            # If raw is a string sentinel, handle separately
+            if isinstance(raw, str):
+                raw_str = raw.strip().lower()
+                if raw_str in {"overfactor", "체크 필요"}:
+                    numeric = 0.0
+                else:
+                    numeric = float(raw)
+            else:
+                numeric = float(raw)
         except Exception:
             numeric = float("nan")
 

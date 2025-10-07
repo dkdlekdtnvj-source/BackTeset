@@ -8,6 +8,7 @@ data:
 
 datasets:
   - ltf: [1m, 3m, 5m]
+    htf: [5m, 15m, 60m]
     start: 2024-01-01
     end:   2025-09-26
 

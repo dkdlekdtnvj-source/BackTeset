@@ -1,11 +1,7 @@
 import math
 
-from typing import List
-
 import pandas as pd
 import pytest
-
-import optimize.strategy_model
 
 from optimize.strategy_model import (
     _bars_since_mask,
@@ -162,81 +158,6 @@ def test_short_stop_handles_missing_candidates():
     metrics = run_backtest(df, params, FEES, RISK)
 
     assert metrics["Trades"] >= 1
-
-
-@pytest.mark.parametrize("ma_type, counter_key", [("SMA", "sma"), ("EMA", "ema"), ("HMA", "hma")])
-def test_run_backtest_respects_matype(monkeypatch, ma_type, counter_key):
-    prices = [100 + i * 0.5 for i in range(40)]
-    df = _make_ohlcv(prices)
-    sig_len = 7
-    counters = {"ema": 0, "sma": 0, "hma": 0}
-
-    orig_ema = optimize.strategy_model._ema
-    orig_sma = optimize.strategy_model._sma
-    orig_hma = optimize.strategy_model._hma
-
-    def record_ema(series, length):
-        if length == sig_len:
-            counters["ema"] += 1
-        return orig_ema(series, length)
-
-    def record_sma(series, length):
-        if length == sig_len:
-            counters["sma"] += 1
-        return orig_sma(series, length)
-
-    def record_hma(series, length):
-        if length == sig_len:
-            counters["hma"] += 1
-        return orig_hma(series, length)
-
-    monkeypatch.setattr("optimize.strategy_model._ema", record_ema)
-    monkeypatch.setattr("optimize.strategy_model._sma", record_sma)
-    monkeypatch.setattr("optimize.strategy_model._hma", record_hma)
-
-    params = _base_params(
-        signalLen=sig_len,
-        maType=ma_type,
-        useDynamicThresh=False,
-        useModSqueeze=False,
-        fluxSmoothLen=1,
-    )
-
-    run_backtest(df, params, FEES, RISK)
-
-    assert counters[counter_key] >= 1
-    for name, count in counters.items():
-        if name != counter_key:
-            assert count == 0
-
-
-@pytest.mark.parametrize("flux_mode", ["SMA", "EMA", "HMA"])
-def test_run_backtest_respects_flux_smoothing(monkeypatch, flux_mode):
-    prices = [100 + (i % 5) for i in range(60)]
-    df = _make_ohlcv(prices)
-    flux_smooth_len = 4
-    recorded: List[str] = []
-
-    orig_apply = optimize.strategy_model._apply_ma
-
-    def record_apply(series, length, mode):
-        if length == flux_smooth_len:
-            recorded.append(str(mode))
-        return orig_apply(series, length, mode)
-
-    monkeypatch.setattr("optimize.strategy_model._apply_ma", record_apply)
-
-    params = _base_params(
-        fluxSmoothLen=flux_smooth_len,
-        fluxSmoothType=flux_mode,
-        useDynamicThresh=False,
-        useModFlux=False,
-        useModSqueeze=False,
-    )
-
-    run_backtest(df, params, FEES, RISK)
-
-    assert any(mode.upper() == flux_mode.upper() for mode in recorded)
 
 
 def test_security_series_resamples_monthly_timeframe():

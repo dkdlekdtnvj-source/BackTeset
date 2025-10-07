@@ -155,15 +155,7 @@ def get_search_spaces() -> List[Dict[str, object]]:
                     "kcMult": {"type": "float", "min": 1.0, "max": 2.5, "step": 0.1},
                     "fluxLen": {"type": "int", "min": 10, "max": 40, "step": 2},
                     "fluxSmoothLen": {"type": "int", "min": 1, "max": 7, "step": 1},
-                    "fluxSmoothType": {
-                        "type": "choice",
-                        "values": ["기본", "EMA", "HMA"],
-                    },
                     "useFluxHeikin": {"type": "bool"},
-                    "maType": {
-                        "type": "choice",
-                        "values": ["기본", "EMA", "HMA"],
-                    },
                     "useDynamicThresh": {"type": "bool"},
                     "useSymThreshold": {
                         "type": "bool",
