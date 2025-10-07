@@ -2006,13 +2006,13 @@ def run_backtest(
         flag, trades_val, wins_val, abs_loss, threshold = result
         if flag == LOSSLESS_ANOMALY_FLAG:
             LOGGER.info(
-                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
                 int(trades_val),
                 int(wins_val),
             )
         elif flag == MICRO_LOSS_ANOMALY_FLAG:
             LOGGER.warning(
-                "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
                 abs_loss,
                 threshold,
                 int(trades_val),
@@ -2020,7 +2020,7 @@ def run_backtest(
             )
         else:
             LOGGER.warning(
-                "ProfitFactor를 0으로 재조정하는 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                "DisplayedProfitFactor=0으로 처리한 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
                 flag,
                 int(trades_val),
                 int(wins_val),

@@ -182,6 +182,7 @@ TRIAL_PROGRESS_FIELDS = [
     "number",
     "sortino",
     "profit_factor",
+    "lossless_profit_factor_value",
     "score",
     "value",
     "state",
@@ -1801,13 +1802,13 @@ def combine_metrics(
             anomaly_flags.append(flag)
             if flag == LOSSLESS_ANOMALY_FLAG:
                 LOGGER.info(
-                    "손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                    "손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
                     int(trades_val),
                     int(wins_val),
                 )
             elif flag == MICRO_LOSS_ANOMALY_FLAG:
                 LOGGER.warning(
-                    "미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
                     abs_loss,
                     threshold,
                     int(trades_val),
@@ -1815,7 +1816,7 @@ def combine_metrics(
                 )
             else:
                 LOGGER.warning(
-                    "ProfitFactor를 0으로 재조정하는 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                    "DisplayedProfitFactor=0으로 처리한 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
                     flag,
                     int(trades_val),
                     int(wins_val),
@@ -2076,7 +2077,10 @@ def compute_score_pf_basic(
             return default
         return number
 
-    pf = _as_float(metrics.get("ProfitFactor"), 0.0)
+    pf_source = metrics.get("ProfitFactor")
+    pf = _as_float(pf_source, 0.0)
+    if isinstance(pf_source, str):
+        pf = _as_float(metrics.get("DisplayedProfitFactor"), pf)
 
     dd_raw = metrics.get("MaxDD")
     if dd_raw is None:
@@ -2106,8 +2110,10 @@ def compute_score_pf_basic(
 def _clean_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
     clean: Dict[str, object] = {}
     for key, value in metrics.items():
+        if key == "DisplayedProfitFactor":
+            continue
         if isinstance(value, (int, float, bool, str)):
-            if key == "ProfitFactor" and isinstance(value, (int, float)):
+            if key in {"ProfitFactor", "LosslessProfitFactorValue"} and isinstance(value, (int, float)):
                 clean[key] = f"{float(value):.3f}"
             else:
                 clean[key] = value
@@ -2601,6 +2607,10 @@ def optimisation_loop(
             # explicitly captured to support ordered CSV logging.
             sortino_val = _metric_value("Sortino") or trial.user_attrs.get("sortino")
             pf_val = _metric_value("ProfitFactor") or trial.user_attrs.get("profit_factor")
+            lossless_pf_val = (
+                _metric_value("LosslessProfitFactorValue")
+                or trial.user_attrs.get("lossless_profit_factor_value")
+            )
 
             row = {
                 "number": trial.number,
@@ -2609,6 +2619,7 @@ def optimisation_loop(
                 "score": trial.user_attrs.get("score"),
                 "sortino": sortino_val,
                 "profit_factor": pf_val,
+                "lossless_profit_factor_value": lossless_pf_val,
                 "trades": _metric_value("Trades"),
                 "win_rate": _metric_value("WinRate"),
                 "max_dd": max_dd_value,
@@ -2643,6 +2654,14 @@ def optimisation_loop(
             # Display Sortino and ProfitFactor for progress logs in order of importance
             sortino_display = row.get("sortino") or trial.user_attrs.get("sortino") or "-"
             pf_display = row.get("profit_factor") or trial.user_attrs.get("profit_factor") or "-"
+            if (
+                isinstance(pf_display, str)
+                and pf_display.strip().lower() == "overfactor"
+                and lossless_pf_val not in {None, ""}
+            ):
+                pf_display = f"overfactor(원본={lossless_pf_val})"
+            elif pf_display in {None, ""} and lossless_pf_val not in {None, ""}:
+                pf_display = lossless_pf_val
             trades_display = row.get("trades") if row.get("trades") not in {None, ""} else "-"
             score_display = row.get("score") if row.get("score") not in {None, ""} else "-"
             LOGGER.info(
@@ -2780,14 +2799,14 @@ def optimisation_loop(
                 flag, trades_val, wins_val, abs_loss, threshold = lossless_info
                 if flag == LOSSLESS_ANOMALY_FLAG:
                     LOGGER.info(
-                        "데이터셋 %s 에서 손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor를 0으로 재조정합니다.",
+                        "데이터셋 %s 에서 손실 거래가 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
                         dataset.name,
                         int(trades_val),
                         int(wins_val),
                     )
                 elif flag == MICRO_LOSS_ANOMALY_FLAG:
                     LOGGER.warning(
-                        "데이터셋 %s 에서 미세 손실 %.6g (임계값 %.6g 이하)로 ProfitFactor를 0으로 재조정합니다. trades=%d, wins=%d",
+                        "데이터셋 %s 에서 미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
                         dataset.name,
                         abs_loss,
                         threshold,
@@ -2796,7 +2815,7 @@ def optimisation_loop(
                     )
                 else:
                     LOGGER.warning(
-                        "데이터셋 %s 에서 ProfitFactor 0 재조정 플래그(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                        "데이터셋 %s 에서 DisplayedProfitFactor=0으로 처리한 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
                         dataset.name,
                         flag,
                         int(trades_val),
@@ -2832,6 +2851,10 @@ def optimisation_loop(
                 return
 
             pf_value = _safe_float(cleaned_metrics.get("ProfitFactor"))
+            if pf_value is None:
+                pf_value = _safe_float(cleaned_metrics.get("LosslessProfitFactorValue"))
+            if pf_value is None:
+                pf_value = _safe_float(cleaned_metrics.get("DisplayedProfitFactor"))
             if pf_value is not None and pf_value >= PF_ANOMALY_THRESHOLD:
                 # Instead of skipping the dataset entirely when the profit factor
                 # exceeds the anomaly threshold, mark the profit factor as a
@@ -2897,10 +2920,15 @@ def optimisation_loop(
                     results.append(pruned_record)
                 trial.set_user_attr("score", float(partial_score))
                 trial.set_user_attr("metrics", cleaned_partial)
-                trial.set_user_attr(
-                    "profit_factor",
-                    _safe_float(cleaned_partial.get("ProfitFactor")),
-                )
+                pf_attr = _safe_float(cleaned_partial.get("ProfitFactor"))
+                if pf_attr is None:
+                    pf_attr = _safe_float(cleaned_partial.get("DisplayedProfitFactor"))
+                trial.set_user_attr("profit_factor", pf_attr)
+                if "LosslessProfitFactorValue" in cleaned_partial:
+                    trial.set_user_attr(
+                        "lossless_profit_factor_value",
+                        cleaned_partial.get("LosslessProfitFactorValue"),
+                    )
                 trial.set_user_attr("trades", _coerce_int(cleaned_partial.get("Trades")))
                 trial.set_user_attr("valid", bool(cleaned_partial.get("Valid", True)))
                 trial.set_user_attr("pruned", True)
@@ -3059,6 +3087,8 @@ def optimisation_loop(
         pf_anomaly = False
         anomaly_info: Optional[Dict[str, object]] = None
         final_pf = _safe_float(cleaned_aggregated.get("ProfitFactor"))
+        if final_pf is None:
+            final_pf = _safe_float(cleaned_aggregated.get("DisplayedProfitFactor"))
         if final_pf is not None and final_pf >= PF_ANOMALY_THRESHOLD:
             # Mark the profit factor anomaly rather than invalidating the entire trial.
             pf_anomaly = True
@@ -3130,7 +3160,18 @@ def optimisation_loop(
         pf_display = cleaned_aggregated.get("ProfitFactor")
         if pf_display is None and pf_anomaly:
             pf_display = PROFIT_FACTOR_CHECK_LABEL
-        trial.set_user_attr("profit_factor", pf_display)
+        lossless_pf_attr = cleaned_aggregated.get("LosslessProfitFactorValue")
+        if (
+            isinstance(pf_display, str)
+            and pf_display.strip().lower() == "overfactor"
+            and lossless_pf_attr not in {None, ""}
+        ):
+            pf_user_attr = f"overfactor(원본={lossless_pf_attr})"
+        else:
+            pf_user_attr = pf_display
+        trial.set_user_attr("profit_factor", pf_user_attr)
+        if lossless_pf_attr is not None:
+            trial.set_user_attr("lossless_profit_factor_value", lossless_pf_attr)
         trial.set_user_attr("trades", _coerce_int(cleaned_aggregated.get("Trades")))
         trial.set_user_attr("valid", valid_status)
         trial.set_user_attr("pruned", False)
@@ -3200,7 +3241,10 @@ def optimisation_loop(
         if not record.get("valid", True):
             return float("-inf")
         try:
-            value = float(metrics.get("ProfitFactor", float("-inf")))
+            value_obj = metrics.get("DisplayedProfitFactor")
+            if value_obj is None:
+                value_obj = metrics.get("ProfitFactor", float("-inf"))
+            value = float(value_obj)
         except (TypeError, ValueError):
             value = float("-inf")
         if not np.isfinite(value) or value <= 0:
@@ -3881,7 +3925,10 @@ def _execute_single(
         if not record.get("valid", True):
             return float("-inf")
         try:
-            value = float(metrics.get("ProfitFactor", float("-inf")))
+            value_obj = metrics.get("DisplayedProfitFactor")
+            if value_obj is None:
+                value_obj = metrics.get("ProfitFactor", float("-inf"))
+            value = float(value_obj)
         except (TypeError, ValueError):
             value = float("-inf")
         if not np.isfinite(value) or value <= 0:

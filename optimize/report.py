@@ -61,7 +61,11 @@ def _flatten_results(results: List[Dict[str, object]]) -> Tuple[pd.DataFrame, pd
         }
         base_row.update(record.get("params", {}))
         for key, value in record.get("metrics", {}).items():
+            if key == "DisplayedProfitFactor":
+                continue
             if isinstance(value, (int, float, bool)):
+                base_row[key] = value
+            elif key in {"ProfitFactor", "LosslessProfitFactorValue"}:
                 base_row[key] = value
         aggregated_rows.append(base_row)
 
@@ -75,7 +79,11 @@ def _flatten_results(results: List[Dict[str, object]]) -> Tuple[pd.DataFrame, pd
             ds_row.update(dataset.get("meta", {}))
             ds_row.update(record.get("params", {}))
             for key, value in dataset.get("metrics", {}).items():
+                if key == "DisplayedProfitFactor":
+                    continue
                 if isinstance(value, (int, float, bool)):
+                    ds_row[key] = value
+                elif key in {"ProfitFactor", "LosslessProfitFactorValue"}:
                     ds_row[key] = value
             dataset_rows.append(ds_row)
 
@@ -151,6 +159,7 @@ def export_results(
         param_order,
         (
             "ProfitFactor",
+            "LosslessProfitFactorValue",
             "Sortino",
             "Score",
             "CompositeScore",
@@ -171,6 +180,7 @@ def export_results(
             param_order,
             (
                 "ProfitFactor",
+                "LosslessProfitFactorValue",
                 "Sortino",
                 "Score",
                 "Valid",

@@ -288,10 +288,17 @@ def test_sanitise_storage_meta_masks_password():
 
 
 def test_clean_metrics_rounds_profit_factor() -> None:
-    metrics = {"ProfitFactor": 1.98765, "Other": 10}
+    metrics = {
+        "ProfitFactor": 1.98765,
+        "LosslessProfitFactorValue": 3.3333,
+        "DisplayedProfitFactor": 0.0,
+        "Other": 10,
+    }
     cleaned = _clean_metrics(metrics)
     assert cleaned["ProfitFactor"] == "1.988"
+    assert cleaned["LosslessProfitFactorValue"] == "3.333"
     assert cleaned["Other"] == 10
+    assert "DisplayedProfitFactor" not in cleaned
 
 
 def test_clean_metrics_preserves_check_label() -> None:
