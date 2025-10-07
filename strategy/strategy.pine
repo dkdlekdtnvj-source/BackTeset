@@ -56,6 +56,20 @@ useModFlux   = input.bool(false, title="모디파이드 플럭스(DMI/ADX) 사�
 useModSqueeze = input.bool(false, title="모디파이드 스퀴즈모멘텀(ATR) 사용" , group=gMod)
 // 모멘텀 신호선 이평선 종류: 기본(SMA), EMA, HMA
 maType       = input.string("기본", title="모멘텀 신호선 타입", options=["기본","EMA","HMA"], group=gMod)
+
+// --- 7. 리스크 & 월렛 ---
+gRisk = "7. 리스크 & 월렛"
+baseQtyPercent       = input.float(30.0, title="기본 포지션 비율 (%)", group=gRisk, minval=0.0, maxval=100.0, step=0.1)
+leverage             = input.float(10.0, title="레버리지", group=gRisk, minval=0.1, maxval=100.0, step=0.1)
+useWallet            = input.bool(false, title="월렛 분리 사용", group=gRisk)
+profitReservePct     = input.float(20.0, title="이익 적립 비율 (%)", group=gRisk, minval=0.0, maxval=100.0, step=0.1, inline="reserve")
+applyReserveToSizing = input.bool(true, title="적립액 제외 후 사이징", group=gRisk, inline="reserve")
+minTradableCapital   = input.float(250.0, title="최소 운용 자본", group=gRisk, minval=0.0)
+useDailyLossGuard    = input.bool(false, title="일일 손실 한도 사용", group=gRisk)
+dailyLossLimit       = input.float(80.0, title="일일 손실 한도", group=gRisk)
+useLossStreakGuard   = input.bool(false, title="연속 손실 차단", group=gRisk)
+maxConsecutiveLosses = input.int(3, title="허용 연속 손실 수", group=gRisk, minval=1)
+maxDailyLosses       = input.int(0, title="일일 허용 손실 거래 수", group=gRisk, minval=0)
 // --- 3. 청산 옵션 ---
 gExit = "3. 청산 옵션"
 exitOpposite = input.bool(true , title="반대 신호 청산"      , group=gExit)
@@ -226,73 +240,140 @@ var float highestSinceEntry = na
 var float lowestSinceEntry  = na
 var int   holdBars          = 0
 
+var float withdrawable      = 0.0
+var float effectiveEquity   = strategy.initial_capital
+var float tradableCapital   = strategy.initial_capital
+var float peakEquity        = strategy.initial_capital
+var float dailyStartCapital = strategy.initial_capital
+var float dailyPeakCapital  = strategy.initial_capital
+var float prevNetProfit     = 0.0
+var int   dailyLosses       = 0
+var int   lossStreak        = 0
+var bool  guardFrozen       = false
+var bool  prevGuardFrozen   = false
+
 if barstate.isconfirmed
+    bool newDay = ta.change(time("D")) != 0
+    if newDay
+        dailyStartCapital := tradableCapital
+        dailyPeakCapital := tradableCapital
+        dailyLosses := 0
+        guardFrozen := false
+
+    float netProfit = strategy.netprofit
+    float openProfit = strategy.openprofit
+    float accountEquity = strategy.initial_capital + netProfit + openProfit
+
+    if useWallet
+        if netProfit > 0
+            withdrawable += netProfit * (profitReservePct / 100.0)
+        withdrawable := math.min(withdrawable, math.max(accountEquity, 0.0))
+    else
+        withdrawable := 0.0
+
+    float adjustedEquityValue = useWallet and applyReserveToSizing ? (accountEquity - withdrawable) : accountEquity
+    adjustedEquityValue := math.max(adjustedEquityValue, strategy.initial_capital * 0.01)
+    effectiveEquity := adjustedEquityValue
+    tradableCapital := adjustedEquityValue
+    peakEquity := math.max(peakEquity, accountEquity)
+    dailyPeakCapital := math.max(dailyPeakCapital, tradableCapital)
+
+    float profitDelta = netProfit - prevNetProfit
+    if profitDelta < 0
+        lossStreak += 1
+        dailyLosses += 1
+    else if profitDelta > 0
+        lossStreak := 0
+    prevNetProfit := netProfit
+
+    float dailyPnl = tradableCapital - dailyStartCapital
+    bool dailyLossBreached = useDailyLossGuard and dailyPnl <= -math.abs(dailyLossLimit)
+    bool lossStreakBreached = useLossStreakGuard and lossStreak >= maxConsecutiveLosses
+    bool lossCountBreached = maxDailyLosses > 0 and dailyLosses >= maxDailyLosses
+    bool capitalBreached = tradableCapital < minTradableCapital
+    bool guardHit = dailyLossBreached or lossStreakBreached or lossCountBreached or capitalBreached
+    if guardHit
+        guardFrozen := true
+
+    bool guardActivated = guardFrozen and not prevGuardFrozen
+    prevGuardFrozen := guardFrozen
+
+    if guardActivated
+        if strategy.position_size > 0
+            strategy.close("Long", alert_message=alertExitLong)
+        else if strategy.position_size < 0
+            strategy.close("Short", alert_message=alertExitShort)
+
+    float tradeQtyValue = close > 0 ? (tradableCapital * math.max(baseQtyPercent, 0.0) / 100.0) * leverage / close : 0.0
+    bool canTrade = not guardFrozen and tradeQtyValue > 0
+
     if strategy.position_size == 0
         holdBars := 0
         highestSinceEntry := na
         lowestSinceEntry := na
         strategy.cancel("LongStop")
         strategy.cancel("ShortStop")
-        if enterLong
-            strategy.entry("Long", strategy.long, alert_message=alertLongEntry)
-        if enterShort
-            strategy.entry("Short", strategy.short, alert_message=alertShortEntry)
+        if canTrade and enterLong
+            strategy.entry("Long", strategy.long, qty=tradeQtyValue, alert_message=alertLongEntry)
+        if canTrade and enterShort
+            strategy.entry("Short", strategy.short, qty=tradeQtyValue, alert_message=alertShortEntry)
     else
-        holdBars += 1
-        if strategy.position_size > 0
-            highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
-            float breakevenStop = na
-            if useBreakeven and not na(highestSinceEntry) and not na(atrTrailBase)
-                breakevenStop := (highestSinceEntry - strategy.position_avg_price) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
-            float trailStop = useAtrTrail and not na(highestSinceEntry) and not na(atrTrailBase) ? highestSinceEntry - atrTrailMult * atrTrailBase : na
-            float combinedStop = na
-            if useBreakeven and not na(breakevenStop)
-                combinedStop := breakevenStop
-            if useStopLoss and not na(swingLow)
-                combinedStop := na(combinedStop) ? swingLow : math.max(combinedStop, swingLow)
-            if usePivotStop and not na(pivotLow)
-                combinedStop := na(combinedStop) ? pivotLow : math.max(combinedStop, pivotLow)
-            if useAtrTrail and not na(trailStop)
-                combinedStop := na(combinedStop) ? trailStop : math.max(combinedStop, trailStop)
-            if useFixedStop
-                float fixedStop = strategy.position_avg_price * (1 - fixedStopPct / 100.0)
-                combinedStop := na(combinedStop) ? fixedStop : math.max(combinedStop, fixedStop)
-            if useAtrStop and not na(atrBase)
-                float atrStopVal = strategy.position_avg_price - atrBase * atrStopMult
-                combinedStop := na(combinedStop) ? atrStopVal : math.max(combinedStop, atrStopVal)
-            if not na(combinedStop)
-                strategy.exit("LongStop", from_entry="Long", stop=combinedStop, alert_message=alertExitLong)
-            if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
-                strategy.close("Long", alert_message=alertExitLong)
-            else if exitLongOpposite or (exitLongFade and holdBars >= 1)
-                strategy.close("Long", alert_message=alertExitLong)
-        else if strategy.position_size < 0
-            lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
-            float breakevenStop = na
-            if useBreakeven and not na(lowestSinceEntry) and not na(atrTrailBase)
-                breakevenStop := (strategy.position_avg_price - lowestSinceEntry) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
-            float trailStop = useAtrTrail and not na(lowestSinceEntry) and not na(atrTrailBase) ? lowestSinceEntry + atrTrailMult * atrTrailBase : na
-            float combinedStop = na
-            if useBreakeven and not na(breakevenStop)
-                combinedStop := breakevenStop
-            if useStopLoss and not na(swingHigh)
-                combinedStop := na(combinedStop) ? swingHigh : math.min(combinedStop, swingHigh)
-            if usePivotStop and not na(pivotHigh)
-                combinedStop := na(combinedStop) ? pivotHigh : math.min(combinedStop, pivotHigh)
-            if useAtrTrail and not na(trailStop)
-                combinedStop := na(combinedStop) ? trailStop : math.min(combinedStop, trailStop)
-            if useFixedStop
-                float fixedStop = strategy.position_avg_price * (1 + fixedStopPct / 100.0)
-                combinedStop := na(combinedStop) ? fixedStop : math.min(combinedStop, fixedStop)
-            if useAtrStop and not na(atrBase)
-                float atrStopVal = strategy.position_avg_price + atrBase * atrStopMult
-                combinedStop := na(combinedStop) ? atrStopVal : math.min(combinedStop, atrStopVal)
-            if not na(combinedStop)
-                strategy.exit("ShortStop", from_entry="Short", stop=combinedStop, alert_message=alertExitShort)
-            if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
-                strategy.close("Short", alert_message=alertExitShort)
-            else if exitShortOpposite or (exitShortFade and holdBars >= 1)
-                strategy.close("Short", alert_message=alertExitShort)
+        if not guardActivated
+            holdBars += 1
+            if strategy.position_size > 0
+                highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
+                float breakevenStop = na
+                if useBreakeven and not na(highestSinceEntry) and not na(atrTrailBase)
+                    breakevenStop := (highestSinceEntry - strategy.position_avg_price) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
+                float trailStop = useAtrTrail and not na(highestSinceEntry) and not na(atrTrailBase) ? highestSinceEntry - atrTrailMult * atrTrailBase : na
+                float combinedStop = na
+                if useBreakeven and not na(breakevenStop)
+                    combinedStop := breakevenStop
+                if useStopLoss and not na(swingLow)
+                    combinedStop := na(combinedStop) ? swingLow : math.max(combinedStop, swingLow)
+                if usePivotStop and not na(pivotLow)
+                    combinedStop := na(combinedStop) ? pivotLow : math.max(combinedStop, pivotLow)
+                if useAtrTrail and not na(trailStop)
+                    combinedStop := na(combinedStop) ? trailStop : math.max(combinedStop, trailStop)
+                if useFixedStop
+                    float fixedStop = strategy.position_avg_price * (1 - fixedStopPct / 100.0)
+                    combinedStop := na(combinedStop) ? fixedStop : math.max(combinedStop, fixedStop)
+                if useAtrStop and not na(atrBase)
+                    float atrStopVal = strategy.position_avg_price - atrBase * atrStopMult
+                    combinedStop := na(combinedStop) ? atrStopVal : math.max(combinedStop, atrStopVal)
+                if not na(combinedStop)
+                    strategy.exit("LongStop", from_entry="Long", stop=combinedStop, alert_message=alertExitLong)
+                if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
+                    strategy.close("Long", alert_message=alertExitLong)
+                else if exitLongOpposite or (exitLongFade and holdBars >= 1)
+                    strategy.close("Long", alert_message=alertExitLong)
+            else if strategy.position_size < 0
+                lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+                float breakevenStop = na
+                if useBreakeven and not na(lowestSinceEntry) and not na(atrTrailBase)
+                    breakevenStop := (strategy.position_avg_price - lowestSinceEntry) >= atrTrailBase * breakevenMult ? strategy.position_avg_price : na
+                float trailStop = useAtrTrail and not na(lowestSinceEntry) and not na(atrTrailBase) ? lowestSinceEntry + atrTrailMult * atrTrailBase : na
+                float combinedStop = na
+                if useBreakeven and not na(breakevenStop)
+                    combinedStop := breakevenStop
+                if useStopLoss and not na(swingHigh)
+                    combinedStop := na(combinedStop) ? swingHigh : math.min(combinedStop, swingHigh)
+                if usePivotStop and not na(pivotHigh)
+                    combinedStop := na(combinedStop) ? pivotHigh : math.min(combinedStop, pivotHigh)
+                if useAtrTrail and not na(trailStop)
+                    combinedStop := na(combinedStop) ? trailStop : math.min(combinedStop, trailStop)
+                if useFixedStop
+                    float fixedStop = strategy.position_avg_price * (1 + fixedStopPct / 100.0)
+                    combinedStop := na(combinedStop) ? fixedStop : math.min(combinedStop, fixedStop)
+                if useAtrStop and not na(atrBase)
+                    float atrStopVal = strategy.position_avg_price + atrBase * atrStopMult
+                    combinedStop := na(combinedStop) ? atrStopVal : math.min(combinedStop, atrStopVal)
+                if not na(combinedStop)
+                    strategy.exit("ShortStop", from_entry="Short", stop=combinedStop, alert_message=alertExitShort)
+                if useTimeStop and maxHoldBars > 0 and holdBars >= maxHoldBars
+                    strategy.close("Short", alert_message=alertExitShort)
+                else if exitShortOpposite or (exitShortFade and holdBars >= 1)
+                    strategy.close("Short", alert_message=alertExitShort)
 
 // =================================================================================
 // === 시각화 =====================================================================
