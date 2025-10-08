@@ -824,7 +824,10 @@ def _vectorbt_backtest(
         raw_returns = raw_returns_attr()
     else:
         raw_returns = raw_returns_attr
-    returns = pd.Series(np.asarray(raw_returns), index=parsed.df.index)
+    returns = pd.Series(
+        np.asarray(raw_returns, dtype=float), index=parsed.df.index, dtype=float
+    )
+    returns.name = "returns"
 
     records = pf.trades.records_readable
     trades: List[Trade] = []
@@ -860,6 +863,8 @@ def _vectorbt_backtest(
             trades.append(trade)
 
     metrics = aggregate_metrics(trades, returns, simple=False)
+    metrics["TradesList"] = trades
+    metrics["Returns"] = returns
     metrics.setdefault("InitialCapital", parsed.initial_capital)
     metrics.setdefault("Leverage", parsed.leverage)
     metrics.setdefault("Commission", parsed.commission_pct)

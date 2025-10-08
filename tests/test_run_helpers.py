@@ -1,16 +1,19 @@
-from typing import Optional
+import csv
+from datetime import UTC, datetime
+from typing import Dict, List, Optional
 
 import logging
 from pathlib import Path
-from typing import Dict
 
 import pandas as pd
 import pytest
+from optuna.trial import TrialState
 
 from optimize.run import (
     PROFIT_FACTOR_CHECK_LABEL,
     DatasetCacheInfo,
     DatasetSpec,
+    optimisation_loop,
     _configure_parallel_workers,
     _apply_study_registry_defaults,
     _clean_metrics,
@@ -307,6 +310,127 @@ def test_clean_metrics_preserves_check_label() -> None:
     metrics = {"ProfitFactor": PROFIT_FACTOR_CHECK_LABEL}
     cleaned = _clean_metrics(metrics)
     assert cleaned["ProfitFactor"] == PROFIT_FACTOR_CHECK_LABEL
+
+
+def test_log_trial_preserves_zero_metrics(monkeypatch, tmp_path):
+    dataset = _make_dataset("1m", None)
+
+    metrics_payload = {
+        "Sortino": 0.0,
+        "ProfitFactor": 0.0,
+        "LosslessProfitFactorValue": 0.0,
+        "Trades": 0.0,
+        "WinRate": 0.0,
+        "MaxDD": 12.3,
+        "Valid": 1.0,
+    }
+
+    class DummyTrial:
+        def __init__(self, number: int):
+            self.number = number
+            self.value = 0.0
+            self.state = TrialState.COMPLETE
+            self.params: Dict[str, object] = {}
+            self.datetime_complete = datetime.now(UTC)
+            self.user_attrs: Dict[str, object] = {
+                "metrics": metrics_payload,
+                "sortino": 0.0,
+                "profit_factor": 0.0,
+                "lossless_profit_factor_value": 0.0,
+                "score": 0.0,
+                "valid": True,
+                "pruned": False,
+                "skipped_datasets": [],
+            }
+
+    class DummyStudy:
+        def __init__(self, trial: DummyTrial):
+            self._trial = trial
+            self._trials: List[DummyTrial] = []
+            self._attrs: Dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self._attrs[key] = value
+
+        def enqueue_trial(self, *args, **kwargs) -> None:
+            return None
+
+        def get_trials(self, deepcopy: bool = False):
+            return list(self._trials)
+
+        @property
+        def trials(self):
+            return list(self._trials)
+
+        def trials_dataframe(self):
+            return pd.DataFrame()
+
+        @property
+        def best_trial(self):
+            return self._trial
+
+        def optimize(
+            self,
+            objective,
+            n_trials,
+            n_jobs,
+            show_progress_bar,
+            callbacks,
+            gc_after_trial,
+            catch,
+        ):
+            self._trials.append(self._trial)
+            for callback in callbacks:
+                callback(self, self._trial)
+            raise StopIteration
+
+    dummy_trial = DummyTrial(0)
+    dummy_study = DummyStudy(dummy_trial)
+
+    def fake_create_study(*args, **kwargs):
+        return dummy_study
+
+    monkeypatch.setattr("optimize.run.optuna.create_study", fake_create_study)
+
+    captured_logs: List[str] = []
+
+    def fake_info(message, *args, **kwargs):
+        text = message % args if args else message
+        captured_logs.append(text)
+
+    monkeypatch.setattr("optimize.run.LOGGER.info", fake_info)
+    monkeypatch.setattr("optimize.run.backtest_cfg", {}, raising=False)
+
+    params_cfg: Dict[str, object] = {"space": {}, "search": {"n_trials": 1}}
+    objectives = [{"name": "NetProfit", "goal": "maximize"}]
+
+    with pytest.raises(StopIteration):
+        optimisation_loop(
+            [dataset],
+            params_cfg,
+            objectives,
+            fees={},
+            risk={},
+            log_dir=tmp_path,
+        )
+
+    progress_path = tmp_path / "trials_progress.csv"
+    assert progress_path.exists()
+
+    with progress_path.open("r", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert pytest.approx(float(row["sortino"])) == 0.0
+    assert pytest.approx(float(row["profit_factor"])) == 0.0
+    assert pytest.approx(float(row["lossless_profit_factor_value"])) == 0.0
+
+    progress_logs = [entry for entry in captured_logs if "작업 진행상황" in entry]
+    assert progress_logs, "진행 로그가 기록되어야 합니다."
+    latest = progress_logs[-1]
+    assert "Sortino=0.0" in latest
+    assert "ProfitFactor=0.0" in latest
 
 
 def test_configure_parallel_workers_single_dataset(caplog):

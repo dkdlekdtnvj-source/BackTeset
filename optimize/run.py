@@ -2672,12 +2672,15 @@ def optimisation_loop(
 
             # Extract metrics for the trial.  Sortino and ProfitFactor are
             # explicitly captured to support ordered CSV logging.
-            sortino_val = _metric_value("Sortino") or trial.user_attrs.get("sortino")
-            pf_val = _metric_value("ProfitFactor") or trial.user_attrs.get("profit_factor")
-            lossless_pf_val = (
-                _metric_value("LosslessProfitFactorValue")
-                or trial.user_attrs.get("lossless_profit_factor_value")
-            )
+            sortino_val = _metric_value("Sortino")
+            if sortino_val is None:
+                sortino_val = trial.user_attrs.get("sortino")
+            pf_val = _metric_value("ProfitFactor")
+            if pf_val is None:
+                pf_val = trial.user_attrs.get("profit_factor")
+            lossless_pf_val = _metric_value("LosslessProfitFactorValue")
+            if lossless_pf_val is None:
+                lossless_pf_val = trial.user_attrs.get("lossless_profit_factor_value")
 
             row = {
                 "number": trial.number,
@@ -2719,8 +2722,17 @@ def optimisation_loop(
             )
             total_display: object = n_trials if n_trials else len(trials_snapshot)
             # Display Sortino and ProfitFactor for progress logs in order of importance
-            sortino_display = row.get("sortino") or trial.user_attrs.get("sortino") or "-"
-            pf_display = row.get("profit_factor") or trial.user_attrs.get("profit_factor") or "-"
+            sortino_display = row.get("sortino")
+            if sortino_display in {None, ""}:
+                sortino_display = trial.user_attrs.get("sortino")
+            if sortino_display in {None, ""}:
+                sortino_display = "-"
+
+            pf_display = row.get("profit_factor")
+            if pf_display in {None, ""}:
+                pf_display = trial.user_attrs.get("profit_factor")
+            if pf_display in {None, ""}:
+                pf_display = "-"
             if (
                 isinstance(pf_display, str)
                 and pf_display.strip().lower() == "overfactor"

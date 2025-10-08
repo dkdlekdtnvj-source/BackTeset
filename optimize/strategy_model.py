@@ -113,7 +113,7 @@ LOGGER = logging.getLogger(__name__)
 # =====================================================================================
 
 
-@njit(parallel=True)  # type: ignore[misc]
+@njit  # type: ignore[misc]
 def _rolling_rma_last(values: np.ndarray, length: int) -> np.ndarray:
     """슬라이딩 윈도우에 대해 Wilder RMA의 마지막 값을 계산합니다."""
 
@@ -122,17 +122,25 @@ def _rolling_rma_last(values: np.ndarray, length: int) -> np.ndarray:
     for i in range(n):
         result[i] = np.nan
 
-    if length <= 0:
+    if length <= 0 or n == 0:
         return result
 
-    # Outer loop parallelised using prange.  Each iteration computes the last RMA
-    # for the window ending at ``idx`` independently of other indices.
-    for idx in prange(length - 1, n):
-        start = idx - length + 1
-        acc = values[start]
-        for j in range(start + 1, idx + 1):
-            acc = (acc * (length - 1) + values[j]) / length
-        result[idx] = acc
+    alpha = 1.0 / float(length)
+    window_sum = 0.0
+    ready = False
+    prev_rma = 0.0
+
+    for idx in range(n):
+        value = float(values[idx])
+        if not ready:
+            window_sum += value
+            if idx + 1 == length:
+                prev_rma = window_sum / float(length)
+                result[idx] = prev_rma
+                ready = True
+        else:
+            prev_rma = prev_rma + alpha * (value - prev_rma)
+            result[idx] = prev_rma
 
     return result
 
