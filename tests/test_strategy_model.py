@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 import pandas as pd
 import pytest
 
@@ -259,3 +261,17 @@ def test_volatility_guard_atr_matches_reference():
             expected.append(0.0)
 
     assert computed == pytest.approx(expected)
+
+
+def test_rolling_rma_last_matches_recursive_formula():
+    values = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float)
+
+    result = _rolling_rma_last(values, 3)
+
+    assert np.isnan(result[0])
+    assert np.isnan(result[1])
+    expected_tail = [2.0, 2.6666666667, 3.4444444444]
+    assert result[2:] == pytest.approx(expected_tail)
+
+    zero_length = _rolling_rma_last(values, 0)
+    assert np.isnan(zero_length).all()
