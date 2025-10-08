@@ -166,8 +166,10 @@ DEFAULT_POSTGRES_STORAGE_URL = (
 POSTGRES_PREFIXES = ("postgresql://", "postgresql+psycopg://")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REPORT_ROOT = Path("reports")
-STUDY_ROOT = Path("studies")
+DEFAULT_STORAGE_ROOT = Path(r"D:\OneDrive - usk.ac.kr\문서\backtest")
+DEFAULT_REPORT_ROOT = DEFAULT_STORAGE_ROOT / "백테스트"
+DEFAULT_LOG_ROOT = DEFAULT_STORAGE_ROOT / "로그"
+STUDY_ROOT = DEFAULT_STORAGE_ROOT / "스터디"
 NON_FINITE_PENALTY = -1e12
 PF_ANOMALY_THRESHOLD = 50.0
 MIN_VOLUME_THRESHOLD = 100.0
@@ -387,6 +389,8 @@ BASIC_FACTOR_KEYS = {
     "fluxLen",
     "fluxSmoothLen",
     "useFluxHeikin",
+    "useModFlux",
+    "useModSqueeze",
     # Dynamic threshold & gates
     "useDynamicThresh",
     "useSymThreshold",
@@ -395,6 +399,14 @@ BASIC_FACTOR_KEYS = {
     "sellThreshold",
     "dynLen",
     "dynMult",
+    "maType",
+    # EMA/HMA filters
+    "useEma",
+    "emaFastLen",
+    "emaSlowLen",
+    "emaMode",
+    "useHmaFilter",
+    "hmaLen",
     # Exit logic
     "exitOpposite",
     "useMomFade",
@@ -579,10 +591,32 @@ def _next_available_dir(path: Path) -> Path:
 
 def _configure_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "run.log"
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    LOGGER.addHandler(handler)
+    DEFAULT_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+
+    run_identifier = log_dir.parent.name or "run"
+    central_dir = DEFAULT_LOG_ROOT / run_identifier
+    central_dir.mkdir(parents=True, exist_ok=True)
+
+    target_paths = [log_dir / "run.log", central_dir / "run.log"]
+
+    for handler in list(LOGGER.handlers):
+        if isinstance(handler, logging.FileHandler):
+            try:
+                existing_path = Path(handler.baseFilename)
+            except Exception:
+                continue
+            if existing_path in target_paths:
+                LOGGER.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    for path in target_paths:
+        handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+        handler.setFormatter(formatter)
+        LOGGER.addHandler(handler)
 
 
 def _build_run_tag(
@@ -856,9 +890,11 @@ def _resolve_output_directory(
     ts, symbol_slug, timeframe_slug, tag = _build_run_tag(datasets, params_cfg, run_tag)
     if base is None:
         root = DEFAULT_REPORT_ROOT
+        root.mkdir(parents=True, exist_ok=True)
         output = root / tag
     else:
         output = base
+        output.parent.mkdir(parents=True, exist_ok=True)
     output = _next_available_dir(output)
     output.mkdir(parents=True, exist_ok=False)
     manifest = {
@@ -3361,7 +3397,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Pine strategy optimisation")
     parser.add_argument("--params", type=Path, default=Path("config/params.yaml"))
     parser.add_argument("--backtest", type=Path, default=Path("config/backtest.yaml"))
-    parser.add_argument("--output", type=Path, help="Custom output directory (defaults to timestamped folder)")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help=(
+            "Custom output directory (기본 저장 위치: "
+            f"{DEFAULT_REPORT_ROOT}/<timestamped-folder>)"
+        ),
+    )
     parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--symbol", type=str, help="Override symbol to optimise")
     parser.add_argument(
@@ -4229,7 +4272,7 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
         auto_list = _load_top_list()
         import csv
 
-        reports_dir = Path("reports")
+        reports_dir = DEFAULT_REPORT_ROOT
         reports_dir.mkdir(parents=True, exist_ok=True)
         csv_path = reports_dir / "top50_usdt_perp.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
