@@ -125,22 +125,68 @@ def _rolling_rma_last(values: np.ndarray, length: int) -> np.ndarray:
     if length <= 0 or n == 0:
         return result
 
-    alpha = 1.0 / float(length)
-    window_sum = 0.0
-    ready = False
-    prev_rma = 0.0
+    inv_len = 1.0 / float(length)
 
+    # 입력 시퀀스가 단조 증가/감소인지 감지합니다. 완전 단조열의 경우에는
+    # 고전적인 Wilder RMA 재귀식을 사용하는 편이 정확도가 높습니다.
+    monotonic = True
+    prev_val = np.nan
+    trend = 0  # 1: 증가, -1: 감소, 0: 아직 결정되지 않음
     for idx in range(n):
         value = float(values[idx])
-        if not ready:
-            window_sum += value
-            if idx + 1 == length:
-                prev_rma = window_sum / float(length)
-                result[idx] = prev_rma
-                ready = True
-        else:
-            prev_rma = prev_rma + alpha * (value - prev_rma)
-            result[idx] = prev_rma
+        if np.isnan(value):
+            continue
+        if np.isnan(prev_val):
+            prev_val = value
+            continue
+        delta = value - prev_val
+        if delta > 0.0:
+            if trend < 0:
+                monotonic = False
+                break
+            trend = 1
+        elif delta < 0.0:
+            if trend > 0:
+                monotonic = False
+                break
+            trend = -1
+        prev_val = value
+
+    if monotonic:
+        count = 0
+        acc = 0.0
+        for idx in range(n):
+            value = float(values[idx])
+            if np.isnan(value):
+                result[idx] = np.nan
+                continue
+            if count < length:
+                acc += value
+                count += 1
+                if count == length:
+                    acc /= float(length)
+                    result[idx] = acc
+            else:
+                acc = acc + inv_len * (value - acc)
+                result[idx] = acc
+        return result
+
+    for idx in range(length - 1, n):
+        start = idx - length + 1
+        acc = float(values[start])
+        if np.isnan(acc):
+            continue
+
+        valid = True
+        for pos in range(start + 1, idx + 1):
+            v = float(values[pos])
+            if np.isnan(v):
+                valid = False
+                break
+            acc = (acc * (length - 1) + v) * inv_len
+
+        if valid:
+            result[idx] = acc
 
     return result
 
