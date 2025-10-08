@@ -32,19 +32,24 @@ objective:
     weight: 1.0
 
 constraints:
-  min_trades_test: 12   # 테스트 구간에서 최소 거래 수 (없으면 강한 패널티)
+  min_trades_test: 50   # 최소 거래 수. 거래수가 50 미만이면 학습 점수에 반영하지 않습니다.
   max_dd_pct: 70        # MaxDD 70% 초과면 패널티
 
 space:
-  # === Squeeze Momentum Deluxe 로직에 맞춘 최적화 공간 ===
+# === 스퀴즈 모멘텀 전략 최적화 공간 ===
 
   # --- 1. 핵심 오실레이터 설정 ---
-  # Deluxe 로직에서는 oscLen이 모멘텀 채널과 스퀴즈 계산 모두에 영향을 줌
+  # 모멘텀 오실레이터 길이(oscLen)와 신호 길이(signalLen)는 회귀 및 스무딩 길이를 결정하며
+  # 스퀴즈 감지 파라미터와는 독립적으로 작동합니다.
   oscLen:         { type: int,   min: 10,  max: 40, step: 2 }
   signalLen:      { type: int,   min: 2,   max: 12, step: 1 }
 
   # --- 2. 스퀴즈 감지용 KC 채널 ---
-  # Deluxe 로직은 BB 대신 KC와 ATR만으로 스퀴즈를 감지함
+  # Keltner Channel(KC) 파라미터로 스퀴즈를 감지합니다.  모멘텀 계산 스타일은 `momStyle`
+  # 파라미터를 통해 선택됩니다.  KC 스타일은 최고가/최저가의 평균을 기준으로 계산하고,
+  # AVG 스타일은 볼린저밴드 중간선과 KC 평균선의 평균을 사용하며, Deluxe 스타일은
+  # hl2 기반 중간선(최고/최저 기반)과 볼린저 중간선을 평균해 사용합니다.  Mod 스타일은
+  # midline(hl2+KC 중간값)을 ATR 로 정규화한 값으로 모멘텀을 계산합니다.
   kcLen:          { type: int,   min: 10,  max: 30, step: 2 }
   kcMult:         { type: float, min: 1.0, max: 2.5, step: 0.1 }
 
@@ -53,7 +58,7 @@ space:
   fluxSmoothLen:  { type: int,   min: 1,   max: 7,  step: 1 }
   useFluxHeikin:  { type: bool }
   useModFlux:     { type: bool }
-  useModSqueeze:  { type: bool }
+  momStyle:       { type: choice, values: [KC, AVG, Deluxe, Mod] }
   maType:         { type: choice, values: [SMA, EMA, HMA] }
 
   # --- 4. 동적 임계값 및 진입 조건 ---
@@ -64,12 +69,6 @@ space:
   sellThreshold:        { type: float, min: 20.0, max: 60.0, step: 2.0 }
   dynLen:               { type: int,   min: 15,  max: 60, step: 5 }
   dynMult:              { type: float, min: 0.8, max: 2.0, step: 0.1 }
-  useEma:               { type: bool }
-  emaFastLen:           { type: int,   min: 4,  max: 30, step: 1,  requires: useEma }
-  emaSlowLen:           { type: int,   min: 10, max: 80, step: 2,  requires: useEma }
-  emaMode:              { type: choice, values: [Trend, Crossover], requires: useEma }
-  useHmaFilter:         { type: bool }
-  hmaLen:               { type: int,   min: 10, max: 80, step: 2,  requires: useHmaFilter }
 
   # --- 5. 청산 로직 ---
   exitOpposite:   { type: bool }

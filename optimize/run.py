@@ -390,7 +390,8 @@ BASIC_FACTOR_KEYS = {
     "fluxSmoothLen",
     "useFluxHeikin",
     "useModFlux",
-    "useModSqueeze",
+    # Squeeze momentum style selection (KC/AVG/Deluxe/Mod)
+    "momStyle",
     # Dynamic threshold & gates
     "useDynamicThresh",
     "useSymThreshold",
@@ -400,13 +401,6 @@ BASIC_FACTOR_KEYS = {
     "dynLen",
     "dynMult",
     "maType",
-    # EMA/HMA filters
-    "useEma",
-    "emaFastLen",
-    "emaSlowLen",
-    "emaMode",
-    "useHmaFilter",
-    "hmaLen",
     # Exit logic
     "exitOpposite",
     "useMomFade",
@@ -2245,9 +2239,16 @@ def compute_score_pf_basic(
 
     base = pf
 
+    # If the number of trades is below the minimum threshold, we still compute
+    # metrics but do not reward the trial in the optimisation.  Returning
+    # zero neutralises the effect in ranking, effectively excluding it from
+    # learning while preserving metrics for reporting.  No further
+    # adjustments are applied.
     if trades < min_trades:
-        base -= (min_trades - trades) * 0.2
+        return 0.0
 
+    # Apply a drawdown penalty when the maximum drawdown exceeds the
+    # configured threshold.  The penalty scales linearly with the excess.
     if dd_pct > max_dd:
         base -= (dd_pct - max_dd) * 0.05
 

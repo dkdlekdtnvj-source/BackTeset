@@ -845,8 +845,43 @@ def run_backtest(
 
     # 모디파이드 플럭스 및 스퀴즈 사용 여부와 신호선 타입
     use_mod_flux = bool_param("useModFlux", False)
-    use_mod_squeeze = bool_param("useModSqueeze", False)
+    # 선택할 모멘텀 계산 스타일.  기본값은 "KC"이며, "AVG", "Deluxe", "Mod" 가운데 하나로 지정할 수
+    # 있습니다.  이 값은 스퀴즈 모멘텀에서 기준선을 어떻게 정의하고 ATR 정규화를 적용할지 결정합니다.
+    mom_style_raw = str_param("momStyle", "KC")
+    # 정규화: 영문/한글 입력을 모두 처리하도록 소문자로 변환 후 매핑합니다. 기본값은 "kc" 스타일입니다.
+    mom_style_tmp = str(mom_style_raw).strip().lower()
+    if mom_style_tmp in {"kc", "basic", "원본", "기본"}:
+        mom_style = "kc"
+    elif mom_style_tmp in {"avg", "average", "avgstyle", "average_style"}:
+        mom_style = "avg"
+    elif mom_style_tmp in {"deluxe", "dx", "delux", "디럭스"}:
+        mom_style = "deluxe"
+    elif mom_style_tmp in {"mod", "modified", "modsqueeze", "모디파이드", "modded"}:
+        mom_style = "mod"
+    else:
+        mom_style = "kc"
+    # -------------------------------------------------------------------------
+    # Momentum signal MA type.  Accept both the English identifiers (SMA, EMA,
+    # HMA) and the Korean label used in the Pine script ("기본").  Some users
+    # reported that the maType parameter was not being honoured because the
+    # default value in the YAML profile is "SMA" while the Pine script uses
+    # "기본" (meaning "basic").  To ensure both strings resolve to the same
+    # behaviour we normalise the value here.  If the parameter is unset or
+    # cannot be parsed, fall back to SMA.
     ma_type = str_param("maType", "SMA")
+    if ma_type is None:
+        ma_type = "SMA"
+    # Normalise to lower‑case and map Korean/English synonyms to SMA
+    mt_normalised = str(ma_type).strip().lower()
+    if mt_normalised in {"기본", "basic", "sma", "default"}:
+        ma_type = "SMA"
+    elif mt_normalised in {"ema"}:
+        ma_type = "EMA"
+    elif mt_normalised in {"hma"}:
+        ma_type = "HMA"
+    else:
+        # Unknown value – default to SMA
+        ma_type = "SMA"
 
     use_dynamic_thresh = bool_param("useDynamicThresh", True)
     use_sym_threshold = bool_param("useSymThreshold", False)
@@ -1113,22 +1148,48 @@ def run_backtest(
     tick_size = _estimate_tick(df["close"])
     slip_value = tick_size * slippage_ticks
 
+    # ATR 계산: 오실레이터 길이와 KC 길이 기반으로 각각 계산합니다.
     atr_len_series = _atr(df, osc_len)
     atr_primary = _atr(df, kc_len)
-    # 스퀴즈 모멘텀 입력값 계산: 기본은 midline 차이, 모디파이드는 ATR 로 정규화
-    # KC midline 계산을 위해 중간값들을 선계산
+    # === 스퀴즈 모멘텀 입력값 계산 ===
+    # 다양한 모멘텀 스타일(KC/AVG/Deluxe/Mod)에 따라 기준선을 구성하고 ATR 정규화 여부를 결정합니다.
+    # 공통 선계산
     hl2 = (df["high"] + df["low"]) / 2.0
+    # --- KC 스타일을 위한 최고/최저 기반 중앙값 ---
+    highest_high = df["high"].rolling(kc_len).max()
+    lowest_low = df["low"].rolling(kc_len).min()
+    mean_kc = (highest_high + lowest_low) / 2.0
+    # --- BB 및 KC 선계산 ---
+    # Bollinger Band 중간선은 종가의 단순 이동평균으로 정의합니다.
+    bb_basis_close = _sma(df["close"], kc_len)
+    # Keltner Channel 기반 중심선 계산을 위해 hl2 를 사용합니다.
     kc_basis = _sma(hl2, kc_len)
     kc_range_series = atr_primary * float(kc_mult)
     kc_upper = kc_basis + kc_range_series
     kc_lower = kc_basis - kc_range_series
     kc_average = (kc_upper + kc_lower) / 2.0
     midline = (hl2 + kc_average) / 2.0
-    # 기본과 모디파이드 입력값 계산
-    norm_mod = (df["close"] - midline).divide(atr_primary.replace(0.0, np.nan))
-    norm_orig = df["close"] - midline
-    norm_series = norm_mod if use_mod_squeeze else norm_orig
-    norm_series = (norm_series * 100.0).fillna(0.0)
+    # --- AVG 스타일: BB 중간선과 KC 중앙값의 평균선 ---
+    avg_line_avg = (bb_basis_close + mean_kc) / 2.0
+    # --- Deluxe 스타일: 최고/최저 기반 중앙값과 hl2 기반 중간선의 평균선 ---
+    bb_mid_hl2 = _sma(hl2, kc_len)
+    kc_hl2 = mean_kc
+    avg_line_deluxe = (kc_hl2 + bb_mid_hl2) / 2.0
+    # --- 스타일에 따른 norm 계산 ---
+    if mom_style == "avg":
+        # AVG 스타일: BB+KC 평균선을 기준으로 ATR 로 정규화
+        norm_raw = (df["close"] - avg_line_avg).divide(atr_primary.replace(0.0, np.nan))
+    elif mom_style == "deluxe":
+        # Deluxe 스타일: 최고/최저 기반 중앙값과 hl2 기반 중간선의 평균을 기준으로 사용 (정규화 없음)
+        norm_raw = (df["close"] - avg_line_deluxe)
+    elif mom_style == "mod":
+        # Mod 스타일: midline 을 사용하여 ATR 로 정규화
+        norm_raw = (df["close"] - midline).divide(atr_primary.replace(0.0, np.nan))
+    else:
+        # KC 스타일: 최고/최저 기반 중앙값을 기준으로 사용 (정규화 없음)
+        norm_raw = (df["close"] - mean_kc)
+    # --- 정규화 후 스케일링 ---
+    norm_series = (norm_raw * 100.0).fillna(0.0)
     momentum = _linreg(norm_series, osc_len)
     # 모멘텀 신호선 유형 선택
     mt = (ma_type or "SMA").lower()

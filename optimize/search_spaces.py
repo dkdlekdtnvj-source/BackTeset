@@ -157,7 +157,11 @@ def get_search_spaces() -> List[Dict[str, object]]:
                     "fluxSmoothLen": {"type": "int", "min": 1, "max": 7, "step": 1},
                     "useFluxHeikin": {"type": "bool"},
                     "useModFlux": {"type": "bool"},
-                    "useModSqueeze": {"type": "bool"},
+                    # 모멘텀 스퀴즈 스타일: KC, AVG, Deluxe, Mod (ATR 정규화)
+                    "momStyle": {
+                        "type": "choice",
+                        "values": ["KC", "AVG", "Deluxe", "Mod"],
+                    },
                     "maType": {
                         "type": "choice",
                         "values": ["SMA", "EMA", "HMA"],
@@ -201,34 +205,6 @@ def get_search_spaces() -> List[Dict[str, object]]:
                         "max": 2.0,
                         "step": 0.1,
                         "requires": {"name": "useDynamicThresh", "equals": True},
-                    },
-                    "useEma": {"type": "bool"},
-                    "emaFastLen": {
-                        "type": "int",
-                        "min": 4,
-                        "max": 30,
-                        "step": 1,
-                        "requires": "useEma",
-                    },
-                    "emaSlowLen": {
-                        "type": "int",
-                        "min": 10,
-                        "max": 80,
-                        "step": 2,
-                        "requires": "useEma",
-                    },
-                    "emaMode": {
-                        "type": "choice",
-                        "values": ["Trend", "Crossover"],
-                        "requires": "useEma",
-                    },
-                    "useHmaFilter": {"type": "bool"},
-                    "hmaLen": {
-                        "type": "int",
-                        "min": 10,
-                        "max": 80,
-                        "step": 2,
-                        "requires": "useHmaFilter",
                     },
                     "exitOpposite": {"type": "bool"},
                     "useMomFade": {"type": "bool"},

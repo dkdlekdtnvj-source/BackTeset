@@ -51,10 +51,11 @@ dfh          = input.bool(true, title="Heikin-Ashi 변환 사용" , group=gDF)
 // --- 6. 모디파이드 옵션 ---
 gMod = "6. 모디파이드"
 // 모디파이드 DMI/ADX 기반 방향성 플럭스 사용 여부
-useModFlux   = input.bool(false, title="모디파이드 플럭스(DMI/ADX) 사용" , group=gMod)
-// 모디파이드 스퀴즈 모멘텀(ATR 정규화) 사용 여부
-useModSqueeze = input.bool(false, title="모디파이드 스퀴즈모멘텀(ATR) 사용" , group=gMod)
-// 모멘텀 신호선 이평선 종류: 기본(SMA), EMA, HMA
+useModFlux   = input.bool(false, title="모디파이드 플럭스(DMI/ADX) 사용", group=gMod)
+// 모멘텀 계산 방식 선택: 기본(KC), AVG, Deluxe, Mod.  Mod 스타일은 ATR 정규화를 포함하며 이전
+// `useModSqueeze` 옵션을 대체합니다.
+momStyle     = input.string("KC", title="모멘텀 계산 방식", options=["KC", "AVG", "Deluxe", "Mod"], group=gMod)
+// 모멘텀 신호선 이동평균 종류: 기본(SMA), EMA, HMA. 기본값 "기본"은 SMA와 동일하게 처리됩니다.
 maType       = input.string("기본", title="모멘텀 신호선 타입", options=["기본","EMA","HMA"], group=gMod)
 
 // --- 7. 리스크 & 월렛 ---
@@ -153,23 +154,50 @@ float modFluxVal    = dfSmoothLen > 1 ? ta.sma(modFluxCore, dfSmoothLen) : modFl
 float fluxVal    = useModFlux ? modFluxVal : fluxValOriginal
 
 // --- 스퀴즈 모멘텀 계산 ---
-float bbBasis = ta.sma(close, bbLen)
-float bbDev   = ta.stdev(close, bbLen) * bbMult
-float kcRange = ta.atr(kcLen) * kcMult
-bool squeezeOn = bbDev < kcRange
+// Bollinger Band 기준선: 종가의 이동평균으로 계산합니다. kcLen 을 사용하여 KC 길이와 일치시킵니다.
+float bbBasis     = ta.sma(close, kcLen)
+float bbDev       = ta.stdev(close, bbLen) * bbMult
+float kcRange     = ta.atr(kcLen) * kcMult
+bool squeezeOn    = bbDev < kcRange
 
+// 공통 선계산
 float hl2         = (high + low) / 2.0
+// KC 채널 및 midline
 float kcBasis     = ta.sma(hl2, kcLen)
 float kcUpper     = kcBasis + kcRange
 float kcLower     = kcBasis - kcRange
 float kcAverage   = (kcUpper + kcLower) / 2.0
 float midline     = math.avg(hl2, kcAverage)
 float atrPrimary  = ta.atr(kcLen)
-// 기본/모디파이드 스퀴즈 모멘텀 입력값
-float normOriginal = (close - midline)
-float normMod      = atrPrimary > 0 ? (close - midline) / atrPrimary : 0.0
-float normSel      = useModSqueeze ? normMod : normOriginal
-// 100 배율을 맞춰 비교적 일관된 크기를 유지
+
+// 최고/최저 기반 KC 중심값 (KC 스타일)
+float highestHigh = ta.highest(high, kcLen)
+float lowestLow   = ta.lowest(low, kcLen)
+float meanKC      = (highestHigh + lowestLow) / 2.0
+
+// AVG 스타일을 위한 BB 및 중앙값 평균선
+float avgLineAvg  = (bbBasis + meanKC) / 2.0
+
+// Deluxe 스타일을 위한 hl2 기반 BB 중간선과 meanKC 평균선
+float bbMidHl2    = ta.sma(hl2, kcLen)
+float avgLineDeluxe = (meanKC + bbMidHl2) / 2.0
+
+// 모멘텀 입력값: 스타일에 따라 다른 기준선과 ATR 정규화를 적용합니다.
+float normKC    = close - meanKC
+float normAVG   = atrPrimary > 0 ? (close - avgLineAvg) / atrPrimary : 0.0
+float normDeluxe= close - avgLineDeluxe
+float normMod   = atrPrimary > 0 ? (close - midline) / atrPrimary : 0.0
+
+// 선택된 모멘텀 스타일에 따라 norm 값을 고릅니다.  기본값은 "KC" 입니다.
+float normSel = normKC
+if momStyle == "AVG"
+    normSel := normAVG
+else if momStyle == "Deluxe"
+    normSel := normDeluxe
+else if momStyle == "Mod"
+    normSel := normMod
+
+// 100 배율을 맞춰 비교적 일관된 크기를 유지합니다.
 float momentum    = ta.linreg(normSel * 100.0, len, 0)
 // 모멘텀 신호선 타입별 계산
 float momSignal   = na

@@ -168,20 +168,36 @@ def apply_lossless_anomaly(
         flags.append(flag)
     target["AnomalyFlags"] = flags
 
-    # Profit factor 를 강제로 0 으로 덮어쓰지 않고 원본 값을 보존한다. 사용자가
-    # 확인할 수 있도록 ``LosslessProfitFactorValue`` 에는 원본 수치를, 학습·정량
-    # 비교 용도로 사용할 ``DisplayedProfitFactor`` 에는 안전한 수치 값을 기록한다.
+    # Profit factor anomalies: we treat complete lossless and micro-loss cases
+    # differently.  In the lossless case (no losing trades), the true ratio is
+    # mathematically undefined, so we keep the original value but expose a
+    # sentinel "overfactor" string to the user.  In the micro-loss case we
+    # preserve the original profit factor instead of forcing it to zero.  This
+    # avoids confusing logs such as ``profit_factor: 0.000`` when a nearly
+    # lossless result is achieved.  The ``LosslessProfitFactorValue`` always
+    # stores the raw value for reproducibility.
     original_pf = target.get("ProfitFactor")
     if original_pf is None:
         original_pf = float("nan")
-
+    # Record the original value
     target["LosslessProfitFactorValue"] = original_pf
     target["LosslessProfitFactor"] = True
-    target["DisplayedProfitFactor"] = 0.0
-
-    if flag == LOSSLESS_ANOMALY_FLAG:
+    # Micro‑loss: keep the original PF rather than zero
+    if flag == MICRO_LOSS_ANOMALY_FLAG:
+        # For micro‑loss anomalies we leave ProfitFactor unchanged and
+        # propagate it to the DisplayedProfitFactor so downstream reports
+        # show a meaningful value.  The anomaly flag remains recorded.
+        target["DisplayedProfitFactor"] = original_pf
+        target["ProfitFactor"] = original_pf
+    elif flag == LOSSLESS_ANOMALY_FLAG:
+        # True lossless case: set ProfitFactor to a sentinel string while
+        # preserving the numeric value separately.  DisplayedProfitFactor
+        # is set to 0 to avoid skewing weighted averages.
+        target["DisplayedProfitFactor"] = 0.0
         target["ProfitFactor"] = "overfactor"
     else:
+        # Unexpected flag type: fall back to original logic
+        target["DisplayedProfitFactor"] = original_pf
         target["ProfitFactor"] = original_pf
 
     return flag, trades_val, wins_val, abs(gross_loss_val), threshold_val
