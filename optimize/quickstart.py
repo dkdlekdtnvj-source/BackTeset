@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from optimize.run import execute, load_yaml, parse_args
+from optimize.run import DEFAULT_REPORT_ROOT, execute, load_yaml, parse_args
 
 
 def _prompt_choice(label: str, choices: Iterable[str], default: Optional[str] = None) -> str:
@@ -82,7 +82,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive quick-start for Pine optimisation")
     parser.add_argument("--params", type=Path, default=Path("config/params.yaml"))
     parser.add_argument("--backtest", type=Path, default=Path("config/backtest.yaml"))
-    parser.add_argument("--output", type=Path, default=Path("reports"))
+    parser.add_argument("--output", type=Path, default=DEFAULT_REPORT_ROOT)
     parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--n-trials", type=int, help="Override Optuna trial count")
     args = parser.parse_args()
