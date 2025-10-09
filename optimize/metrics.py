@@ -182,12 +182,10 @@ def apply_lossless_anomaly(
     # Record the original value
     target["LosslessProfitFactorValue"] = original_pf
     target["LosslessProfitFactor"] = True
-    # Micro‑loss: keep the original PF rather than zero
+    # Micro-loss: keep the original PF but zero out the displayed metric so
+    # weighted aggregates are not distorted by near-lossless ratios.
     if flag == MICRO_LOSS_ANOMALY_FLAG:
-        # For micro‑loss anomalies we leave ProfitFactor unchanged and
-        # propagate it to the DisplayedProfitFactor so downstream reports
-        # show a meaningful value.  The anomaly flag remains recorded.
-        target["DisplayedProfitFactor"] = original_pf
+        target["DisplayedProfitFactor"] = 0.0
         target["ProfitFactor"] = original_pf
     elif flag == LOSSLESS_ANOMALY_FLAG:
         # True lossless case: set ProfitFactor to a sentinel string while

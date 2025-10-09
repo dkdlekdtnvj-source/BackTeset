@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
@@ -344,34 +346,79 @@ def generate_llm_candidates(
             entry["values"] = values
         top_trials.append(entry)
 
+    param_importances: Dict[str, float] = {}
+    if finished_trials:
+        representative = finished_trials[0]
+        is_multi_objective = bool(getattr(representative, "values", None)) and (
+            isinstance(representative.values, Sequence) and len(representative.values) > 1
+        )
+        if not is_multi_objective:
+            try:
+                importance_study = optuna.create_study(direction="maximize")
+                importance_study.add_trials(finished_trials)
+                importances = optuna.importance.get_param_importances(importance_study)
+            except Exception as exc:  # pragma: no cover - fallback path
+                LOGGER.debug("Gemini 파라미터 중요도 계산 실패: %s", exc)
+            else:
+                param_importances = {name: float(value) for name, value in importances.items()}
+
+    param_summaries: Dict[str, object] = {}
+    summary_trials = sorted_trials[:top_n]
+    for name in space.keys():
+        observed = [trial.params.get(name) for trial in summary_trials if name in trial.params]
+        if not observed:
+            continue
+        if all(isinstance(value, bool) for value in observed):
+            counts = Counter(bool(value) for value in observed)
+            param_summaries[name] = {"most_common": [item for item, _ in counts.most_common(3)]}
+            continue
+        if all(isinstance(value, (int, float)) for value in observed):
+            numeric_values = [float(value) for value in observed]
+            param_summaries[name] = {
+                "min": round(min(numeric_values), 6),
+                "median": round(statistics.median(numeric_values), 6),
+                "max": round(max(numeric_values), 6),
+            }
+            continue
+        counts = Counter(observed)
+        param_summaries[name] = {"most_common": [item for item, _ in counts.most_common(3)]}
+
     client = genai.Client(api_key=api_key)
     model = str(config.get("model", "gemini-2.0-flash-exp"))
-    prompt = (
-        "You are assisting with hyper-parameter optimisation for a trading strategy.\n"
-        "The search space is defined by the following JSON (types: int, float, bool, choice):\n"
-        f"{json.dumps(space, indent=2)}\n\n"
-        "Here are the top completed trials with their objective values (higher is better):\n"
-        f"{json.dumps(top_trials, indent=2)}\n\n"
+    prompt_sections = [
+        "You are assisting with hyper-parameter optimisation for a trading strategy.",
+        "The search space is defined by the following JSON (types: int, float, bool, choice):",
+        json.dumps(space, indent=2),
+        "Here are the top completed trials with their objective values (higher is better):",
+        json.dumps(top_trials, indent=2),
+    ]
+    if param_importances:
+        prompt_sections.append(
+            "Optuna parameter importances (descending order, sum≈1.0):"
+        )
+        prompt_sections.append(json.dumps(param_importances, indent=2))
+    if param_summaries:
+        prompt_sections.append(
+            "Parameter value summaries across the top trials (min/median/max or most common choices):"
+        )
+        prompt_sections.append(json.dumps(param_summaries, indent=2))
+    prompt_sections.append(
         f"Propose {count} new parameter sets strictly within the given bounds as a JSON array under the key 'candidates'."
         " Also return 2-3 short tactical insights or strategy adjustments derived from the trials as a string array under the key 'insights'."
         " Respond with a single JSON object containing both 'candidates' and 'insights'."
     )
+    prompt = "\n\n".join(prompt_sections)
 
     # Optional thinking budget / generation config support for Gemini 2.5+ models.
     generation_config = None
     thinking_budget = config.get("thinking_budget")
     if thinking_budget is not None:
         try:
-            # Try to build a GenerationConfig if types are available. The
-            # google-genai SDK exposes these under genai.types. Not all versions
-            # include a ThinkingConfig, so we fall back gracefully on failure.
             budget_int = int(thinking_budget)
             try:
-                # pylint: disable=no-member
                 GenerationConfig = getattr(genai, "types", None)
                 if GenerationConfig is not None:
                     types_module = GenerationConfig
-                    # Build thinking_config
                     thinking_cls = getattr(types_module, "ThinkingConfig", None)
                     gen_cfg_cls = getattr(types_module, "GenerationConfig", None)
                     if thinking_cls is not None and gen_cfg_cls is not None:
@@ -383,17 +430,49 @@ def generate_llm_candidates(
         except Exception:
             generation_config = None
 
-    try:  # pragma: no cover - network side effects
-        # Pass the optional generation_config if available. The SDK will ignore
-        # unknown kwargs.
-        if generation_config is not None:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                generation_config=generation_config,
+    prompt_contents = [{"role": "user", "parts": [{"text": prompt}]}]
+    request_kwargs: Dict[str, object] = {"model": model, "contents": prompt_contents}
+    if generation_config is not None:
+        request_kwargs["generation_config"] = generation_config
+
+    system_instruction = config.get("system_instruction")
+    if isinstance(system_instruction, str) and system_instruction.strip():
+        request_kwargs["system_instruction"] = system_instruction.strip()
+
+    candidate_count = config.get("candidate_count")
+    if candidate_count is not None:
+        try:
+            request_kwargs["candidate_count"] = max(1, int(candidate_count))
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Gemini candidate_count 설정 '%s' 을 정수로 변환하지 못했습니다.",
+                candidate_count,
             )
-        else:
-            response = client.models.generate_content(model=model, contents=prompt)
+
+    def _call_with_fallback(kwargs: Dict[str, object]):
+        attempt = dict(kwargs)
+        while True:
+            try:
+                return client.models.generate_content(**attempt)
+            except TypeError as exc:  # pragma: no cover - SDK compatibility path
+                message = str(exc)
+                removed = False
+                for key in list(attempt.keys()):
+                    if key in {"model", "contents"}:
+                        continue
+                    if f"'{key}'" in message or f" {key}" in message:
+                        LOGGER.debug(
+                            "Gemini generate_content 인자 '%s' 를 제거하고 재시도합니다: %s",
+                            key,
+                            exc,
+                        )
+                        attempt.pop(key, None)
+                        removed = True
+                if not removed:
+                    raise
+
+    try:  # pragma: no cover - network side effects
+        response = _call_with_fallback(request_kwargs)
     except Exception as exc:  # pragma: no cover - network side effects
         LOGGER.warning("Gemini 호출에 실패했습니다: %s", exc)
         return LLMSuggestions([], [])

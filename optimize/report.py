@@ -44,6 +44,129 @@ def _get_seaborn():
     return sns
 
 
+def _summarise_distribution(values: Sequence[float]) -> Dict[str, float]:
+    if not values:
+        return {}
+    array = np.asarray(values, dtype=float)
+    if array.size == 0:
+        return {}
+    return {
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "p05": float(np.percentile(array, 5)),
+        "p95": float(np.percentile(array, 95)),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+    }
+
+
+def _collect_trade_profits(best: Dict[str, object]) -> List[float]:
+    profits: List[float] = []
+    seen: set[Tuple[Optional[float], Optional[float], Optional[int]]] = set()
+
+    def _extract_from_container(container: object) -> None:
+        if not isinstance(container, dict):
+            return
+        trades_payload = container.get("TradesList") or container.get("trades")
+        if not isinstance(trades_payload, list):
+            return
+        for entry in trades_payload:
+            candidate = None
+            return_value: Optional[float] = None
+            bars_candidate: Optional[int] = None
+            if isinstance(entry, dict):
+                candidate = entry.get("profit")
+                raw_return = entry.get("return_pct")
+                try:
+                    return_value = float(raw_return) if raw_return is not None else None
+                except (TypeError, ValueError):
+                    return_value = None
+                bars_value = entry.get("bars_held")
+                try:
+                    bars_candidate = int(bars_value) if bars_value is not None else None
+                except (TypeError, ValueError):
+                    bars_candidate = None
+            elif isinstance(entry, (int, float)):
+                candidate = entry
+            if candidate is None:
+                continue
+            try:
+                numeric = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(numeric):
+                key = (numeric, return_value, bars_candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                profits.append(numeric)
+
+    _extract_from_container(best.get("metrics"))
+    datasets = best.get("datasets")
+    if isinstance(datasets, list):
+        for dataset in datasets:
+            if not isinstance(dataset, dict):
+                continue
+            _extract_from_container(dataset.get("metrics"))
+            _extract_from_container(dataset)
+
+    return profits
+
+
+def _run_trade_monte_carlo(
+    profits: Sequence[float],
+    *,
+    iterations: int = 500,
+    drop_ratio: float = 0.1,
+) -> Optional[Dict[str, object]]:
+    if not profits:
+        return None
+
+    array = np.asarray([p for p in profits if np.isfinite(p)], dtype=float)
+    if array.size == 0:
+        return None
+
+    drop_ratio = max(0.0, min(float(drop_ratio), 0.9))
+    rng = np.random.default_rng()
+    net_results: List[float] = []
+    drawdowns: List[float] = []
+    win_rates: List[float] = []
+    sample_lengths: List[int] = []
+
+    for _ in range(int(iterations)):
+        sample = np.array(array, copy=True)
+        rng.shuffle(sample)
+        drop_count = int(round(sample.size * drop_ratio))
+        if drop_count > 0 and drop_count < sample.size:
+            mask = np.ones(sample.size, dtype=bool)
+            mask[rng.choice(sample.size, size=drop_count, replace=False)] = False
+            sample = sample[mask]
+        sample_lengths.append(int(sample.size))
+        if sample.size == 0:
+            net_results.append(0.0)
+            drawdowns.append(0.0)
+            win_rates.append(0.0)
+            continue
+        wins = float(np.sum(sample > 0) / sample.size)
+        win_rates.append(wins)
+        equity = np.concatenate([[0.0], np.cumsum(sample)])
+        net_results.append(float(equity[-1]))
+        running_max = np.maximum.accumulate(equity)
+        dd_curve = equity - running_max
+        drawdowns.append(float(dd_curve.min()) if dd_curve.size else 0.0)
+
+    summary = {
+        "iterations": int(iterations),
+        "sample_size": int(array.size),
+        "drop_ratio": float(drop_ratio),
+        "avg_sample_length": float(np.mean(sample_lengths)) if sample_lengths else 0.0,
+        "net_profit": _summarise_distribution(net_results),
+        "max_drawdown": _summarise_distribution(drawdowns),
+        "win_rate": _summarise_distribution(win_rates),
+    }
+    return summary
+
+
 def _objective_iterator(objectives: Iterable[object]) -> Iterable[Tuple[str, float]]:
     for spec in normalise_objectives(objectives):
         yield spec.name, float(spec.weight)
@@ -221,6 +344,8 @@ def export_best(best: Dict[str, object], wf_summary: Dict[str, object], output_d
             "candidates": wf_summary.get("candidates", []),
         },
     }
+    if "monte_carlo" in best:
+        payload["monte_carlo"] = best["monte_carlo"]
     (output_dir / "best.json").write_text(json.dumps(payload, indent=2))
 
 
@@ -345,6 +470,13 @@ def generate_reports(
                 if key not in ordered_metrics:
                     ordered_metrics[key] = value
             best_payload["metrics"] = dict(ordered_metrics)
+
+    monte_carlo_summary = _run_trade_monte_carlo(_collect_trade_profits(best_payload))
+    if monte_carlo_summary:
+        best_payload["monte_carlo"] = monte_carlo_summary
+        (output_dir / "monte_carlo.json").write_text(
+            json.dumps(monte_carlo_summary, indent=2)
+        )
 
     export_best(best_payload, wf_summary, output_dir)
     export_timeframe_summary(dataset_df, output_dir)
