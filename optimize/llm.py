@@ -556,32 +556,86 @@ def generate_llm_candidates(
                 candidate_count,
             )
 
-    def _call_with_fallback(kwargs: Dict[str, object]):
+    def _invoke_model(kwargs: Dict[str, object]):
         attempt = dict(kwargs)
+        removed: Set[str] = set()
         while True:
             try:
                 return client.models.generate_content(**attempt)
             except TypeError as exc:  # pragma: no cover - SDK compatibility path
                 message = str(exc)
-                removed = False
+                stripped = message.strip()
+                removed_key = False
                 for key in list(attempt.keys()):
-                    if key in {"model", "contents"}:
+                    if key in {"model", "contents"} or key in removed:
                         continue
-                    if f"'{key}'" in message or f" {key}" in message:
+                    if f"'{key}'" in stripped or f" {key}" in stripped:
                         LOGGER.debug(
                             "Gemini generate_content 인자 '%s' 를 제거하고 재시도합니다: %s",
                             key,
                             exc,
                         )
                         attempt.pop(key, None)
-                        removed = True
-                if not removed:
+                        removed.add(key)
+                        removed_key = True
+                if not removed_key:
                     raise
 
-    try:  # pragma: no cover - network side effects
-        response = _call_with_fallback(request_kwargs)
-    except Exception as exc:  # pragma: no cover - network side effects
-        LOGGER.warning("Gemini 호출에 실패했습니다: %s", exc)
+    def _should_switch_model(exc: Exception) -> bool:
+        text = str(exc).lower()
+        keywords = (
+            "permission",
+            "denied",
+            "forbidden",
+            "blocked",
+            "not found",
+            "does not exist",
+            "unsupported",
+            "unavailable",
+            "quota",
+        )
+        return any(token in text for token in keywords)
+
+    fallback_models_cfg = config.get("fallback_models")
+    fallback_models: List[str] = []
+    if isinstance(fallback_models_cfg, Sequence) and not isinstance(
+        fallback_models_cfg, (str, bytes, bytearray)
+    ):
+        for entry in fallback_models_cfg:
+            candidate = str(entry or "").strip()
+            if candidate:
+                fallback_models.append(candidate)
+
+    model_candidates: List[str] = []
+    for candidate in [model, *fallback_models, "gemini-2.0-flash", "gemini-1.5-flash"]:
+        candidate_str = str(candidate or "").strip()
+        if candidate_str and candidate_str not in model_candidates:
+            model_candidates.append(candidate_str)
+
+    response = None
+    last_error: Optional[Exception] = None
+    for idx, candidate_model in enumerate(model_candidates):
+        attempt_kwargs = dict(request_kwargs)
+        attempt_kwargs["model"] = candidate_model
+        try:  # pragma: no cover - network side effects
+            response = _invoke_model(attempt_kwargs)
+            break
+        except Exception as exc:  # pragma: no cover - network side effects
+            last_error = exc
+            if idx < len(model_candidates) - 1 and _should_switch_model(exc):
+                next_model = model_candidates[idx + 1]
+                LOGGER.warning(
+                    "Gemini 모델 '%s' 호출이 거부되어 '%s'(으)로 재시도합니다: %s",
+                    candidate_model,
+                    next_model,
+                    exc,
+                )
+                continue
+            LOGGER.warning("Gemini 호출에 실패했습니다: %s", exc)
+            return LLMSuggestions([], [])
+
+    if response is None:
+        LOGGER.warning("Gemini 호출에 실패했습니다: %s", last_error)
         return LLMSuggestions([], [])
 
     raw_text = _extract_text(response)

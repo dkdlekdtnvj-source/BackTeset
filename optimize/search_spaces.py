@@ -151,6 +151,8 @@ def get_search_spaces() -> List[Dict[str, object]]:
                 {
                     "oscLen": {"type": "int", "min": 10, "max": 40, "step": 2},
                     "signalLen": {"type": "int", "min": 2, "max": 12, "step": 1},
+                    "bbLen": {"type": "int", "min": 10, "max": 40, "step": 2},
+                    "bbMult": {"type": "float", "min": 1.0, "max": 3.0, "step": 0.1},
                     "kcLen": {"type": "int", "min": 10, "max": 30, "step": 2},
                     "kcMult": {"type": "float", "min": 1.0, "max": 2.5, "step": 0.1},
                     "fluxLen": {"type": "int", "min": 10, "max": 40, "step": 2},

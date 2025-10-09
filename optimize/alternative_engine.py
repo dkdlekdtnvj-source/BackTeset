@@ -25,7 +25,9 @@ from optimize.strategy_model import (  # 재사용 가능한 보조 함수들
     _atr,
     _bars_since_mask,
     _directional_flux,
+    _ema,
     _heikin_ashi,
+    _hma,
     _linreg,
     _rma,
     _sma,
@@ -315,26 +317,55 @@ def _compute_indicators(
     osc_len = max(_coerce_int(params.get("oscLen"), 20), 1)
     sig_len = max(_coerce_int(params.get("signalLen"), 3), 1)
     use_same_len = _coerce_bool(params.get("useSameLen"), False)
-    bb_len = osc_len if use_same_len else max(_coerce_int(params.get("bbLen"), 20), 1)
     kc_len = osc_len if use_same_len else max(_coerce_int(params.get("kcLen"), 18), 1)
-    bb_mult = _coerce_float(params.get("bbMult"), 1.4)
     kc_mult = _coerce_float(params.get("kcMult"), 1.0)
+    if use_same_len:
+        bb_len = osc_len
+    else:
+        bb_len = max(_coerce_int(params.get("bbLen"), kc_len), 1)
+    bb_mult = _coerce_float(params.get("bbMult"), kc_mult)
+    mom_style = str(params.get("momStyle", "KC") or "KC").strip().lower()
+    ma_type = str(params.get("maType", "SMA") or "SMA").strip().lower()
 
     flux_len = max(_coerce_int(params.get("fluxLen"), 14), 1)
     flux_smooth_len = max(_coerce_int(params.get("fluxSmoothLen"), 1), 1)
     flux_use_ha = _coerce_bool(params.get("useFluxHeikin"), True)
 
     hl2 = (df["high"] + df["low"]) / 2.0
-    atr_kc = _atr(df, kc_len).replace(0.0, np.nan)
+    atr_kc_raw = _atr(df, kc_len)
+    atr_for_norm = atr_kc_raw.replace(0.0, np.nan)
+    highest_high = df["high"].rolling(kc_len).max()
+    lowest_low = df["low"].rolling(kc_len).min()
+    mean_kc = (highest_high + lowest_low) / 2.0
+    bb_basis_close = _sma(df["close"], bb_len)
     kc_basis = _sma(hl2, kc_len)
-    kc_range = atr_kc * kc_mult
+    kc_range = atr_kc_raw * kc_mult
     kc_upper = kc_basis + kc_range
     kc_lower = kc_basis - kc_range
     kc_average = (kc_upper + kc_lower) / 2.0
     midline = (hl2 + kc_average) / 2.0
-    norm = (df["close"] - midline) / atr_kc * 100.0
+    avg_line_avg = (bb_basis_close + mean_kc) / 2.0
+    bb_mid_hl2 = _sma(hl2, bb_len)
+    kc_hl2 = mean_kc
+    avg_line_deluxe = (kc_hl2 + bb_mid_hl2) / 2.0
+
+    if mom_style == "avg":
+        norm_raw = (df["close"] - avg_line_avg).divide(atr_for_norm)
+    elif mom_style == "deluxe":
+        norm_raw = df["close"] - avg_line_deluxe
+    elif mom_style == "mod":
+        norm_raw = (df["close"] - midline).divide(atr_for_norm)
+    else:
+        norm_raw = df["close"] - mean_kc
+
+    norm = (norm_raw * 100.0).fillna(0.0)
     momentum = _linreg(norm, osc_len)
-    mom_signal = _sma(momentum, sig_len)
+    if ma_type == "ema":
+        mom_signal = _ema(momentum, sig_len)
+    elif ma_type == "hma":
+        mom_signal = _hma(momentum, sig_len)
+    else:
+        mom_signal = _sma(momentum, sig_len)
 
     prev_mom = momentum.shift(1).fillna(momentum)
     prev_sig = mom_signal.shift(1).fillna(mom_signal)
@@ -449,6 +480,11 @@ def _prepare_mom_fade_context(
     use_same_len = _coerce_bool(params.get("useSameLen"), False)
     kc_len = osc_len if use_same_len else max(_coerce_int(params.get("kcLen"), 18), 1)
     kc_mult = _coerce_float(params.get("kcMult"), 1.0)
+    if use_same_len:
+        bb_len = osc_len
+    else:
+        bb_len = max(_coerce_int(params.get("bbLen"), kc_len), 1)
+    bb_mult = _coerce_float(params.get("bbMult"), kc_mult)
 
     mom_fade_source = (df["high"] + df["low"] + df["close"]) / 3.0
     mom_fade_basis = _sma(mom_fade_source, mom_fade_bb_len)
@@ -477,9 +513,9 @@ def _prepare_mom_fade_context(
     mom_fade_since_nonneg = _bars_since_mask(mom_fade_nonneg)
 
     source_for_squeeze = df["close"]
-    kc_dev_for_squeeze = _std(source_for_squeeze, kc_len)
-    atr_val_for_squeeze = _atr(df, kc_len) * kc_mult
-    gate_sq_on = (kc_dev_for_squeeze < atr_val_for_squeeze).fillna(False).astype(bool)
+    bb_dev_for_squeeze = _std(source_for_squeeze, bb_len) * bb_mult
+    kc_range_for_squeeze = _atr(df, kc_len) * kc_mult
+    gate_sq_on = (bb_dev_for_squeeze < kc_range_for_squeeze).fillna(False).astype(bool)
     gate_sq_prev = gate_sq_on.shift(fill_value=False)
     gate_sq_rel = gate_sq_prev & np.logical_not(gate_sq_on)
     gate_rel_idx = gate_sq_rel.cumsum()
