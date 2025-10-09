@@ -1098,10 +1098,13 @@ def run_backtest(
     osc_len = int_param("oscLen", 20)
     sig_len = int_param("signalLen", 3)
     use_same_len = bool_param("useSameLen", False)
-    bb_len = osc_len if use_same_len else int_param("bbLen", 20)
     kc_len = osc_len if use_same_len else int_param("kcLen", 18)
-    bb_mult = float_param("bbMult", 1.4)
     kc_mult = float_param("kcMult", 1.0)
+    if use_same_len:
+        bb_len = osc_len
+    else:
+        bb_len = int_param("bbLen", kc_len)
+    bb_mult = float_param("bbMult", kc_mult)
 
     flux_len = int_param("fluxLen", 14)
     flux_smooth_len = int_param("fluxSmoothLen", 1)
@@ -1682,7 +1685,7 @@ def run_backtest(
     mean_kc = (highest_high + lowest_low) / 2.0
     # --- BB 및 KC 선계산 ---
     # Bollinger Band 중간선은 종가의 단순 이동평균으로 정의합니다.
-    bb_basis_close = _sma(df["close"], kc_len)
+    bb_basis_close = _sma(df["close"], bb_len)
     # Keltner Channel 기반 중심선 계산을 위해 hl2 를 사용합니다.
     kc_basis = _sma(hl2, kc_len)
     kc_range_series = atr_primary * float(kc_mult)
@@ -1693,19 +1696,20 @@ def run_backtest(
     # --- AVG 스타일: BB 중간선과 KC 중앙값의 평균선 ---
     avg_line_avg = (bb_basis_close + mean_kc) / 2.0
     # --- Deluxe 스타일: 최고/최저 기반 중앙값과 hl2 기반 중간선의 평균선 ---
-    bb_mid_hl2 = _sma(hl2, kc_len)
+    bb_mid_hl2 = _sma(hl2, bb_len)
     kc_hl2 = mean_kc
     avg_line_deluxe = (kc_hl2 + bb_mid_hl2) / 2.0
     # --- 스타일에 따른 norm 계산 ---
+    atr_norm = atr_primary.replace(0.0, np.nan)
     if mom_style == "avg":
         # AVG 스타일: BB+KC 평균선을 기준으로 ATR 로 정규화
-        norm_raw = (df["close"] - avg_line_avg).divide(atr_primary.replace(0.0, np.nan))
+        norm_raw = (df["close"] - avg_line_avg).divide(atr_norm)
     elif mom_style == "deluxe":
         # Deluxe 스타일: 최고/최저 기반 중앙값과 hl2 기반 중간선의 평균을 기준으로 사용 (정규화 없음)
         norm_raw = (df["close"] - avg_line_deluxe)
     elif mom_style == "mod":
         # Mod 스타일: midline 을 사용하여 ATR 로 정규화
-        norm_raw = (df["close"] - midline).divide(atr_primary.replace(0.0, np.nan))
+        norm_raw = (df["close"] - midline).divide(atr_norm)
     else:
         # KC 스타일: 최고/최저 기반 중앙값을 기준으로 사용 (정규화 없음)
         norm_raw = (df["close"] - mean_kc)

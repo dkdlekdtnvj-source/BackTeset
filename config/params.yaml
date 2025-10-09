@@ -43,6 +43,9 @@ space:
   # 스퀴즈 감지 파라미터와는 독립적으로 작동합니다.
   oscLen:         { type: int,   min: 10,  max: 40, step: 2 }
   signalLen:      { type: int,   min: 2,   max: 12, step: 1 }
+  # 볼린저 밴드 길이/배수 (오실레이터 계산에 사용)
+  bbLen:          { type: int,   min: 10,  max: 40, step: 2 }
+  bbMult:         { type: float, min: 1.0, max: 3.0, step: 0.1 }
 
   # --- 2. 스퀴즈 감지용 KC 채널 ---
   # Keltner Channel(KC) 파라미터로 스퀴즈를 감지합니다.  모멘텀 계산 스타일은 `momStyle`

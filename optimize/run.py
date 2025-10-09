@@ -543,6 +543,78 @@ def _filter_basic_factor_params(
     return {key: value for key, value in params.items() if key in BASIC_FACTOR_KEYS}
 
 
+def _space_value(space: Optional[Mapping[str, Dict[str, object]]], name: str, key: str) -> Optional[object]:
+    if not isinstance(space, Mapping):
+        return None
+    spec = space.get(name)
+    if not isinstance(spec, Mapping):
+        return None
+    value = spec.get(key)
+    return value if value is not None else None
+
+
+def _ensure_channel_params(
+    params: Dict[str, object],
+    space: Optional[Mapping[str, Dict[str, object]]] = None,
+) -> Dict[str, object]:
+    """과거 기록 호환을 위해 BB 파라미터가 없으면 KC 값을 기반으로 채웁니다."""
+
+    if not isinstance(params, dict):
+        return {}
+
+    def _coerce_int(value: object, default: Optional[int]) -> Optional[int]:
+        try:
+            if value is None:
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_float(value: object, default: float) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    patched = dict(params)
+    kc_len = _coerce_int(patched.get("kcLen"), None)
+    kc_mult = None
+    try:
+        kc_mult = float(patched.get("kcMult"))
+    except (TypeError, ValueError):
+        kc_mult = None
+
+    bb_len_default = kc_len
+    if bb_len_default is None:
+        bb_len_default = _coerce_int(_space_value(space, "bbLen", "default"), None)
+    if bb_len_default is None:
+        bb_len_default = _coerce_int(_space_value(space, "bbLen", "min"), 20)
+    if bb_len_default is None:
+        bb_len_default = 20
+
+    bb_mult_default = kc_mult
+    if bb_mult_default is None:
+        raw_default = _space_value(space, "bbMult", "default")
+        if raw_default is None:
+            raw_default = _space_value(space, "bbMult", "min")
+        bb_mult_default = _coerce_float(raw_default, 1.4)
+    bb_mult_default = _coerce_float(bb_mult_default, 1.4)
+
+    if patched.get("bbLen") in (None, ""):
+        patched["bbLen"] = bb_len_default
+    else:
+        patched["bbLen"] = _coerce_int(patched.get("bbLen"), bb_len_default)
+
+    if patched.get("bbMult") in (None, ""):
+        patched["bbMult"] = bb_mult_default
+    else:
+        patched["bbMult"] = _coerce_float(patched.get("bbMult"), bb_mult_default)
+
+    return patched
+
+
 def _order_mapping(
     payload: Mapping[str, object],
     preferred_order: Optional[Sequence[str]] = None,
@@ -1131,6 +1203,7 @@ def _load_seed_trials(
         filtered_params = _filter_basic_factor_params(
             dict(params), enabled=basic_filter_enabled
         )
+        filtered_params = _ensure_channel_params(filtered_params, space)
         if not filtered_params:
             continue
         seeds.append(filtered_params)
@@ -1143,6 +1216,7 @@ def _load_seed_trials(
         mutated_filtered = _filter_basic_factor_params(
             mutated, enabled=basic_filter_enabled
         )
+        mutated_filtered = _ensure_channel_params(mutated_filtered, space)
         if mutated_filtered:
             seeds.append(mutated_filtered)
     return seeds
@@ -2754,7 +2828,7 @@ def optimisation_loop(
             else:
                 value_field = trial_value
 
-            params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=True)
+            params_json = json.dumps(record["params"], ensure_ascii=False, sort_keys=False)
             skipped_json = (
                 json.dumps(skipped_serialisable, ensure_ascii=False)
                 if skipped_serialisable
@@ -3407,6 +3481,7 @@ def optimisation_loop(
                 trial_params = _filter_basic_factor_params(
                     dict(candidate), enabled=use_basic_factors
                 )
+                trial_params = _ensure_channel_params(trial_params, space)
                 if not trial_params:
                     continue
                 trial_params.update(forced_params)
@@ -4323,7 +4398,8 @@ def _execute_single(
 
     def _ordered_params_view(raw_params: object) -> Dict[str, object]:
         if isinstance(raw_params, Mapping):
-            return _order_mapping(raw_params, param_order)
+            patched = _ensure_channel_params(dict(raw_params), space)
+            return _order_mapping(patched, param_order)
         return {}
 
     wf_summary = run_walk_forward(
@@ -4450,6 +4526,7 @@ def _execute_single(
         filtered_params = _filter_basic_factor_params(
             item.get("params") or {}, enabled=optimisation.get("basic_factor_profile", True)
         )
+        filtered_params = _ensure_channel_params(filtered_params, space)
         ordered_params = _order_mapping(filtered_params, param_order)
         raw_metrics = trial_record.get("metrics") if isinstance(trial_record, dict) else {}
         if isinstance(raw_metrics, Mapping):
