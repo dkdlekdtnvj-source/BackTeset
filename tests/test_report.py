@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+from pathlib import Path
 from typing import Optional
 
 import matplotlib
@@ -118,3 +120,49 @@ def test_generate_reports_emits_timeframe_summary(tmp_path: Path) -> None:
     assert (summary_df["timeframe"] == "1m").any()
     assert "Sortino_mean" in ranking_df.columns
     assert "htf_timeframe" not in ranking_df.columns
+
+
+def test_generate_reports_writes_monte_carlo_summary(tmp_path: Path) -> None:
+    trades = [
+        {"profit": 50.0, "return_pct": 0.02},
+        {"profit": -25.0, "return_pct": -0.01},
+        {"profit": 75.0, "return_pct": 0.03},
+        {"profit": -10.0, "return_pct": -0.005},
+    ]
+
+    best = {
+        "params": {"oscLen": 20},
+        "metrics": {"NetProfit": 0.25, "ProfitFactor": 1.6, "TradesList": trades},
+        "datasets": [
+            {
+                "name": "BINANCE:ENAUSDT_1m",
+                "meta": {"timeframe": "1m"},
+                "metrics": {"Valid": True, "Trades": 120, "TradesList": trades},
+            }
+        ],
+        "score": 1.0,
+    }
+
+    results = [
+        {
+            "trial": 0,
+            "score": 1.0,
+            "params": {"oscLen": 20},
+            "metrics": {"NetProfit": 0.25, "Sortino": 1.8, "ProfitFactor": 1.6},
+            "datasets": [],
+        }
+    ]
+
+    generate_reports(results, best, {}, ["NetProfit"], tmp_path)
+
+    monte_path = tmp_path / "monte_carlo.json"
+    assert monte_path.exists()
+
+    payload = json.loads(monte_path.read_text(encoding="utf-8"))
+    assert payload["iterations"] == 500
+    assert payload["sample_size"] == len(trades)
+    assert "net_profit" in payload
+    assert "max_drawdown" in payload
+
+    best_payload = json.loads((tmp_path / "best.json").read_text(encoding="utf-8"))
+    assert "monte_carlo" in best_payload

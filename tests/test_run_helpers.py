@@ -149,9 +149,18 @@ def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
 def test_dataset_total_volume_sums_numeric_values():
     dataset = _make_dataset("1m", None)
 
+    assert dataset.total_volume is None
     total = _dataset_total_volume(dataset)
 
     assert total == pytest.approx(33.0)
+    assert dataset.total_volume == pytest.approx(33.0)
+
+    # Subsequent calls should use the cached value even if the frame changes.
+    dataset.df.loc[:, "volume"] = [0, 0, 0]
+    cached = _dataset_total_volume(dataset)
+
+    assert cached == pytest.approx(33.0)
+    assert dataset.total_volume == pytest.approx(33.0)
 
 
 def test_dataset_total_volume_handles_missing_volume_column():
@@ -161,6 +170,7 @@ def test_dataset_total_volume_handles_missing_volume_column():
     total = _dataset_total_volume(dataset)
 
     assert total == 0.0
+    assert dataset.total_volume == 0.0
 
 
 def test_has_sufficient_volume_detects_shortfall():
@@ -256,6 +266,306 @@ def test_run_dataset_backtest_task_accepts_dataset_id_via_process_cache(
 
     _process_pool_initializer([])
 
+
+def test_optimisation_loop_process_executor_reuses_handles(monkeypatch, tmp_path):
+    dataset_a = _make_dataset("1m", None)
+    dataset_b = _make_dataset("1m", None)
+    dataset_a.cache_info = DatasetCacheInfo(root=tmp_path, futures=False)
+    dataset_b.cache_info = DatasetCacheInfo(root=tmp_path, futures=False)
+    dataset_b.start = "2024-01-05"
+    dataset_b.end = "2024-01-06"
+
+    params_cfg: Dict[str, object] = {
+        "space": {},
+        "search": {
+            "n_trials": 1,
+            "dataset_executor": "process",
+            "dataset_jobs": 2,
+        },
+        "llm": {"enabled": False},
+        "timeframe": "1m",
+    }
+
+    objectives = [{"name": "NetProfit", "goal": "maximize"}]
+
+    serialise_calls: List[List[str]] = []
+    original_serialise = _serialise_datasets_for_process
+
+    def fake_serialise(datasets):
+        serialise_calls.append([dataset.name for dataset in datasets])
+        return original_serialise(datasets)
+
+    monkeypatch.setattr("optimize.run._serialise_datasets_for_process", fake_serialise)
+
+    submissions: List[object] = []
+
+    def fake_run(dataset_ref, params, fees, risk, min_trades=None):
+        submissions.append(dataset_ref)
+        return {
+            "Valid": True,
+            "ProfitFactor": 1.2,
+            "Trades": 20,
+            "Wins": 12,
+            "Losses": 8,
+        }
+
+    monkeypatch.setattr("optimize.run._run_dataset_backtest_task", fake_run)
+
+    class DummyFuture:
+        def __init__(self, fn, args, kwargs):
+            self._fn = fn
+            self._args = args
+            self._kwargs = kwargs
+            self.cancelled = False
+
+        def result(self):
+            return self._fn(*self._args, **self._kwargs)
+
+        def cancel(self):
+            self.cancelled = True
+
+    class DummyProcessPoolExecutor:
+        instances: List["DummyProcessPoolExecutor"] = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shutdown_called = False
+            DummyProcessPoolExecutor.instances.append(self)
+
+        def submit(self, fn, *args, **kwargs):
+            return DummyFuture(fn, args, kwargs)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_called = True
+
+    monkeypatch.setattr("optimize.run.ProcessPoolExecutor", DummyProcessPoolExecutor)
+
+    class DummyTrial:
+        def __init__(self, number: int):
+            self.number = number
+            self.params: Dict[str, object] = {}
+            self.user_attrs: Dict[str, object] = {}
+            self.state = TrialState.RUNNING
+            self.datetime_complete = None
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+        def report(self, *args, **kwargs) -> None:  # pragma: no cover - behaviourless
+            return None
+
+        def should_prune(self) -> bool:
+            return False
+
+    class DummyStudy:
+        def __init__(self):
+            self._trials: List[DummyTrial] = []
+            self._attrs: Dict[str, object] = {}
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self._attrs[key] = value
+
+        def enqueue_trial(self, *args, **kwargs) -> None:
+            return None
+
+        def get_trials(self, deepcopy: bool = False):
+            return list(self._trials)
+
+        @property
+        def trials(self):
+            return list(self._trials)
+
+        def trials_dataframe(self):
+            return pd.DataFrame()
+
+        @property
+        def best_trial(self):
+            if self._trials:
+                return self._trials[0]
+            dummy = DummyTrial(0)
+            dummy.state = TrialState.COMPLETE
+            dummy.value = 0.0
+            return dummy
+
+        def optimize(
+            self,
+            objective,
+            n_trials,
+            n_jobs,
+            show_progress_bar,
+            callbacks,
+            gc_after_trial,
+            catch,
+        ):
+            trial = DummyTrial(0)
+            value = objective(trial)
+            trial.state = TrialState.COMPLETE
+            trial.value = value
+            self._trials.append(trial)
+            for callback in callbacks:
+                callback(self, trial)
+            raise StopIteration
+
+    dummy_study = DummyStudy()
+    monkeypatch.setattr("optimize.run.optuna.create_study", lambda *args, **kwargs: dummy_study)
+    monkeypatch.setattr("optimize.run.backtest_cfg", {}, raising=False)
+
+    with pytest.raises(StopIteration):
+        optimisation_loop(
+            [dataset_a, dataset_b],
+            params_cfg,
+            objectives,
+            fees={},
+            risk={"min_volume": 0},
+        )
+
+    assert len(serialise_calls) == 1
+    assert {ref for ref in submissions} == {dataset_a.name, dataset_b.name}
+    assert DummyProcessPoolExecutor.instances
+    assert DummyProcessPoolExecutor.instances[0].shutdown_called is True
+
+
+def test_optimisation_loop_thread_executor_uses_objects(monkeypatch):
+    dataset_a = _make_dataset("1m", None)
+    dataset_b = _make_dataset("1m", None)
+
+    params_cfg: Dict[str, object] = {
+        "space": {},
+        "search": {
+            "n_trials": 1,
+            "dataset_executor": "thread",
+            "dataset_jobs": 2,
+        },
+        "llm": {"enabled": False},
+        "timeframe": "1m",
+    }
+
+    objectives = [{"name": "NetProfit", "goal": "maximize"}]
+
+    submissions: List[object] = []
+
+    def fake_run(dataset_ref, params, fees, risk, min_trades=None):
+        submissions.append(dataset_ref)
+        return {
+            "Valid": True,
+            "ProfitFactor": 1.1,
+            "Trades": 15,
+            "Wins": 9,
+            "Losses": 6,
+        }
+
+    monkeypatch.setattr("optimize.run._run_dataset_backtest_task", fake_run)
+
+    class DummyFuture:
+        def __init__(self, fn, args, kwargs):
+            self._fn = fn
+            self._args = args
+            self._kwargs = kwargs
+
+        def result(self):
+            return self._fn(*self._args, **self._kwargs)
+
+        def cancel(self):
+            return None
+
+    class DummyThreadPoolExecutor:
+        instances: List["DummyThreadPoolExecutor"] = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shutdown_called = False
+            DummyThreadPoolExecutor.instances.append(self)
+
+        def submit(self, fn, *args, **kwargs):
+            return DummyFuture(fn, args, kwargs)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_called = True
+
+    monkeypatch.setattr("optimize.run.ThreadPoolExecutor", DummyThreadPoolExecutor)
+
+    class DummyTrial:
+        def __init__(self, number: int):
+            self.number = number
+            self.params: Dict[str, object] = {}
+            self.user_attrs: Dict[str, object] = {}
+            self.state = TrialState.RUNNING
+            self.datetime_complete = None
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            self.user_attrs[key] = value
+
+        def report(self, *args, **kwargs) -> None:  # pragma: no cover - behaviourless
+            return None
+
+        def should_prune(self) -> bool:
+            return False
+
+    class DummyStudy:
+        def __init__(self):
+            self._trials: List[DummyTrial] = []
+
+        def set_user_attr(self, key: str, value: object) -> None:
+            return None
+
+        def enqueue_trial(self, *args, **kwargs) -> None:
+            return None
+
+        def get_trials(self, deepcopy: bool = False):
+            return list(self._trials)
+
+        @property
+        def trials(self):
+            return list(self._trials)
+
+        def trials_dataframe(self):
+            return pd.DataFrame()
+
+        @property
+        def best_trial(self):
+            if self._trials:
+                return self._trials[0]
+            dummy = DummyTrial(0)
+            dummy.state = TrialState.COMPLETE
+            dummy.value = 0.0
+            return dummy
+
+        def optimize(
+            self,
+            objective,
+            n_trials,
+            n_jobs,
+            show_progress_bar,
+            callbacks,
+            gc_after_trial,
+            catch,
+        ):
+            trial = DummyTrial(0)
+            value = objective(trial)
+            trial.state = TrialState.COMPLETE
+            trial.value = value
+            self._trials.append(trial)
+            for callback in callbacks:
+                callback(self, trial)
+            raise StopIteration
+
+    dummy_study = DummyStudy()
+    monkeypatch.setattr("optimize.run.optuna.create_study", lambda *args, **kwargs: dummy_study)
+    monkeypatch.setattr("optimize.run.backtest_cfg", {}, raising=False)
+
+    with pytest.raises(StopIteration):
+        optimisation_loop(
+            [dataset_a, dataset_b],
+            params_cfg,
+            objectives,
+            fees={},
+            risk={"min_volume": 0},
+        )
+
+    assert len(submissions) == 2
+    assert all(ref is dataset_a or ref is dataset_b for ref in submissions)
+    assert DummyThreadPoolExecutor.instances
+    assert DummyThreadPoolExecutor.instances[0].shutdown_called is True
 
 def test_study_registry_round_trip_for_rdb(tmp_path):
     study_path = tmp_path / "studies" / "demo.db"

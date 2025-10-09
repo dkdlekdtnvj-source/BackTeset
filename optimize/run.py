@@ -15,13 +15,13 @@ import sys
 import time
 from collections import OrderedDict
 from collections.abc import Sequence as AbcSequence
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Literal
 
 import numpy as np
 import optuna
@@ -34,6 +34,15 @@ import sqlalchemy
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from optuna.trial import TrialState
+import importlib.util
+
+typer_spec = importlib.util.find_spec("typer")
+if typer_spec is not None:
+    import typer
+else:  # pragma: no cover - fallback when Typer is unavailable
+    typer = None  # type: ignore[assignment]
+
+TYPER_AVAILABLE = typer_spec is not None
 
 from datafeed.cache import DataCache
 from optimize.metrics import (
@@ -126,6 +135,8 @@ def fetch_top_usdt_perp_symbols(
 
 
 LOGGER = logging.getLogger("optimize")
+
+_ORIGINAL_ARGV: List[str] = []
 
 # ---------------------------------------------------------------------------
 # Warning management
@@ -1342,6 +1353,7 @@ class DatasetSpec:
     htf_timeframe: Optional[str] = None
     source_symbol: Optional[str] = None
     cache_info: Optional[DatasetCacheInfo] = None
+    total_volume: Optional[float] = None
 
     @property
     def name(self) -> str:
@@ -1431,6 +1443,7 @@ def _load_process_dataset(dataset_id: str) -> DatasetSpec:
         htf_timeframe=htf_timeframe,
         source_symbol=source_symbol,
         cache_info=DatasetCacheInfo(Path(str(cache_root)), futures=futures_flag),
+        total_volume=_compute_total_volume(df),
     )
     _PROCESS_DATASET_OBJECTS[dataset_id] = dataset
     return dataset
@@ -1475,16 +1488,25 @@ def _serialise_datasets_for_process(datasets: Sequence[DatasetSpec]) -> List[Dic
     return handles
 
 
-def _dataset_total_volume(dataset: "DatasetSpec") -> float:
-    """Return a finite total volume for the given dataset."""
-
-    if dataset.df is None or "volume" not in dataset.df.columns:
+def _compute_total_volume(frame: Optional[pd.DataFrame]) -> float:
+    if frame is None or "volume" not in frame.columns:
         return 0.0
 
-    volume_series = pd.to_numeric(dataset.df["volume"], errors="coerce")
+    volume_series = pd.to_numeric(frame["volume"], errors="coerce")
     total = float(np.nansum(volume_series.to_numpy(dtype=float)))
     if not np.isfinite(total):
         return 0.0
+    return total
+
+
+def _dataset_total_volume(dataset: "DatasetSpec") -> float:
+    """Return a finite total volume for the given dataset."""
+
+    if dataset.total_volume is not None:
+        return dataset.total_volume
+
+    total = _compute_total_volume(dataset.df)
+    dataset.total_volume = total
     return total
 
 
@@ -1836,6 +1858,7 @@ def prepare_datasets(
                     end,
                 )
                 df = cache.get(source_symbol, timeframe_text, start, end)
+                total_volume = _compute_total_volume(df)
                 datasets.append(
                     DatasetSpec(
                         symbol=display_symbol,
@@ -1847,6 +1870,7 @@ def prepare_datasets(
                         htf_timeframe=None,
                         source_symbol=source_symbol,
                         cache_info=cache_info,
+                        total_volume=total_volume,
                     )
                 )
         if not datasets:
@@ -1896,6 +1920,7 @@ def prepare_datasets(
             end,
         )
         df = cache.get(source_symbol, timeframe, start, end)
+        total_volume = _compute_total_volume(df)
         datasets.append(
             DatasetSpec(
                 symbol=display_symbol,
@@ -1907,6 +1932,7 @@ def prepare_datasets(
                 htf_timeframe=None,
                 source_symbol=source_symbol,
                 cache_info=cache_info,
+                total_volume=total_volume,
             )
         )
     return datasets
@@ -2386,6 +2412,10 @@ def optimisation_loop(
         n_jobs=n_jobs,
     )
 
+    process_handles: Optional[List[Dict[str, object]]] = None
+    if dataset_executor == "process":
+        process_handles = _serialise_datasets_for_process(datasets)
+
     algo_raw = search_cfg.get("algo", "bayes")
     algo = str(algo_raw or "bayes").lower()
     seed = search_cfg.get("seed")
@@ -2636,6 +2666,30 @@ def optimisation_loop(
 
     results: List[Dict[str, object]] = []
     results_lock = Lock()
+    dataset_executor_pool: Optional[Executor] = None
+    if dataset_jobs > 1:
+        if dataset_executor == "process":
+            try:
+                ctx = (
+                    multiprocessing.get_context(dataset_start_method)
+                    if dataset_start_method
+                    else multiprocessing.get_context("spawn")
+                )
+            except ValueError:
+                LOGGER.warning(
+                    "dataset_start_method '%s' 을 사용할 수 없어 기본 spawn 을 사용합니다.",
+                    dataset_start_method,
+                )
+                ctx = multiprocessing.get_context("spawn")
+            init_handles = process_handles or []
+            dataset_executor_pool = ProcessPoolExecutor(
+                max_workers=dataset_jobs,
+                mp_context=ctx,
+                initializer=_process_pool_initializer,
+                initargs=(init_handles,),
+            )
+        else:
+            dataset_executor_pool = ThreadPoolExecutor(max_workers=dataset_jobs)
 
     def _to_native(value: object) -> object:
         if isinstance(value, np.generic):
@@ -2848,6 +2902,7 @@ def optimisation_loop(
         numeric_metrics: List[Dict[str, float]] = []
         dataset_scores: List[float] = []
         skipped_dataset_records: List[Dict[str, object]] = []
+        aggregate_trade_payload: List[Dict[str, object]] = []
 
         def _safe_float(value: object) -> Optional[float]:
             try:
@@ -2863,6 +2918,42 @@ def optimisation_loop(
             if numeric is None:
                 return None
             return int(round(numeric))
+
+        def _serialise_trades_list(raw: object) -> List[Dict[str, object]]:
+            serialised: List[Dict[str, object]] = []
+            if not isinstance(raw, list):
+                return serialised
+
+            def _maybe_float(candidate: object) -> Optional[float]:
+                value = _safe_float(candidate)
+                return value if value is not None else None
+
+            for trade in raw:
+                profit = None
+                return_pct = None
+                bars = None
+                if isinstance(trade, Trade):
+                    profit = _maybe_float(getattr(trade, "profit", None))
+                    return_pct = _maybe_float(getattr(trade, "return_pct", None))
+                    bars = _coerce_int(getattr(trade, "bars_held", None))
+                elif isinstance(trade, Mapping):
+                    profit = _maybe_float(trade.get("profit"))
+                    return_pct = _maybe_float(trade.get("return_pct"))
+                    bars = _coerce_int(trade.get("bars_held"))
+                else:
+                    continue
+
+                payload: Dict[str, object] = {}
+                if profit is not None:
+                    payload["profit"] = float(profit)
+                if return_pct is not None:
+                    payload["return_pct"] = float(return_pct)
+                if bars is not None:
+                    payload["bars_held"] = int(bars)
+                if payload:
+                    serialised.append(payload)
+
+            return serialised
 
         def _resolve_min_volume_threshold() -> float:
             candidates: List[object] = [
@@ -2908,6 +2999,12 @@ def optimisation_loop(
                 "meta": dataset.meta,
                 "metrics": cleaned_metrics,
             }
+
+            trades_serialised = _serialise_trades_list(metrics.get("TradesList"))
+            if trades_serialised:
+                dataset_entry["trades"] = trades_serialised
+                cleaned_metrics["TradesList"] = trades_serialised
+                aggregate_trade_payload.extend(trades_serialised)
 
             lossless_info = _apply_lossless_anomaly(metrics)
             if lossless_info:
@@ -3088,71 +3185,51 @@ def optimisation_loop(
         selected_datasets = eligible_datasets
 
         parallel_enabled = dataset_jobs > 1 and len(selected_datasets) > 1
-        if parallel_enabled:
-            executor_kwargs: Dict[str, object] = {"max_workers": dataset_jobs}
+        if parallel_enabled and dataset_executor_pool is not None:
             if dataset_executor == "process":
-                handles = _serialise_datasets_for_process(selected_datasets)
-                try:
-                    ctx = (
-                        multiprocessing.get_context(dataset_start_method)
-                        if dataset_start_method
-                        else multiprocessing.get_context("spawn")
-                    )
-                except ValueError:
-                    LOGGER.warning(
-                        "dataset_start_method '%s' 을 사용할 수 없어 기본 spawn 을 사용합니다.",
-                        dataset_start_method,
-                    )
-                    ctx = multiprocessing.get_context("spawn")
-                executor_cls = ProcessPoolExecutor
-                executor_kwargs["mp_context"] = ctx
-                executor_kwargs["initializer"] = _process_pool_initializer
-                executor_kwargs["initargs"] = (handles,)
-                dataset_refs: Sequence[object] = [handle["id"] for handle in handles]
+                dataset_refs: Sequence[object] = [dataset.name for dataset in selected_datasets]
             else:
-                executor_cls = ThreadPoolExecutor
                 dataset_refs = list(selected_datasets)
 
             futures = []
-            with executor_cls(**executor_kwargs) as executor:
-                for dataset, dataset_ref in zip(selected_datasets, dataset_refs):
-                    min_trades_requirement = _resolve_dataset_min_trades(
-                        dataset,
-                        constraints=constraints_cfg,
-                        risk=risk,
+            for dataset, dataset_ref in zip(selected_datasets, dataset_refs):
+                min_trades_requirement = _resolve_dataset_min_trades(
+                    dataset,
+                    constraints=constraints_cfg,
+                    risk=risk,
+                )
+                futures.append(
+                    dataset_executor_pool.submit(
+                        _run_dataset_backtest_task,
+                        dataset_ref,
+                        params,
+                        fees,
+                        risk,
+                        min_trades_requirement,
                     )
-                    futures.append(
-                        executor.submit(
-                            _run_dataset_backtest_task,
-                            dataset_ref,
-                            params,
-                            fees,
-                            risk,
-                            min_trades_requirement,
-                        )
-                    )
+                )
 
-                for idx, (dataset, future) in enumerate(zip(selected_datasets, futures), start=1):
-                    try:
-                        metrics = future.result()
-                    except Exception:
-                        for pending in futures[idx:]:
-                            pending.cancel()
-                        LOGGER.exception(
-                            "백테스트 실행 중 오류 발생 (dataset=%s, timeframe=%s, htf=%s)",
-                            dataset.name,
-                            dataset.timeframe,
-                            dataset.htf_timeframe,
-                        )
-                        raise
-                    try:
-                        _consume_dataset(
-                            idx, dataset, metrics, simple_override=simple_metrics_enabled
-                        )
-                    except optuna.TrialPruned:
-                        for pending in futures[idx:]:
-                            pending.cancel()
-                        raise
+            for idx, (dataset, future) in enumerate(zip(selected_datasets, futures), start=1):
+                try:
+                    metrics = future.result()
+                except Exception:
+                    for pending in futures[idx:]:
+                        pending.cancel()
+                    LOGGER.exception(
+                        "백테스트 실행 중 오류 발생 (dataset=%s, timeframe=%s, htf=%s)",
+                        dataset.name,
+                        dataset.timeframe,
+                        dataset.htf_timeframe,
+                    )
+                    raise
+                try:
+                    _consume_dataset(
+                        idx, dataset, metrics, simple_override=simple_metrics_enabled
+                    )
+                except optuna.TrialPruned:
+                    for pending in futures[idx:]:
+                        pending.cancel()
+                    raise
         else:
             for idx, dataset in enumerate(selected_datasets, start=1):
                 try:
@@ -3198,6 +3275,8 @@ def optimisation_loop(
         )
 
         cleaned_aggregated = _clean_metrics(aggregated)
+        if aggregate_trade_payload:
+            cleaned_aggregated["TradesList"] = list(aggregate_trade_payload)
         valid_status = bool(aggregated.get("Valid", bool(numeric_metrics)))
 
         pf_anomaly = False
@@ -3340,6 +3419,8 @@ def optimisation_loop(
         else:
             _run_optuna(n_trials)
     finally:
+        if dataset_executor_pool is not None:
+            dataset_executor_pool.shutdown(wait=True, cancel_futures=True)
         if final_csv_path is not None:
             try:
                 df = study.trials_dataframe()
@@ -3392,148 +3473,388 @@ def merge_dicts(primary: Dict[str, float], secondary: Dict[str, float]) -> Dict[
     return merged
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build an :class:`argparse.ArgumentParser` for optimisation commands."""
+def _prepare_cli_tokens(tokens: Sequence[str]) -> List[str]:
+    processed: List[str] = []
+    replaced_interactive = False
+    for token in tokens:
+        if token == "시작":
+            processed.append("--interactive")
+            replaced_interactive = True
+        else:
+            processed.append(token)
+    if replaced_interactive and "--interactive" not in processed:
+        processed.append("--interactive")
+    return processed
 
-    parser = argparse.ArgumentParser(description="Run Pine strategy optimisation")
-    parser.add_argument("--params", type=Path, default=Path("config/params.yaml"))
-    parser.add_argument("--backtest", type=Path, default=Path("config/backtest.yaml"))
+
+def _build_argparse_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="optimize.run",
+        description="Pine 전략 최적화를 실행하는 CLI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--params",
+        type=Path,
+        default=Path("config/params.yaml"),
+        help="전략 파라미터 YAML 경로",
+    )
+    parser.add_argument(
+        "--backtest",
+        type=Path,
+        default=Path("config/backtest.yaml"),
+        help="백테스트 설정 YAML 경로",
+    )
     parser.add_argument(
         "--output",
         type=Path,
-        help=(
-            "Custom output directory (기본 저장 위치: "
-            f"{DEFAULT_REPORT_ROOT}/<timestamped-folder>)"
-        ),
+        help="결과 저장 디렉터리(기본: 자동 생성)",
     )
-    parser.add_argument("--data", type=Path, default=Path("data"))
-    parser.add_argument("--symbol", type=str, help="Override symbol to optimise")
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path("data"),
+        help="데이터 캐시 루트 경로",
+    )
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        help="최적화 대상 심볼 강제 지정",
+    )
     parser.add_argument(
         "--list-top50",
         action="store_true",
-        help="USDT-Perp 24h 거래대금 상위 50개 심볼을 번호와 함께 출력 후 종료",
+        help="USDT-Perp 거래대금 상위 50 심볼을 출력 후 종료",
     )
     parser.add_argument(
         "--pick-top50",
         type=int,
         default=0,
-        help="USDT-Perp 상위 50 리스트에서 번호로 선택(1~50). 선택된 심볼만 백테스트",
+        help="상위 50 리스트에서 번호로 심볼 선택 (1~50)",
     )
     parser.add_argument(
         "--pick-symbol",
         type=str,
-        default="",
-        help="직접 심볼 지정 (예: BINANCE:ETHUSDT). 지정 시 top50 무시",
+        help="직접 심볼 지정 (예: BINANCE:ETHUSDT)",
     )
-    parser.add_argument("--timeframe", type=str, help="Override lower timeframe")
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        help="하위 타임프레임 강제 지정",
+    )
     parser.add_argument(
         "--timeframe-grid",
         type=str,
-        help="쉼표/세미콜론으로 구분된 다중 LTF 목록을 일괄 실행 (예: '1m,3m,5m')",
+        help="쉼표/세미콜론 구분 타임프레임 일괄 실행",
     )
-    parser.add_argument("--start", type=str, help="Override backtest start date (ISO8601)")
-    parser.add_argument("--end", type=str, help="Override backtest end date (ISO8601)")
-    parser.add_argument("--leverage", type=float, help="Override leverage setting")
-    parser.add_argument("--qty-pct", type=float, help="Override quantity percent")
+    parser.add_argument(
+        "--start",
+        type=str,
+        help="백테스트 시작일 (ISO8601)",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        help="백테스트 종료일 (ISO8601)",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        help="레버리지 덮어쓰기",
+    )
+    parser.add_argument(
+        "--qty-pct",
+        type=float,
+        help="포지션 비중(%) 덮어쓰기",
+    )
     parser.add_argument(
         "--full-space",
         action="store_true",
-        help="기본 팩터 필터를 비활성화하고 원본 탐색 공간을 그대로 사용합니다",
+        help="기본 팩터 필터 비활성화",
     )
     parser.add_argument(
         "--basic-factors-only",
         action="store_true",
-        help="기본 팩터 필터를 강제로 활성화합니다",
+        help="기본 팩터 필터 강제 활성화",
     )
     parser.add_argument(
         "--llm",
         dest="llm",
         action="store_true",
-        help="Gemini 기반 LLM 후보 제안과 전략 인사이트를 활성화합니다",
+        help="Gemini 기반 LLM 제안 사용",
     )
     parser.add_argument(
         "--no-llm",
         dest="llm",
         action="store_false",
-        help="Gemini 기반 제안을 비활성화합니다",
+        help="Gemini 기반 LLM 제안 비활성화",
     )
     parser.set_defaults(llm=None)
-    parser.add_argument("--interactive", action="store_true", help="Prompt for dataset and toggle selections")
-    parser.add_argument("--enable", action="append", default=[], help="Force-enable boolean parameters (comma separated)")
-    parser.add_argument("--disable", action="append", default=[], help="Force-disable boolean parameters (comma separated)")
-    parser.add_argument("--top-k", type=int, default=0, help="Re-rank top-K trials by walk-forward OOS mean")
-    parser.add_argument("--n-trials", type=int, help="Override Optuna trial count")
-    parser.add_argument("--n-jobs", type=int, help="Optuna 병렬 worker 수 (기본 1)")
+    parser.add_argument(
+        "--interactive",
+        "--시작",
+        action="store_true",
+        help="심볼/옵션을 대화형으로 선택",
+    )
+    parser.add_argument(
+        "--enable",
+        action="append",
+        dest="enable",
+        help="강제로 활성화할 불리언 파라미터",
+    )
+    parser.add_argument(
+        "--disable",
+        action="append",
+        dest="disable",
+        help="강제로 비활성화할 불리언 파라미터",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="상위 K개 트라이얼을 워크포워드 성과로 재정렬",
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        help="Optuna 트라이얼 수 덮어쓰기",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        help="Optuna 병렬 worker 수",
+    )
     parser.add_argument(
         "--optuna-jobs",
         type=int,
-        default=DEFAULT_OPTUNA_JOBS,
-        help="Optuna 트라이얼 병렬 n_jobs. 기본=코어수 절반",
+        help="Optuna n_jobs 직접 지정",
     )
     parser.add_argument(
         "--dataset-jobs",
         type=int,
-        default=DEFAULT_DATASET_JOBS,
-        help="데이터셋 병렬 워커 수. 기본=코어수 절반",
+        help="데이터셋 병렬 worker 수",
     )
     parser.add_argument(
         "--dataset-executor",
         choices=["thread", "process"],
-        help="데이터셋 병렬 백테스트 실행기를 지정합니다 (기본 thread)",
+        help="데이터셋 병렬 백테스트 실행기 선택",
     )
     parser.add_argument(
         "--dataset-start-method",
         type=str,
-        help="Process executor 사용 시 multiprocessing start method 를 지정합니다",
+        help="multiprocessing start method 지정",
     )
     parser.add_argument(
         "--auto-workers",
         action="store_true",
-        help="가용 CPU 기반으로 Optuna worker 와 데이터셋 병렬 구성을 자동 조정합니다",
+        help="가용 CPU 기반 병렬 설정 자동 조정",
     )
-    parser.add_argument("--study-name", type=str, help="Override Optuna study name")
+    parser.add_argument(
+        "--study-name",
+        type=str,
+        help="Optuna 스터디 이름 덮어쓰기",
+    )
     parser.add_argument(
         "--study-template",
         type=str,
-        help="--timeframe-grid 사용 시 스터디 이름 템플릿 (예: '{symbol_slug}_{ltf_slug}')",
+        help="타임프레임 그리드 실행 시 스터디 이름 템플릿",
     )
-    parser.add_argument("--storage-url", type=str, help="Override Optuna storage URL (sqlite:/// or RDB)")
+    parser.add_argument(
+        "--storage-url",
+        type=str,
+        help="Optuna 스토리지 URL",
+    )
     parser.add_argument(
         "--storage-url-env",
         type=str,
-        help="Optuna 스토리지 URL을 읽어올 환경 변수 이름을 덮어씁니다",
+        help="스토리지 URL 환경변수 이름",
     )
     parser.add_argument(
         "--allow-sqlite-parallel",
         action="store_true",
-        help="SQLite 스토리지에서도 Optuna 병렬 worker를 유지합니다 (잠금 충돌 가능)",
+        help="SQLite 스토리지에서도 병렬 허용",
     )
     parser.add_argument(
         "--force-sqlite-serial",
         action="store_true",
-        help="SQLite 스토리지 사용 시 Optuna worker를 1개로 강제합니다",
+        help="SQLite 사용 시 worker 1개로 강제",
     )
-    parser.add_argument("--run-tag", type=str, help="Additional suffix for the output directory name")
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        help="출력 디렉터리 추가 태그",
+    )
     parser.add_argument(
         "--run-tag-template",
         type=str,
-        help="--timeframe-grid 실행 시 출력 디렉터리 태그 템플릿",
+        help="타임프레임 그리드 출력 태그 템플릿",
     )
-    parser.add_argument("--resume-from", type=Path, help="Path to a bank.json file for warm-start seeding")
-    parser.add_argument("--pruner", type=str, help="Override pruner selection (asha, hyperband, median, threshold, patient, wilcoxon, none)")
-    parser.add_argument("--cv", type=str, choices=["purged-kfold", "none"], help="Enable auxiliary cross-validation scoring")
-    parser.add_argument("--cv-k", type=int, help="Number of folds for Purged K-Fold validation")
-    parser.add_argument("--cv-embargo", type=float, help="Embargo fraction for Purged K-Fold validation")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="warm-start 용 bank.json 경로",
+    )
+    parser.add_argument(
+        "--pruner",
+        type=str,
+        help="프루너 선택(asha, median 등)",
+    )
+    parser.add_argument(
+        "--cv",
+        type=str,
+        choices=["purged-kfold", "none"],
+        help="보조 검증 방식",
+    )
+    parser.add_argument(
+        "--cv-k",
+        type=int,
+        help="Purged K-Fold 분할 수",
+    )
+    parser.add_argument(
+        "--cv-embargo",
+        type=float,
+        help="Purged K-Fold embargo 비율",
+    )
     return parser
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    """Parse CLI arguments and return a populated :class:`Namespace`."""
+if TYPER_AVAILABLE:
+    app = typer.Typer(add_completion=False, help="Run Pine strategy optimisation")
 
-    args = build_parser().parse_args(argv)
-    global simple_metrics_enabled
+    @app.callback(invoke_without_command=True)
+    def cli(
+        ctx: typer.Context,
+        params: Path = typer.Option(Path("config/params.yaml"), "--params", help="전략 파라미터 YAML 경로"),
+        backtest: Path = typer.Option(Path("config/backtest.yaml"), "--backtest", help="백테스트 설정 YAML 경로"),
+        output: Optional[Path] = typer.Option(None, "--output", help="결과 저장 디렉터리(기본: 자동 생성)"),
+        data: Path = typer.Option(Path("data"), "--data", help="데이터 캐시 루트 경로"),
+        symbol: Optional[str] = typer.Option(None, "--symbol", help="최적화 대상 심볼 강제 지정"),
+        list_top50: bool = typer.Option(False, "--list-top50", help="USDT-Perp 거래대금 상위 50 심볼을 출력 후 종료"),
+        pick_top50: int = typer.Option(0, "--pick-top50", help="상위 50 리스트에서 번호로 심볼 선택 (1~50)"),
+        pick_symbol: Optional[str] = typer.Option(None, "--pick-symbol", help="직접 심볼 지정 (예: BINANCE:ETHUSDT)"),
+        timeframe: Optional[str] = typer.Option(None, "--timeframe", help="하위 타임프레임 강제 지정"),
+        timeframe_grid: Optional[str] = typer.Option(None, "--timeframe-grid", help="쉼표/세미콜론 구분 타임프레임 일괄 실행"),
+        start: Optional[str] = typer.Option(None, "--start", help="백테스트 시작일 (ISO8601)"),
+        end: Optional[str] = typer.Option(None, "--end", help="백테스트 종료일 (ISO8601)"),
+        leverage: Optional[float] = typer.Option(None, "--leverage", help="레버리지 덮어쓰기"),
+        qty_pct: Optional[float] = typer.Option(None, "--qty-pct", help="포지션 비중(%) 덮어쓰기"),
+        full_space: bool = typer.Option(False, "--full-space", help="기본 팩터 필터 비활성화"),
+        basic_factors_only: bool = typer.Option(False, "--basic-factors-only", help="기본 팩터 필터 강제 활성화"),
+        llm: Optional[bool] = typer.Option(None, "--llm/--no-llm", help="Gemini 기반 LLM 제안 사용 여부"),
+        interactive: bool = typer.Option(False, "--interactive", "--시작", help="심볼/옵션을 대화형으로 선택"),
+        enable: List[str] = typer.Option([], "--enable", help="강제로 활성화할 불리언 파라미터 (여러 번 지정 가능)"),
+        disable: List[str] = typer.Option([], "--disable", help="강제로 비활성화할 불리언 파라미터"),
+        top_k: int = typer.Option(0, "--top-k", help="상위 K개 트라이얼을 워크포워드 성과로 재정렬"),
+        n_trials: Optional[int] = typer.Option(None, "--n-trials", help="Optuna 트라이얼 수 덮어쓰기"),
+        n_jobs: Optional[int] = typer.Option(None, "--n-jobs", help="Optuna 병렬 worker 수"),
+        optuna_jobs: Optional[int] = typer.Option(None, "--optuna-jobs", help="Optuna n_jobs 직접 지정"),
+        dataset_jobs: Optional[int] = typer.Option(None, "--dataset-jobs", help="데이터셋 병렬 worker 수"),
+        dataset_executor: Optional[Literal["thread", "process"]] = typer.Option(
+            None,
+            "--dataset-executor",
+            help="데이터셋 병렬 백테스트 실행기 선택",
+        ),
+        dataset_start_method: Optional[str] = typer.Option(
+            None,
+            "--dataset-start-method",
+            help="multiprocessing start method 지정",
+        ),
+        auto_workers: bool = typer.Option(False, "--auto-workers", help="가용 CPU 기반 병렬 설정 자동 조정"),
+        study_name: Optional[str] = typer.Option(None, "--study-name", help="Optuna 스터디 이름 덮어쓰기"),
+        study_template: Optional[str] = typer.Option(None, "--study-template", help="타임프레임 그리드 실행 시 스터디 이름 템플릿"),
+        storage_url: Optional[str] = typer.Option(None, "--storage-url", help="Optuna 스토리지 URL"),
+        storage_url_env: Optional[str] = typer.Option(None, "--storage-url-env", help="스토리지 URL 환경변수 이름"),
+        allow_sqlite_parallel: bool = typer.Option(False, "--allow-sqlite-parallel", help="SQLite 스토리지에서도 병렬 허용"),
+        force_sqlite_serial: bool = typer.Option(False, "--force-sqlite-serial", help="SQLite 사용 시 worker 1개로 강제"),
+        run_tag: Optional[str] = typer.Option(None, "--run-tag", help="출력 디렉터리 추가 태그"),
+        run_tag_template: Optional[str] = typer.Option(None, "--run-tag-template", help="타임프레임 그리드 출력 태그 템플릿"),
+        resume_from: Optional[Path] = typer.Option(None, "--resume-from", help="warm-start 용 bank.json 경로"),
+        pruner: Optional[str] = typer.Option(None, "--pruner", help="프루너 선택(asha, median 등)"),
+        cv: Optional[Literal["purged-kfold", "none"]] = typer.Option(
+            None,
+            "--cv",
+            help="보조 검증 방식",
+        ),
+        cv_k: Optional[int] = typer.Option(None, "--cv-k", help="Purged K-Fold 분할 수"),
+        cv_embargo: Optional[float] = typer.Option(None, "--cv-embargo", help="Purged K-Fold embargo 비율"),
+    ) -> argparse.Namespace:
+        namespace = argparse.Namespace(
+            params=params,
+            backtest=backtest,
+            output=output,
+            data=data,
+            symbol=symbol,
+            list_top50=list_top50,
+            pick_top50=pick_top50,
+            pick_symbol=pick_symbol,
+            timeframe=timeframe,
+            timeframe_grid=timeframe_grid,
+            start=start,
+            end=end,
+            leverage=leverage,
+            qty_pct=qty_pct,
+            full_space=full_space,
+            basic_factors_only=basic_factors_only,
+            llm=llm,
+            interactive=interactive,
+            enable=list(enable),
+            disable=list(disable),
+            top_k=top_k,
+            n_trials=n_trials,
+            n_jobs=n_jobs,
+            optuna_jobs=optuna_jobs,
+            dataset_jobs=dataset_jobs,
+            dataset_executor=dataset_executor,
+            dataset_start_method=dataset_start_method,
+            auto_workers=auto_workers,
+            study_name=study_name,
+            study_template=study_template,
+            storage_url=storage_url,
+            storage_url_env=storage_url_env,
+            allow_sqlite_parallel=allow_sqlite_parallel,
+            force_sqlite_serial=force_sqlite_serial,
+            run_tag=run_tag,
+            run_tag_template=run_tag_template,
+            resume_from=resume_from,
+            pruner=pruner,
+            cv=cv,
+            cv_k=cv_k,
+            cv_embargo=cv_embargo,
+        )
+        ctx.obj = namespace
+        if ctx.resilient_parsing:
+            return namespace
+
+        global simple_metrics_enabled
+        simple_metrics_enabled = False
+        execute(namespace, list(_ORIGINAL_ARGV))
+        return namespace
+else:
+    app = None
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """CLI 인자를 파싱해 :class:`argparse.Namespace` 로 반환합니다."""
+
+    global _ORIGINAL_ARGV, simple_metrics_enabled
+    tokens = list(argv or [])
+    _ORIGINAL_ARGV = list(tokens)
+    processed = _prepare_cli_tokens(tokens)
+
+    if not TYPER_AVAILABLE:
+        parser = _build_argparse_parser()
+        namespace = parser.parse_args(processed)
+        namespace.enable = list(namespace.enable or [])  # type: ignore[attr-defined]
+        namespace.disable = list(namespace.disable or [])  # type: ignore[attr-defined]
+        simple_metrics_enabled = False
+        return namespace
+
+    cmd = typer.main.get_command(app)
+    with cmd.make_context("optimize", processed, resilient_parsing=True) as ctx:
+        cmd.invoke(ctx)
+        namespace = ctx.obj if isinstance(ctx.obj, argparse.Namespace) else argparse.Namespace()
     simple_metrics_enabled = False
-    return args
+    return namespace
 
 
 def _execute_single(
@@ -3547,11 +3868,6 @@ def _execute_single(
     params_cfg.setdefault("space", {})
     backtest_cfg.setdefault("symbols", backtest_cfg.get("symbols", []))
     backtest_cfg.setdefault("timeframes", backtest_cfg.get("timeframes", []))
-
-    cli_tokens = list(argv or [])
-
-    def _has_flag(flag: str) -> bool:
-        return any(token == flag or token.startswith(f"{flag}=") for token in cli_tokens)
 
     search_cfg = _ensure_dict(params_cfg, "search")
 
@@ -3590,7 +3906,7 @@ def _execute_single(
             LOGGER.warning("--n-jobs 값 '%s' 이 올바르지 않아 1로 설정합니다.", args.n_jobs)
             search_cfg["n_jobs"] = 1
 
-    if _has_flag("--optuna-jobs"):
+    if args.optuna_jobs is not None:
         try:
             search_cfg["n_jobs"] = max(1, int(args.optuna_jobs))
         except (TypeError, ValueError):
@@ -3601,7 +3917,7 @@ def _execute_single(
             )
             search_cfg["n_jobs"] = DEFAULT_OPTUNA_JOBS
 
-    if _has_flag("--dataset-jobs"):
+    if args.dataset_jobs is not None:
         try:
             search_cfg["dataset_jobs"] = max(1, int(args.dataset_jobs))
         except (TypeError, ValueError):
@@ -4395,24 +4711,20 @@ def execute(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> N
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Entry point for ``python -m optimize.run``."""
 
+    global _ORIGINAL_ARGV
     if argv is None:
-        original_argv: List[str] = list(sys.argv[1:])
+        original_argv = list(sys.argv[1:])
     else:
         original_argv = list(argv)
 
-    parsed_argv = list(original_argv)
-    replaced_interactive = False
-    for index, token in enumerate(parsed_argv):
-        if token == "시작":
-            parsed_argv[index] = "--interactive"
-            replaced_interactive = True
-            break
+    _ORIGINAL_ARGV = list(original_argv)
+    processed = _prepare_cli_tokens(original_argv)
+    if not TYPER_AVAILABLE or app is None:
+        namespace = parse_args(original_argv)
+        execute(namespace, list(_ORIGINAL_ARGV))
+        return
 
-    if replaced_interactive and "--interactive" not in parsed_argv:
-        parsed_argv.append("--interactive")
-
-    args = parse_args(parsed_argv)
-    execute(args, original_argv)
+    app(args=processed)
 
 
 if __name__ == "__main__":
