@@ -94,7 +94,7 @@ $env:MKL_NUM_THREADS="1"
 $env:OPENBLAS_NUM_THREADS="1"
 $env:NUMEXPR_NUM_THREADS="1"
 
-2) 기본 실행 예시 (ETHUSDT / 1m vs HTF=5m)
+2) 기본 실행 예시 (ETHUSDT / 1m 단일 LTF)
 # 파라미터 탐색 범위는 params.yaml에 정의됨
 # --no-simple-metrics 권장(비정상 스코어 방지 가드 경로 사용)
 python -m optimize.run --pick-top50 1 `
@@ -140,10 +140,12 @@ python -m optimize.run --pick-top50 1 `
   인사이트 텍스트는 `reports/<timestamp>/logs/gemini_insights.md` 파일과 로그에서 확인할 수 있습니다.
 
 7) 리포트/로그 디렉터리 안내
-- 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<tf>_<htf>\...
-  예) reports\20251002-1206_ETHUSDT_1m_5m\trials\trials.jsonl
+- 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<ltf>\...
+  예) reports\20251002-1206_ETHUSDT_1m\trials\trials.jsonl
+- 현재 기본 프로필은 LTF 단일 조합만 생성하므로 폴더명에 HTF 구간이 포함되지 않습니다.
+- 상위봉 필터 테스트가 필요하면 params.yaml에서 별도 overrides를 만들어 개별 LTF용 실행을 분리하세요.
 - (패치 전 임시 해결) 경로가 없어서 에러 날 때는 먼저 폴더를 생성:
-  New-Item -ItemType Directory -Force -Path "reports\20251002-1206_ETHUSDT_1m_5m\trials"
+  New-Item -ItemType Directory -Force -Path "reports\20251002-1206_ETHUSDT_1m\trials"
 
 8) 자주 발생하는 오류와 해결
 A. FileNotFoundError / OSError: reports\...\trials 가 없다고 나옴
@@ -217,7 +219,7 @@ $env:MKL_NUM_THREADS="1"
 $env:OPENBLAS_NUM_THREADS="1"
 $env:NUMEXPR_NUM_THREADS="1"
 
-2) 기본 실행 예시 (ETHUSDT / 1m vs HTF=5m)
+2) 기본 실행 예시 (ETHUSDT / 1m 단일 LTF)
 # 파라미터 탐색 범위는 params.yaml에 정의됨
 # --no-simple-metrics 권장(비정상 스코어 방지 가드 경로 사용)
 python -m optimize.run --pick-top50 1 `
@@ -263,10 +265,12 @@ python -m optimize.run --pick-top50 1 `
   인사이트 텍스트는 `reports/<timestamp>/logs/gemini_insights.md` 파일과 로그에서 확인할 수 있습니다.
 
 7) 리포트/로그 디렉터리 안내
-- 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<tf>_<htf>\...
-  예) reports\20251002-1206_ETHUSDT_1m_5m\trials\trials.jsonl
+- 출력 경로: reports\<UTC_날짜-시간>_<심볼>_<ltf>\...
+  예) reports\20251002-1206_ETHUSDT_1m\trials\trials.jsonl
+- 현재 기본 프로필은 LTF 단일 조합만 생성하므로 폴더명에 HTF 구간이 포함되지 않습니다.
+- 상위봉 필터 테스트가 필요하면 params.yaml에서 별도 overrides를 만들어 개별 LTF용 실행을 분리하세요.
 - (패치 전 임시 해결) 경로가 없어서 에러 날 때는 먼저 폴더를 생성:
-  New-Item -ItemType Directory -Force -Path "reports\20251002-1206_ETHUSDT_1m_5m\trials"
+  New-Item -ItemType Directory -Force -Path "reports\20251002-1206_ETHUSDT_1m\trials"
 
 8) 자주 발생하는 오류와 해결
 A. FileNotFoundError / OSError: reports\...\trials 가 없다고 나옴
