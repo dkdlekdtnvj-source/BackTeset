@@ -7,11 +7,9 @@ python -m venv .venv
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 python -m pip install vectorbt
-python -m pip install typer
-python -m pip install numpy
-
-
 $env:GEMINI_API_KEY="AIzaSyDD1i5TbCqfWEMFunoxtvnpnr0VW3XZtsY"
+
+
 $env:OPTUNA_STORAGE = "postgresql+psycopg2://postgres:5432@127.0.0.1:5432/optuna"
 
 $env:OMP_NUM_THREADS="1"
@@ -24,6 +22,11 @@ python -m optimize.run
 python -m optimize.run --pick-top50 1 `
   --n-trials 3000 `
   --auto-workers `
+
+
+python -m optimize.run --pick-symbol BINANCE:ENAUSDT
+  --n-trials 30000 `
+  --auto-workers `
 
 # 1) 기존 가상환경 제거
 deactivate 2>$null
