@@ -24,7 +24,7 @@ python -m optimize.run --pick-top50 1 `
   --auto-workers `
 
 
-python -m optimize.run --pick-symbol BINANCE:ENAUSDT
+python -m optimize.run --pick-symbol BINANCE:ENAUSDT `
   --n-trials 30000 `
   --auto-workers `
 
