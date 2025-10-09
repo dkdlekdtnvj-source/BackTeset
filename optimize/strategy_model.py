@@ -108,6 +108,270 @@ def _compute_cross_series_numba(momentum_array: np.ndarray, signal_array: np.nda
 LOGGER = logging.getLogger(__name__)
 
 
+_FASTPATH_REASON_GENERAL = 0
+_FASTPATH_REASON_OPPOSITE = 1
+_FASTPATH_REASON_TIME = 2
+
+
+if NUMBA_AVAILABLE:
+
+    @njit  # type: ignore[misc]
+    def _fastpath_calc_order_size(
+        price: float,
+        tradable_capital: float,
+        base_qty_percent: float,
+        leverage: float,
+    ) -> float:
+        if price <= 0.0:
+            return 0.0
+        pct = max(base_qty_percent, 0.0)
+        if pct <= 0.0 or leverage <= 0.0:
+            return 0.0
+        capital_portion = tradable_capital * pct / 100.0
+        qty = (capital_portion * leverage) / price
+        if not np.isfinite(qty) or qty <= 0.0:
+            return 0.0
+        return qty
+
+
+    @njit  # type: ignore[misc]
+    def _run_backtest_numba_fastpath(
+        close: np.ndarray,
+        base_long_trigger: np.ndarray,
+        base_short_trigger: np.ndarray,
+        allow_long_entry: bool,
+        allow_short_entry: bool,
+        debug_force_long: bool,
+        debug_force_short: bool,
+        exit_opposite: bool,
+        use_time_stop: bool,
+        max_hold_bars: int,
+        min_hold_bars: int,
+        reentry_bars: int,
+        commission_pct: float,
+        slip_value: float,
+        leverage: float,
+        base_qty_percent: float,
+        initial_capital: float,
+        start_idx: int,
+        min_tradable_capital: float,
+        day_codes: np.ndarray,
+        min_equity_floor: float,
+    ) -> Tuple[
+        float,
+        float,
+        float,
+        float,
+        bool,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        n = close.shape[0]
+        returns = np.zeros(n, dtype=np.float64)
+        trade_entry_idx = np.empty(n, dtype=np.int64)
+        trade_exit_idx = np.empty(n, dtype=np.int64)
+        trade_direction = np.empty(n, dtype=np.int64)
+        trade_qty = np.empty(n, dtype=np.float64)
+        trade_entry_price = np.empty(n, dtype=np.float64)
+        trade_exit_price = np.empty(n, dtype=np.float64)
+        trade_pnl = np.empty(n, dtype=np.float64)
+        trade_reason = np.empty(n, dtype=np.int64)
+        trade_bars_held = np.empty(n, dtype=np.int64)
+        trade_count = 0
+
+        if start_idx < 0:
+            start_idx = 0
+        if start_idx >= n:
+            return (
+                initial_capital,
+                0.0,
+                initial_capital,
+                max(initial_capital, min_equity_floor),
+                False,
+                returns,
+                trade_entry_idx[:0],
+                trade_exit_idx[:0],
+                trade_direction[:0],
+                trade_qty[:0],
+                trade_entry_price[:0],
+                trade_exit_price[:0],
+                trade_pnl[:0],
+                trade_reason[:0],
+                trade_bars_held[:0],
+            )
+
+        equity = initial_capital
+        net_profit = 0.0
+        peak_equity = initial_capital
+        tradable_capital = max(initial_capital, min_equity_floor)
+        guard_frozen = False
+        reentry_countdown = 0
+        position_dir = 0
+        position_qty = 0.0
+        position_avg_price = 0.0
+        position_entry_idx = -1
+        bars_held = 0
+        last_day = day_codes[start_idx]
+
+        for idx in range(start_idx, n):
+            day_val = day_codes[idx]
+            if day_val != last_day:
+                guard_frozen = False
+                last_day = day_val
+
+            tradable_capital = equity
+            if tradable_capital < min_equity_floor:
+                tradable_capital = min_equity_floor
+
+            if position_dir != 0:
+                bars_held += 1
+
+            if position_dir == 0 and reentry_countdown > 0:
+                reentry_countdown -= 1
+
+            if min_tradable_capital > 0.0 and tradable_capital < min_tradable_capital:
+                guard_frozen = True
+
+            can_trade = not guard_frozen
+
+            if can_trade and position_dir == 0 and reentry_countdown == 0:
+                enter_long = False
+                if allow_long_entry and (debug_force_long or base_long_trigger[idx]):
+                    enter_long = True
+                enter_short = False
+                if allow_short_entry and (debug_force_short or base_short_trigger[idx]):
+                    enter_short = True
+
+                if enter_long:
+                    qty = _fastpath_calc_order_size(close[idx], tradable_capital, base_qty_percent, leverage)
+                    if qty > 0.0:
+                        position_dir = 1
+                        position_qty = qty
+                        position_avg_price = close[idx]
+                        position_entry_idx = idx
+                        bars_held = 0
+                        continue
+                if enter_short:
+                    qty = _fastpath_calc_order_size(close[idx], tradable_capital, base_qty_percent, leverage)
+                    if qty > 0.0:
+                        position_dir = -1
+                        position_qty = qty
+                        position_avg_price = close[idx]
+                        position_entry_idx = idx
+                        bars_held = 0
+                        continue
+
+            exit_triggered = False
+            exit_reason = _FASTPATH_REASON_GENERAL
+
+            if position_dir > 0:
+                if exit_opposite and (debug_force_short or base_short_trigger[idx]) and bars_held >= min_hold_bars:
+                    exit_triggered = True
+                    exit_reason = _FASTPATH_REASON_OPPOSITE
+                if use_time_stop and max_hold_bars > 0 and bars_held >= max_hold_bars:
+                    exit_triggered = True
+                    if exit_reason == _FASTPATH_REASON_GENERAL:
+                        exit_reason = _FASTPATH_REASON_TIME
+            elif position_dir < 0:
+                if exit_opposite and (debug_force_long or base_long_trigger[idx]) and bars_held >= min_hold_bars:
+                    exit_triggered = True
+                    exit_reason = _FASTPATH_REASON_OPPOSITE
+                if use_time_stop and max_hold_bars > 0 and bars_held >= max_hold_bars:
+                    exit_triggered = True
+                    if exit_reason == _FASTPATH_REASON_GENERAL:
+                        exit_reason = _FASTPATH_REASON_TIME
+
+            if exit_triggered and position_dir != 0:
+                direction = position_dir
+                exit_price = close[idx] - slip_value if direction > 0 else close[idx] + slip_value
+                pnl = (exit_price - position_avg_price) * direction * position_qty
+                fees = (position_avg_price + exit_price) * position_qty * commission_pct
+                pnl -= fees
+                equity += pnl
+                net_profit += pnl
+                if equity > peak_equity:
+                    peak_equity = equity
+                tradable_capital = equity
+                if tradable_capital < min_equity_floor:
+                    tradable_capital = min_equity_floor
+                if initial_capital > 0.0:
+                    returns[idx] += pnl / initial_capital
+                trade_entry_idx[trade_count] = position_entry_idx
+                trade_exit_idx[trade_count] = idx
+                trade_direction[trade_count] = direction
+                trade_qty[trade_count] = position_qty
+                trade_entry_price[trade_count] = position_avg_price
+                trade_exit_price[trade_count] = exit_price
+                trade_pnl[trade_count] = pnl
+                trade_reason[trade_count] = exit_reason
+                trade_bars_held[trade_count] = bars_held
+                trade_count += 1
+                position_dir = 0
+                position_qty = 0.0
+                position_avg_price = 0.0
+                position_entry_idx = -1
+                bars_held = 0
+                reentry_countdown = reentry_bars
+                continue
+
+        if position_dir != 0:
+            direction = position_dir
+            exit_price = close[n - 1] - slip_value if direction > 0 else close[n - 1] + slip_value
+            pnl = (exit_price - position_avg_price) * direction * position_qty
+            fees = (position_avg_price + exit_price) * position_qty * commission_pct
+            pnl -= fees
+            equity += pnl
+            net_profit += pnl
+            if equity > peak_equity:
+                peak_equity = equity
+            tradable_capital = equity
+            if tradable_capital < min_equity_floor:
+                tradable_capital = min_equity_floor
+            if initial_capital > 0.0:
+                returns[n - 1] += pnl / initial_capital
+            trade_entry_idx[trade_count] = position_entry_idx
+            trade_exit_idx[trade_count] = n - 1
+            trade_direction[trade_count] = direction
+            trade_qty[trade_count] = position_qty
+            trade_entry_price[trade_count] = position_avg_price
+            trade_exit_price[trade_count] = exit_price
+            trade_pnl[trade_count] = pnl
+            trade_reason[trade_count] = _FASTPATH_REASON_GENERAL
+            trade_bars_held[trade_count] = bars_held
+            trade_count += 1
+
+        return (
+            equity,
+            net_profit,
+            peak_equity,
+            tradable_capital,
+            guard_frozen,
+            returns,
+            trade_entry_idx[:trade_count],
+            trade_exit_idx[:trade_count],
+            trade_direction[:trade_count],
+            trade_qty[:trade_count],
+            trade_entry_price[:trade_count],
+            trade_exit_price[:trade_count],
+            trade_pnl[:trade_count],
+            trade_reason[:trade_count],
+            trade_bars_held[:trade_count],
+        )
+
+else:  # NUMBA_AVAILABLE
+
+    def _run_backtest_numba_fastpath(*args, **kwargs):  # type: ignore[unused-argument]
+        raise RuntimeError("Numba is not available")
+
+
 # =====================================================================================
 # === 보조 계산 함수들 ===============================================================
 # =====================================================================================
@@ -975,6 +1239,12 @@ def run_backtest(
         min_trades_req = max(0, int(float(min_trades_value)))
     except (TypeError, ValueError, OverflowError):
         min_trades_req = max(0, int(min_trades_default))
+    try:
+        min_trades_value_float = float(min_trades_value)
+    except (TypeError, ValueError, OverflowError):
+        min_trades_value_float = float(min_trades_default)
+    if not np.isfinite(min_trades_value_float):
+        min_trades_value_float = float(min_trades_default)
 
     use_daily_loss_guard = bool_param("useDailyLossGuard", False)
     daily_loss_limit = float_param("dailyLossLimit", 80.0)
@@ -994,6 +1264,12 @@ def run_backtest(
         max_consecutive_losses = max(0, int(float(max_consecutive_value)))
     except (TypeError, ValueError, OverflowError):
         max_consecutive_losses = max(0, int(max_consecutive_loss_default))
+    try:
+        max_consecutive_value_float = float(max_consecutive_value)
+    except (TypeError, ValueError, OverflowError):
+        max_consecutive_value_float = float(max_consecutive_loss_default)
+    if not np.isfinite(max_consecutive_value_float):
+        max_consecutive_value_float = float(max_consecutive_loss_default)
     use_capital_guard = bool_param("useCapitalGuard", False)
     capital_guard_pct = float_param("capitalGuardPct", 20.0)
     max_daily_losses = int_param("maxDailyLosses", 0)
@@ -1129,6 +1405,12 @@ def run_backtest(
         min_hold_bars_param = max(0, int(float(min_hold_value)))
     except (TypeError, ValueError, OverflowError):
         min_hold_bars_param = max(0, int(min_hold_default))
+    try:
+        min_hold_value_float = float(min_hold_value)
+    except (TypeError, ValueError, OverflowError):
+        min_hold_value_float = float(min_hold_default)
+    if not np.isfinite(min_hold_value_float):
+        min_hold_value_float = float(min_hold_default)
     use_kasa = bool_param("useKASA", False)
     kasa_rsi_len = int_param("kasa_rsiLen", 14, enabled=use_kasa)
     kasa_rsi_ob = float_param("kasa_rsiOB", 72.0, enabled=use_kasa)
@@ -1140,6 +1422,245 @@ def run_backtest(
     atr_slow_len = int_param("atrSlowLen", 20, enabled=use_shock)
     shock_mult = float_param("shockMult", 2.5, enabled=use_shock)
     shock_action = str_param("shockAction", "손절 타이트닝", enabled=use_shock)
+
+    def _finalise_metrics_result(
+        state: EquityState,
+        trades: List[Trade],
+        returns_series: pd.Series,
+        guard_flag: bool,
+    ) -> Dict[str, float]:
+        metrics = aggregate_metrics(trades, returns_series, simple=simple_metrics_only)
+        initial_capital_value = float(state.initial_capital)
+        metrics["InitialCapital"] = initial_capital_value
+        metrics.setdefault("InitialEquity", initial_capital_value)
+        metrics.setdefault("InitialBalance", initial_capital_value)
+        metrics.setdefault("StartingBalance", initial_capital_value)
+        was_lossless = bool(metrics.get("LosslessProfitFactor"))
+        base_threshold = abs(initial_capital_value) * LOSSLESS_GROSS_LOSS_PCT
+        threshold_override = base_threshold
+        existing_threshold = metrics.get("LosslessGrossLossThreshold")
+        try:
+            existing_numeric = float(existing_threshold)
+        except (TypeError, ValueError):
+            existing_numeric = float("nan")
+        if np.isfinite(existing_numeric) and existing_numeric > 0:
+            threshold_override = max(existing_numeric, base_threshold)
+        result = apply_lossless_anomaly(metrics, threshold=threshold_override)
+        if result and not was_lossless:
+            flag, trades_val, wins_val, abs_loss, threshold = result
+            if flag == LOSSLESS_ANOMALY_FLAG:
+                LOGGER.info(
+                    "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
+                    int(trades_val),
+                    int(wins_val),
+                )
+            elif flag == MICRO_LOSS_ANOMALY_FLAG:
+                LOGGER.warning(
+                    "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
+                    abs_loss,
+                    threshold,
+                    int(trades_val),
+                    int(wins_val),
+                )
+            else:
+                LOGGER.warning(
+                    "DisplayedProfitFactor=0으로 처리한 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
+                    flag,
+                    int(trades_val),
+                    int(wins_val),
+                )
+        if simple_metrics_only:
+            metrics["SimpleMetricsOnly"] = True
+        metrics["FinalEquity"] = state.equity
+        metrics["NetProfitAbs"] = state.net_profit
+        metrics["GuardFrozen"] = float(guard_flag)
+        metrics["TradesList"] = trades
+        metrics["Returns"] = returns_series
+        metrics["Withdrawable"] = state.withdrawable
+        _apply_penalty_settings(
+            metrics,
+            min_trades_value=min_trades_value_float,
+            min_hold_value=min_hold_value_float,
+            max_loss_streak=max_consecutive_value_float,
+        )
+        metrics["Valid"] = (
+            metrics.get("Trades", 0.0) >= min_trades_req
+            and metrics.get("AvgHoldBars", 0.0) >= min_hold_bars_param
+            and metrics.get("MaxConsecutiveLosses", 0.0) <= max_consecutive_losses
+        )
+        if metrics.get("LosslessProfitFactor"):
+            metrics["Valid"] = False
+        return metrics
+
+    def _attempt_fastpath() -> Optional[Dict[str, float]]:
+        if not (use_numba and NUMBA_AVAILABLE):
+            return None
+        blockers: List[str] = []
+        feature_flags = {
+            "wallet": use_wallet,
+            "drawdown_scaling": use_drawdown_scaling,
+            "performance_risk": use_perf_adaptive_risk,
+            "daily_loss_guard": use_daily_loss_guard,
+            "daily_profit_lock": use_daily_profit_lock,
+            "weekly_profit_lock": use_weekly_profit_lock,
+            "loss_streak_guard": use_loss_streak_guard,
+            "capital_guard": use_capital_guard,
+            "max_daily_losses": max_daily_losses > 0,
+            "max_guard_fires": max_guard_fires > 0,
+            "guard_exit": use_guard_exit,
+            "volatility_guard": use_volatility_guard,
+            "mom_fade": use_mom_fade,
+            "stop_loss": use_stop_loss,
+            "atr_trail": use_atr_trail,
+            "breakeven_stop": use_breakeven_stop,
+            "pivot_stop": use_pivot_stop,
+            "atr_profit": use_atr_profit,
+            "dynamic_vol": use_dyn_vol,
+            "stop_distance_guard": use_stop_distance_guard,
+            "kasa_exit": use_kasa,
+            "be_tiers": use_be_tiers,
+            "shock_guard": use_shock,
+            "reversal": use_reversal,
+            "equity_slope_filter": use_equity_slope_filter,
+            "sqz_gate": use_sqz_gate,
+            "structure_gate": use_structure_gate,
+            "event_filter": use_event_filter,
+            "distance_guard": use_distance_guard,
+            "regime_filter": use_regime_filter,
+            "adx_filter": use_adx,
+            "atr_diff": use_atr_diff,
+            "ema_filter": use_ema,
+            "bb_filter": use_bb_filter,
+            "stoch_rsi": use_stoch_rsi,
+            "obv_filter": use_obv,
+            "htf_trend": use_htf_trend,
+            "hma_filter": use_hma_filter,
+            "range_filter": use_range_filter,
+            "sizing_override": use_sizing_override,
+        }
+        for name, enabled in feature_flags.items():
+            if enabled:
+                blockers.append(name)
+        if blockers:
+            LOGGER.debug("Numba 패스트패스를 사용할 수 없습니다. 비활성화된 기능: %s", ", ".join(sorted(blockers)))
+            return None
+        try:
+            close_array = df["close"].to_numpy(dtype=np.float64)
+            momentum_array = momentum.to_numpy(dtype=np.float64)
+            buy_thresh_array = buy_thresh_series.to_numpy(dtype=np.float64)
+            sell_thresh_array = sell_thresh_series.to_numpy(dtype=np.float64)
+            flux_array = flux_hist.to_numpy(dtype=np.float64)
+            cross_up_array = _cross_up_series.to_numpy(dtype=np.bool_)
+            cross_down_array = _cross_dn_series.to_numpy(dtype=np.bool_)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("Numba 패스트패스 준비 중 예외 발생: %s", exc)
+            return None
+        long_cross_ok = cross_up_array
+        short_cross_ok = cross_down_array
+        base_long_trigger = long_cross_ok & (momentum_array < buy_thresh_array) & (flux_array > 0.0)
+        base_short_trigger = short_cross_ok & (momentum_array > sell_thresh_array) & (flux_array < 0.0)
+        base_long_trigger = np.ascontiguousarray(base_long_trigger, dtype=np.bool_)
+        base_short_trigger = np.ascontiguousarray(base_short_trigger, dtype=np.bool_)
+        index_ns = df.index.asi8
+        start_value = int(start_ts.value)
+        start_idx = int(np.searchsorted(index_ns, start_value, side="left")) if len(index_ns) else 0
+        day_codes = np.ascontiguousarray(index_ns // 86_400_000_000_000, dtype=np.int64)
+        min_equity_floor = float(initial_capital) * 0.01
+        try:
+            (
+                equity_val,
+                net_profit_val,
+                peak_equity_val,
+                tradable_capital_val,
+                guard_flag,
+                returns_array,
+                entry_idx_arr,
+                exit_idx_arr,
+                direction_arr,
+                qty_arr,
+                entry_price_arr,
+                exit_price_arr,
+                pnl_arr,
+                reason_arr,
+                bars_arr,
+            ) = _run_backtest_numba_fastpath(
+                np.ascontiguousarray(close_array, dtype=np.float64),
+                base_long_trigger,
+                base_short_trigger,
+                bool(allow_long_entry),
+                bool(allow_short_entry),
+                bool(debug_force_long),
+                bool(debug_force_short),
+                bool(exit_opposite),
+                bool(use_time_stop),
+                int(max_hold_bars),
+                int(min_hold_bars_param),
+                int(reentry_bars),
+                float(commission_pct),
+                float(slip_value),
+                float(leverage),
+                float(base_qty_percent),
+                float(initial_capital),
+                start_idx,
+                float(min_tradable_capital),
+                day_codes,
+                float(min_equity_floor),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("Numba 패스트패스 실행 중 예외 발생: %s", exc)
+            return None
+
+        returns_series = pd.Series(returns_array, index=df.index)
+        trades: List[Trade] = []
+        total_trades = len(entry_idx_arr)
+        for i in range(total_trades):
+            entry_idx = int(entry_idx_arr[i])
+            exit_idx = int(exit_idx_arr[i])
+            direction = int(direction_arr[i])
+            qty = float(qty_arr[i])
+            entry_price = float(entry_price_arr[i])
+            exit_price = float(exit_price_arr[i])
+            pnl = float(pnl_arr[i])
+            bars = int(bars_arr[i])
+            reason_code = int(reason_arr[i])
+            if direction > 0:
+                reason_text = "Exit Long"
+            else:
+                reason_text = "Exit Short"
+            if reason_code == _FASTPATH_REASON_OPPOSITE:
+                reason_text = "opposite_signal"
+            elif reason_code == _FASTPATH_REASON_TIME:
+                reason_text = "time_stop"
+            trades.append(
+                Trade(
+                    entry_time=df.index[entry_idx],
+                    exit_time=df.index[exit_idx],
+                    direction="long" if direction > 0 else "short",
+                    size=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    profit=pnl,
+                    return_pct=pnl / initial_capital if initial_capital else 0.0,
+                    mfe=np.nan,
+                    mae=np.nan,
+                    bars_held=bars,
+                    reason=reason_text,
+                )
+            )
+
+        state = EquityState(
+            initial_capital=initial_capital,
+            equity=float(equity_val),
+            net_profit=float(net_profit_val),
+            withdrawable=0.0,
+            tradable_capital=float(tradable_capital_val),
+            peak_equity=float(peak_equity_val),
+            daily_start_capital=initial_capital,
+            daily_peak_capital=max(initial_capital, float(peak_equity_val)),
+            week_start_equity=initial_capital,
+            week_peak_equity=float(peak_equity_val),
+        )
+        return _finalise_metrics_result(state, trades, returns_series, guard_flag)
 
     # =================================================================================
     # === 인디케이터 선계산 ===========================================================
@@ -1299,6 +1820,10 @@ def run_backtest(
             sell_val = abs(sell_threshold)
         buy_thresh_series = pd.Series(buy_val, index=df.index)
         sell_thresh_series = pd.Series(sell_val, index=df.index)
+
+    fastpath_metrics = _attempt_fastpath()
+    if fastpath_metrics is not None:
+        return fastpath_metrics
 
     vol_guard_atr_pct = pd.Series(0.0, index=df.index)
     if use_volatility_guard:
@@ -2100,68 +2625,7 @@ def run_backtest(
     if position.direction != 0 and position.entry_time is not None:
         close_position(df.index[-1], df.iloc[-1]["close"], "EndOfData")
 
-    metrics = aggregate_metrics(trades, returns_series, simple=simple_metrics_only)
-    initial_capital_value = float(state.initial_capital)
-    metrics["InitialCapital"] = initial_capital_value
-    metrics.setdefault("InitialEquity", initial_capital_value)
-    metrics.setdefault("InitialBalance", initial_capital_value)
-    metrics.setdefault("StartingBalance", initial_capital_value)
-    was_lossless = bool(metrics.get("LosslessProfitFactor"))
-    base_threshold = abs(initial_capital_value) * LOSSLESS_GROSS_LOSS_PCT
-    threshold_override = base_threshold
-    existing_threshold = metrics.get("LosslessGrossLossThreshold")
-    try:
-        existing_numeric = float(existing_threshold)
-    except (TypeError, ValueError):
-        existing_numeric = float("nan")
-    if np.isfinite(existing_numeric) and existing_numeric > 0:
-        threshold_override = max(existing_numeric, base_threshold)
-    result = apply_lossless_anomaly(metrics, threshold=threshold_override)
-    if result and not was_lossless:
-        flag, trades_val, wins_val, abs_loss, threshold = result
-        if flag == LOSSLESS_ANOMALY_FLAG:
-            LOGGER.info(
-                "손실이 없는 결과(trades=%d, wins=%d)로 ProfitFactor='overfactor' 및 DisplayedProfitFactor=0으로 표기합니다.",
-                int(trades_val),
-                int(wins_val),
-            )
-        elif flag == MICRO_LOSS_ANOMALY_FLAG:
-            LOGGER.warning(
-                "미세 손실 %.6g (임계값 %.6g 이하)로 DisplayedProfitFactor=0으로 고정합니다. trades=%d, wins=%d",
-                abs_loss,
-                threshold,
-                int(trades_val),
-                int(wins_val),
-            )
-        else:
-            LOGGER.warning(
-                "DisplayedProfitFactor=0으로 처리한 특이 케이스(flag=%s)를 감지했습니다. trades=%d, wins=%d",
-                flag,
-                int(trades_val),
-                int(wins_val),
-            )
-    if simple_metrics_only:
-        metrics["SimpleMetricsOnly"] = True
-    metrics["FinalEquity"] = state.equity
-    metrics["NetProfitAbs"] = state.net_profit
-    metrics["GuardFrozen"] = float(guard_frozen)
-    metrics["TradesList"] = trades
-    metrics["Returns"] = returns_series
-    metrics["Withdrawable"] = state.withdrawable
-    _apply_penalty_settings(
-        metrics,
-        min_trades_value=min_trades_req,
-        min_hold_value=min_hold_bars_param,
-        max_loss_streak=max_consecutive_losses,
-    )
-    metrics["Valid"] = (
-        metrics.get("Trades", 0.0) >= min_trades_req
-        and metrics.get("AvgHoldBars", 0.0) >= min_hold_bars_param
-        and metrics.get("MaxConsecutiveLosses", 0.0) <= max_consecutive_losses
-    )
-    if metrics.get("LosslessProfitFactor"):
-        metrics["Valid"] = False
-    return metrics
+    return _finalise_metrics_result(state, trades, returns_series, guard_frozen)
 
 
 

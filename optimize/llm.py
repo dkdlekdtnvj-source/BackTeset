@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
+import numpy as np
 import optuna
 
 from optimize.search_spaces import SpaceSpec
@@ -95,6 +96,104 @@ def _strip_quotes(text: str) -> str:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
         return text[1:-1]
     return text
+
+
+def _rankdata(values: Sequence[float]) -> List[float]:
+    """Compute rank data with average ranks for ties."""
+
+    enumerated = sorted(((float(v), idx) for idx, v in enumerate(values)), key=lambda item: item[0])
+    n = len(enumerated)
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i + 1
+        value = enumerated[i][0]
+        while j < n and enumerated[j][0] == value:
+            j += 1
+        avg_rank = (i + j - 1) / 2.0 + 1.0
+        for k in range(i, j):
+            ranks[enumerated[k][1]] = avg_rank
+        i = j
+    return ranks
+
+
+def _spearmanr_safe(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
+    """Calculate Spearman correlation with graceful degradation."""
+
+    if len(x) != len(y) or len(x) < 2:
+        return None
+    rank_x = _rankdata(x)
+    rank_y = _rankdata(y)
+    mean_x = sum(rank_x) / len(rank_x)
+    mean_y = sum(rank_y) / len(rank_y)
+    num = 0.0
+    denom_x = 0.0
+    denom_y = 0.0
+    for rx, ry in zip(rank_x, rank_y):
+        dx = rx - mean_x
+        dy = ry - mean_y
+        num += dx * dy
+        denom_x += dx * dx
+        denom_y += dy * dy
+    if denom_x <= 0.0 or denom_y <= 0.0:
+        return None
+    return num / math.sqrt(denom_x * denom_y)
+
+
+def _compute_param_statistics(
+    trials: Sequence[optuna.trial.FrozenTrial],
+    scores: Sequence[float],
+) -> Dict[str, object]:
+    """Derive correlation-style statistics for parameters across trials."""
+
+    if not trials or not scores:
+        return {}
+    per_param: Dict[str, List[Tuple[object, float]]] = {}
+    for trial, score in zip(trials, scores):
+        if not math.isfinite(score):
+            continue
+        for name, value in trial.params.items():
+            per_param.setdefault(name, []).append((value, float(score)))
+    analytics: Dict[str, object] = {}
+    for name, values in per_param.items():
+        if len(values) < 3:
+            continue
+        raw_values = [item[0] for item in values]
+        score_values = [item[1] for item in values]
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_values):
+            numeric_values = [float(v) for v in raw_values]
+            correlation = _spearmanr_safe(numeric_values, score_values)
+            pair_array = sorted(zip(score_values, numeric_values), key=lambda item: item[0])
+            quartile = max(int(len(pair_array) * 0.25), 1)
+            bottom_slice = pair_array[:quartile]
+            top_slice = pair_array[-quartile:]
+            top_scores = [item[0] for item in top_slice]
+            analytics[name] = {
+                "count": len(pair_array),
+                "spearman": None if correlation is None else round(float(correlation), 6),
+                "top_quartile_value_mean": round(float(np.mean([item[1] for item in top_slice])), 6),
+                "top_quartile_score_mean": round(float(np.mean(top_scores)), 6),
+                "bottom_quartile_value_mean": round(float(np.mean([item[1] for item in bottom_slice])), 6),
+                "bottom_quartile_score_mean": round(float(np.mean([item[0] for item in bottom_slice])), 6),
+            }
+        else:
+            grouped: Dict[str, List[float]] = {}
+            for value, score in values:
+                key = str(value)
+                grouped.setdefault(key, []).append(score)
+            averaged = [
+                (label, float(np.mean(scores)), len(scores))
+                for label, scores in grouped.items()
+            ]
+            averaged.sort(key=lambda item: item[1], reverse=True)
+            analytics[name] = {
+                "count": sum(item[2] for item in averaged),
+                "category_scores": [
+                    {"choice": label, "mean_score": round(score, 6), "observations": obs}
+                    for label, score, obs in averaged[:6]
+                ],
+            }
+    return analytics
 
 
 def _load_env_file_variables(path: Path) -> Dict[str, str]:
@@ -364,6 +463,7 @@ def generate_llm_candidates(
 
     param_summaries: Dict[str, object] = {}
     summary_trials = sorted_trials[:top_n]
+    summary_scores = [_trial_priority(trial, config) for trial in summary_trials]
     for name in space.keys():
         observed = [trial.params.get(name) for trial in summary_trials if name in trial.params]
         if not observed:
@@ -382,6 +482,8 @@ def generate_llm_candidates(
             continue
         counts = Counter(observed)
         param_summaries[name] = {"most_common": [item for item, _ in counts.most_common(3)]}
+
+    param_statistics = _compute_param_statistics(summary_trials, summary_scores)
 
     client = genai.Client(api_key=api_key)
     model = str(config.get("model", "gemini-2.0-flash-exp"))
@@ -402,6 +504,11 @@ def generate_llm_candidates(
             "Parameter value summaries across the top trials (min/median/max or most common choices):"
         )
         prompt_sections.append(json.dumps(param_summaries, indent=2))
+    if param_statistics:
+        prompt_sections.append(
+            "Parameter-performance analytics highlighting correlations and top/bottom quartiles:"
+        )
+        prompt_sections.append(json.dumps(param_statistics, indent=2))
     prompt_sections.append(
         f"Propose {count} new parameter sets strictly within the given bounds as a JSON array under the key 'candidates'."
         " Also return 2-3 short tactical insights or strategy adjustments derived from the trials as a string array under the key 'insights'."
