@@ -30,7 +30,13 @@ objective:
   # === 기본룰: ProfitFactor 중심 ===
   - name: ProfitFactor
     weight: 1.0
-
+  - name: Trades
+    weight: 0.2
+  # --- 토글 시작: 최대 손실폭(MaxDD) 목표 추가 ---
+  - name: MaxDD
+    goal: minimize  # MaxDD는 낮을수록 좋으니까 'minimize'로 설정
+    weight: 0.5     # 이 가중치가 높을수록 DD가 낮은 안정적인 전략을 더 선호하게 돼
+  # --- 토글 끝 ---
 constraints:
   min_trades_test: 50   # 최소 거래 수. 거래수가 50 미만이면 학습 점수에 반영하지 않습니다.
   max_dd_pct: 70        # MaxDD 70% 초과면 패널티
