@@ -114,7 +114,7 @@ llm:
   api_key_env: GEMINI_API_KEY
   # api_key: "..."               # 직접 입력 (권장 X)
   # api_key_file: ~/.secrets/gemini.key
-  model: gemini-2.5-flash
+  model: gemini-flash-latest
   top_n: 10
   count: 8
   initial_trials: 20
