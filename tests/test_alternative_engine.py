@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import pandas.testing as pdt
 from optimize import alternative_engine as alt
 from optimize.run import combine_metrics
 
@@ -121,3 +122,47 @@ def test_vectorbt_backtest_returns_trades_and_returns(monkeypatch):
     combined = combine_metrics([metrics])
     assert combined["Trades"] == len(metrics["TradesList"])
     assert combined["NetProfit"] != 0.0
+
+
+def test_compute_indicators_with_mod_flux_matches_manual_calculation():
+    index = pd.date_range("2024-01-01", periods=50, freq="1h", tz="UTC")
+    base = np.linspace(100.0, 110.0, num=len(index))
+    df = pd.DataFrame(
+        {
+            "open": base + np.random.default_rng(42).normal(0, 0.5, size=len(index)),
+            "high": base + 1.0,
+            "low": base - 1.0,
+            "close": base + np.random.default_rng(24).normal(0, 0.3, size=len(index)),
+            "volume": np.linspace(1.0, 2.0, num=len(index)),
+        },
+        index=index,
+    )
+
+    params = {
+        "oscLen": 10,
+        "signalLen": 3,
+        "fluxLen": 8,
+        "fluxSmoothLen": 3,
+        "useFluxHeikin": False,
+        "useModFlux": True,
+        "kcLen": 10,
+        "kcMult": 1.0,
+        "bbLen": 12,
+        "bbMult": 1.2,
+        "maType": "SMA",
+    }
+
+    *_unused, flux_hist = alt._compute_indicators(df, params)
+
+    flux_df = alt._heikin_ashi(df) if params["useFluxHeikin"] else df
+    plus_di, minus_di, _ = alt._dmi(flux_df, params["fluxLen"])
+    flux_denom = (plus_di + minus_di).replace(0.0, np.nan)
+    mod_flux_ratio = (plus_di - minus_di).divide(flux_denom)
+    mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    flux_half = max(int(np.round(params["fluxLen"] / 2.0)), 1)
+    mod_flux_core = alt._rma(mod_flux_ratio, flux_half) * 100.0
+    expected = mod_flux_core.rolling(
+        params["fluxSmoothLen"], min_periods=params["fluxSmoothLen"]
+    ).mean()
+
+    pdt.assert_series_equal(flux_hist, expected, check_names=False, check_exact=False, rtol=1e-12, atol=1e-12)
