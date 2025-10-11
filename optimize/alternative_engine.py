@@ -24,6 +24,7 @@ from optimize.metrics import Trade, aggregate_metrics
 from optimize.strategy_model import (  # 재사용 가능한 보조 함수들
     _atr,
     _bars_since_mask,
+    _dmi,
     _directional_flux,
     _ema,
     _heikin_ashi,
@@ -330,6 +331,7 @@ def _compute_indicators(
     flux_len = max(_coerce_int(params.get("fluxLen"), 14), 1)
     flux_smooth_len = max(_coerce_int(params.get("fluxSmoothLen"), 1), 1)
     flux_use_ha = _coerce_bool(params.get("useFluxHeikin"), True)
+    use_mod_flux = _coerce_bool(params.get("useModFlux"), False)
 
     hl2 = (df["high"] + df["low"]) / 2.0
     atr_kc_raw = _atr(df, kc_len)
@@ -373,11 +375,25 @@ def _compute_indicators(
     cross_down = (prev_mom >= prev_sig) & (momentum < mom_signal)
 
     flux_df = _heikin_ashi(df) if flux_use_ha else df
-    flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
-    if flux_smooth_len > 1:
-        flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+    if use_mod_flux:
+        plus_di, minus_di, _ = _dmi(flux_df, flux_len)
+        flux_denom = (plus_di + minus_di).replace(0.0, np.nan)
+        mod_flux_ratio = (plus_di - minus_di).divide(flux_denom)
+        mod_flux_ratio = mod_flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        flux_half = max(int(np.round(flux_len / 2.0)), 1)
+        mod_flux_core = _rma(mod_flux_ratio, flux_half) * 100.0
+        if flux_smooth_len > 1:
+            flux_hist = mod_flux_core.rolling(
+                flux_smooth_len, min_periods=flux_smooth_len
+            ).mean()
+        else:
+            flux_hist = mod_flux_core
     else:
-        flux_hist = flux_raw
+        flux_raw = _directional_flux(flux_df, flux_len, flux_smooth_len)
+        if flux_smooth_len > 1:
+            flux_hist = flux_raw.rolling(flux_smooth_len, min_periods=flux_smooth_len).mean()
+        else:
+            flux_hist = flux_raw
 
     return momentum, mom_signal, cross_up.astype(bool), cross_down.astype(bool), flux_hist
 
