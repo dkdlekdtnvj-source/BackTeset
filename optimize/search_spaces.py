@@ -60,6 +60,57 @@ def sample_parameters(trial: optuna.Trial, space: SpaceSpec) -> Dict[str, object
     return params
 
 
+def random_parameters(space: SpaceSpec, rng: Optional[np.random.Generator] = None) -> Dict[str, object]:
+    """Sample a random parameter set from *space* without an Optuna trial.
+
+    이 함수는 Optuna sampler 문맥 밖에서 탐색 공간을 균일하게 샘플링할 때
+    사용됩니다. `requires` 조건을 준수하며, 정수/실수 타입은 `step` 간격을
+    고려해 균등 분포로 선택합니다.
+    """
+
+    rng = rng or np.random.default_rng()
+    params: Dict[str, object] = {}
+    for name, spec in space.items():
+        requires = spec.get("requires")
+        if requires and not _requirements_met(params, requires):
+            if "default" in spec:
+                params[name] = spec["default"]
+            continue
+
+        dtype = spec["type"]
+        if dtype == "int":
+            low = int(spec["min"])
+            high = int(spec["max"])
+            step = int(spec.get("step", 1)) or 1
+            choices = list(range(low, high + 1, step))
+            if not choices:
+                raise ValueError(f"정수 파라미터 '{name}' 의 범위가 비어있습니다.")
+            params[name] = int(rng.choice(choices))
+        elif dtype == "float":
+            low = float(spec["min"])
+            high = float(spec["max"])
+            step = float(spec.get("step", 0.0))
+            if step:
+                count = int(np.floor((high - low) / step)) + 1
+                choices = [low + idx * step for idx in range(count)]
+                params[name] = float(rng.choice(choices))
+            else:
+                params[name] = float(rng.uniform(low, high))
+        elif dtype == "bool":
+            params[name] = bool(rng.integers(0, 2))
+        elif dtype in {"choice", "str", "string"}:
+            values = spec.get("values") or spec.get("options") or spec.get("choices")
+            if not values:
+                raise ValueError(
+                    f"Choice 파라미터 '{name}' 은 'values' 목록이 필요합니다."
+                )
+            params[name] = rng.choice(list(values))
+        else:
+            raise ValueError(f"Unsupported parameter type: {dtype}")
+
+    return params
+
+
 def grid_choices(space: SpaceSpec) -> Dict[str, List[object]]:
     grid: Dict[str, List[object]] = {}
     for name, spec in space.items():

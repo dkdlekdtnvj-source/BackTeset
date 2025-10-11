@@ -41,6 +41,10 @@ pip install -r requirements.txt
    and exit modules (ATR stop, fixed % stop, swing/pivot stops, ATR trail,
    breakeven, time stop). You can also pre-define `overrides` to pin any parameter
    on/off before a run and enable Top-K walk-forward re-ranking via `search.top_k`.
+   The new `search.diversify` block monitors consecutive trials and, if the optimiser keeps
+   nudging only minor threshold values, it injects a few random/mutated candidates and can
+   rotate through a custom timeframe cycle (예: 1m×5회 → 3m×3회 → 5m×1회) so the search space
+   does not collapse into a single groove.
 3. Configure the sweep universe in `config/backtest.yaml`. By default it contains
   nine Binance USDT perpetual pairs (ENA, ETH, BTC, SOL, **XPLA**, **ASTER**, DOGE,
   XRP, SUI) with lower timeframes 1m/3m/5m and a single 2024-01-01 → 2025-09-25 창.
@@ -149,7 +153,9 @@ overrides:
   3. `llm.api_key_env` (기본 `GEMINI_API_KEY`) 환경 변수
   4. 현재 작업 디렉터리·저장소 루트·`config/` 아래 `.env` 파일에 정의된 동일한 이름의 키
   어떤 경로에서도 키를 찾지 못하면 실행 시 경고가 출력되고 LLM 단계는 생략됩니다.
-- 기본 모델은 `gemini-2.0-flash-exp` 이며 `top_n`/`count` 값으로 참고할 트라이얼
+- 기본 모델은 `gemini-2.5-pro` 로 변경되었으며, 권한/쿼터 문제로 호출이 거부될 경우
+  자동으로 `gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-flash` 순서로 폴백합니다.
+  `top_n`/`count` 값으로 참고할 트라이얼 수와 제안 받을 후보 수를 제어할 수 있습니다.
   수와 제안 받을 후보 수를 제어할 수 있습니다.
 - `google-genai` 패키지가 설치돼 있지 않으면 경고만 출력하고 LLM 단계를 건너뜁니다.
 - CLI `--llm`/`--no-llm` 플래그 또는 인터랙티브 모드 질문으로 실행 중에도 손쉽게

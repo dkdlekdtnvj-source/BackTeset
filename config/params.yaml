@@ -19,6 +19,19 @@ search:
   storage_connect_timeout: 10           # DB 커넥션 시도 타임아웃(초)
   storage_statement_timeout_ms: 300000  # 쿼리 타임아웃(밀리초). 0 또는 비우면 비활성화
   storage_isolation_level: READ COMMITTED  # PostgreSQL 권장 격리 수준
+  diversify:
+    enabled: true
+    similarity_threshold: 0.9   # 최근 트라이얼과 90% 이상 동일하면 정체로 간주
+    max_consecutive: 6          # 연속 6회 이상 반복되면 강제 점프
+    jump_trials: 3              # 큐에 주입할 랜덤/돌연변이 후보 수
+    history_bias: 0.4           # 일부는 최근 성공 파라미터 주변을 탐색
+    timeframe_cycle:            # 1분 5회 → 3분 3회 → 5분 1회 루프 예시
+      - timeframe: "1m"
+        repeat: 5
+      - timeframe: "3m"
+        repeat: 3
+      - timeframe: "5m"
+        repeat: 1
 
 # === 엔진/성능 옵션 ===
 useNumba: true          # Numba JIT 사용 (없으면 기본 false)
