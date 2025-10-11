@@ -166,3 +166,40 @@ def test_compute_indicators_with_mod_flux_matches_manual_calculation():
     ).mean()
 
     pdt.assert_series_equal(flux_hist, expected, check_names=False, check_exact=False, rtol=1e-12, atol=1e-12)
+
+
+def test_compute_indicators_with_directional_flux_applies_additional_smoothing():
+    index = pd.date_range("2024-01-01", periods=60, freq="1h", tz="UTC")
+    base = np.linspace(120.0, 135.0, num=len(index))
+    df = pd.DataFrame(
+        {
+            "open": base + np.random.default_rng(11).normal(0, 0.4, size=len(index)),
+            "high": base + 1.2,
+            "low": base - 0.8,
+            "close": base + np.random.default_rng(7).normal(0, 0.25, size=len(index)),
+            "volume": np.linspace(1.0, 3.0, num=len(index)),
+        },
+        index=index,
+    )
+
+    params = {
+        "oscLen": 12,
+        "signalLen": 4,
+        "fluxLen": 9,
+        "fluxSmoothLen": 4,
+        "useFluxHeikin": True,
+        "useModFlux": False,
+        "kcLen": 15,
+        "kcMult": 1.1,
+        "bbLen": 18,
+        "bbMult": 1.3,
+        "maType": "EMA",
+    }
+
+    *_unused, flux_hist = alt._compute_indicators(df, params)
+
+    flux_df = alt._heikin_ashi(df) if params["useFluxHeikin"] else df
+    flux_raw = alt._directional_flux(flux_df, params["fluxLen"], params["fluxSmoothLen"])
+    expected = flux_raw.rolling(params["fluxSmoothLen"], min_periods=params["fluxSmoothLen"]).mean()
+
+    pdt.assert_series_equal(flux_hist, expected, check_names=False, check_exact=False, rtol=1e-12, atol=1e-12)
