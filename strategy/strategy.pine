@@ -1,40 +1,1211 @@
 //@version=5
-// 매직1분VN - 경량 최적화 프로파일
-// 필수 신호(스퀴즈 모멘텀·방향성 플럭스)와 기본 필터만 남긴 버전입니다.
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ 매직1분VN — Python 백테스트 엔진과 동등한 TradingView 최종본 (예견편향 수정) ║
+// ║ 원본 Python 구현을 Pine Script v5 로 1:1 로직 이식한 버전                   ║
+// ║ Author: OpenAI gpt-5-codex (for Basemodule 프로젝트)                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+// Gemini 수정 (2025-10-10): f_htf 함수 및 관련 호출부 수정 (request.security mutable variable 에러 해결)
+// 💡 리페인팅 수정 (2025-10-10): f_htf 내 상위 타임프레임 확정 값만 사용하도록 실시간 구간에 한해 이전 봉으로 자동 보정 (경고 제거 & Non-Repainting 유지)
+// 🐞 로직 수정 (2025-10-11): 'Deluxe' 및 'KC' 모멘텀 스타일 정규화 로직 누락 수정 (Gemini)
+strategy('통합모멘텀 (Python 포트)',
+         overlay=true,
+         process_orders_on_close=true,
+         calc_on_every_tick=false,          // 종가 기준 계산으로 일관성 강화
+   
+         pyramiding=0,
+         initial_capital=500,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         currency=currency.USD,
+         max_lines_count=500,
+         max_labels_count=500)
 
-strategy(
-     title                   = "매직1분VN (Optimizer Profile)",
-     overlay                 = true,
-     pyramiding              = 0,
-     initial_capital         = 500,
-     default_qty_type        = strategy.fixed,
-     default_qty_value       = 1,
-     commission_type         = strategy.commission.percent,
-     commission_value        = 0.05,
-     process_orders_on_close = true,
-     calc_on_every_tick      = false
-)
+// ─────────────────────────────────────────────────────────────────────────────
+// 그룹 상수
+var GRP_CORE     = '🅐 코어 모멘텀'
+var GRP_FLUX     = '🅑 플럭스 & 스퀴즈'
+var GRP_THRESH   = '🅒 임계값'
+var GRP_FILTER   = '🅓 필터 & 구조'
+var GRP_GUARD    = '🅔 가드'
+var GRP_RISK     = '🅕 리스크 & 사이징'
+var GRP_EXIT     = '🅖 출구 관리'
+var GRP_MISC     = '🅗 기타'
+var GRP_UI       = '🅘 HUD & 시각화'
 
-// === Colour Palette ===
-const color colup = #ffcfa6
-const color coldn = #419fec
-const color colpf = #ffd0a6
-const color coldf = #4683b4
-const color colps = #169b5d
-const color colng = #970529
-const color colpo = #11cf77
-const color colno = #d11645
-const color colsh = #ff1100
-const color colsm = #ff5e00
+// ─────────────────────────────────────────────────────────────────────────────
+// 핵심 입력 (Python run_backtest 파라미터 반영)
+oscLen            = input.int(20, '오실레이터 길이', minval=1, group=GRP_CORE, inline='OSC_LEN')
+signalLen         = input.int(3, '신호선 길이', minval=1, group=GRP_CORE, inline='OSC_LEN')
+maTypeInput       = input.string('SMA', '신호선 타입', options=['SMA', 'EMA', 'HMA'], group=GRP_CORE, inline='OSC_STYLE')
+useSameLen        = input.bool(false, 'BB/KC 길이 동일 적용', group=GRP_CORE, inline='BB_FLAG')
+bbLen             = input.int(20, '볼린저 길이', minval=1, group=GRP_CORE, tooltip='useSameLen 활성화 시 oscLen과 동일', inline='BB_CONF')
+bbMult            = input.float(1.4, 'BB 배수', minval=0.1, group=GRP_CORE, inline='BB_CONF')
+kcLen             = input.int(18, '켈트너 길이', minval=1, group=GRP_CORE, tooltip='useSameLen 활성화 시 oscLen과 동일', inline='KC_CONF')
+kcMult            = input.float(1.0, 'KC 배수', minval=0.1, group=GRP_CORE, inline='KC_CONF')
 
-// =================================================================================
-// === 설정 (Inputs) ==============================================================
-// =================================================================================
+fluxLen           = input.int(14, '플럭스 길이', minval=1, group=GRP_FLUX, inline='FLUX_LEN')
+fluxSmoothLen     = input.int(1, '플럭스 스무딩', minval=1, group=GRP_FLUX, inline='FLUX_LEN')
+useFluxHeikin     = input.bool(true, '플럭스 Heikin-Ashi', group=GRP_FLUX, inline='FLUX_MODE')
+useModFlux        = input.bool(false, '모디파이드 플럭스', group=GRP_FLUX, inline='FLUX_MODE')
 
-// --- 1. 스퀴즈 모멘텀 ---
-gOsc  = "1. 스퀴즈 모멘텀"
-showMomentum = input.bool(true , title="모멘텀 히스토그램 표시" , group=gOsc)
-len          = input.int (12   , title="Momentum Length"       , group=gOsc, minval=5 , maxval=100)
+momStyleInput     = input.string('KC', '모멘텀 스타일', options=['KC', 'AVG', 'Deluxe', 'Mod'], group=GRP_CORE, inline='OSC_STYLE')
+requireCross      = input.bool(true, '모멘텀 크로스 필수', group=GRP_CORE, inline='MOM_FLAG')
+
+useDynamicThresh  = input.bool(true, '동적 임계값', group=GRP_THRESH, inline='TH_MODE')
+useSymThreshold   = input.bool(false, '대칭 고정 임계값', group=GRP_THRESH, inline='TH_MODE')
+statThreshold     = input.float(38.0, '정적 기준값', minval=0.0, group=GRP_THRESH, inline='TH_STAT')
+buyThreshold      = input.float(36.0, '매수 기준값', minval=0.0, group=GRP_THRESH, inline='TH_BOUNDS')
+sellThreshold     = input.float(36.0, '매도 기준값', minval=0.0, group=GRP_THRESH, inline='TH_BOUNDS')
+dynLen            = input.int(21, '동적 표준편차 기간', minval=1, group=GRP_THRESH, inline='TH_DYN')
+dynMult           = input.float(1.1, '동적 표준편차 배수', minval=0.1, group=GRP_THRESH, inline='TH_DYN')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 필터 입력
+useAdx            = input.bool(false, 'ADX 필터', group=GRP_FILTER, inline='ADX_FLAG')
+useAtrDiff        = input.bool(false, 'ATR Diff 필터', group=GRP_FILTER, inline='ADX_FLAG')
+adxLen            = input.int(10, 'ADX 길이', minval=1, group=GRP_FILTER, inline='ADX_CONF')
+adxThresh         = input.float(15.0, 'ADX 임계값', minval=0.0, group=GRP_FILTER, inline='ADX_CONF')
+adxAtrTf          = input.timeframe('5', 'ADX/ATR 타임프레임', group=GRP_FILTER, inline='ADX_TF')
+
+useObv            = input.bool(false, 'OBV 기울기', group=GRP_FILTER, inline='OBV_FLAG')
+obvSmoothLen      = input.int(3, 'OBV EMA 길이', minval=1, group=GRP_FILTER, inline='OBV_FLAG')
+
+useHtfTrend       = input.bool(false, '상위봉 추세', group=GRP_FILTER, inline='HTF_FLAG')
+htfTrendTf        = input.timeframe('240', '상위봉 TF', group=GRP_FILTER, inline='HTF_CONF')
+htfMaLen          = input.int(20, '상위봉 EMA 길이', minval=1, group=GRP_FILTER, inline='HTF_CONF')
+
+useHmaFilter      = input.bool(false, 'HMA 필터', group=GRP_FILTER, inline='HMA_FLAG')
+hmaLen            = input.int(20, 'HMA 길이', minval=1, group=GRP_FILTER, inline='HMA_FLAG')
+
+useRangeFilter    = input.bool(false, '레인지 박스 필터', group=GRP_FILTER, inline='RANGE_FLAG')
+rangeTf           = input.timeframe('5', '레인지 TF', group=GRP_FILTER, inline='RANGE_CONF')
+rangeBars         = input.int(20, '레인지 봉수', minval=1, group=GRP_FILTER, inline='RANGE_BOX')
+rangePercent      = input.float(1.0, '레인지 %', minval=0.0, group=GRP_FILTER, inline='RANGE_BOX')
+
+useRegimeFilter   = input.bool(false, '레짐 필터', group=GRP_FILTER, inline='REGIME_FLAG')
+ctxHtfTf          = input.timeframe('240', '레짐 TF', group=GRP_FILTER, inline='REGIME_TF')
+ctxHtfEmaLen      = input.int(120, '레짐 EMA', minval=1, group=GRP_FILTER, inline='REGIME_EMA')
+ctxHtfAdxLen      = input.int(14, '레짐 ADX', minval=1, group=GRP_FILTER, inline='REGIME_ADX')
+ctxHtfAdxTh       = input.float(22.0, '레짐 ADX 임계', minval=0.0, group=GRP_FILTER, inline='REGIME_ADX')
+
+useDistanceGuard  = input.bool(false, '이격 가드', group=GRP_FILTER, inline='DIST_FLAG')
+distanceAtrLen    = input.int(21, 'ATR 길이', minval=1, group=GRP_FILTER, inline='DIST_ATR')
+distanceTrendLen  = input.int(55, '추세 EMA 길이', minval=1, group=GRP_FILTER, inline='DIST_TREND')
+distanceMaxAtr    = input.float(2.4, '최대 ATR 배수', minval=0.1, group=GRP_FILTER, inline='DIST_TREND')
+
+useDisparityGuard = input.bool(false, 'Disparity Index 필터', group=GRP_FILTER, inline='DISP_FLAG')
+disparityLen      = input.int(34, 'Disparity 길이', minval=1, group=GRP_FILTER, inline='DISP_CONF')
+disparityMaxPct   = input.float(6.0, 'Disparity 한계 %', minval=0.0, group=GRP_FILTER, inline='DISP_CONF')
+
+useSqzGate        = input.bool(false, '스퀴즈 게이트', group=GRP_FILTER, inline='SQZ_FLAG')
+sqzReleaseBars    = input.int(5, '스퀴즈 해제 유지', minval=1, group=GRP_FILTER, inline='SQZ_FLAG')
+
+useReversal       = input.bool(false, '반전 진입', group=GRP_FILTER, inline='REV_FLAG')
+reversalDelaySec  = input.float(0.0, '반전 지연(초)', minval=0.0, group=GRP_FILTER, inline='REV_FLAG')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 가드 & 리스크 입력
+leverage          = input.float(10.0, '레버리지', minval=1.0, group=GRP_RISK, inline='RISK_BASE')
+commissionPct     = input.float(0.05, '수수료 %', minval=0.0, group=GRP_RISK, inline='RISK_BASE')
+slipTicks         = input.int(1, '슬리피지 틱', minval=0, group=GRP_RISK, inline='RISK_BASE2')
+baseQtyPercent    = input.float(30.0, '기본 포지션 %', minval=0.0, group=GRP_RISK, inline='RISK_BASE2')
+useSizingOverride = input.bool(false, '고급 사이징 사용', group=GRP_RISK, inline='SIZING_MODE')
+sizingMode        = input.string('자본 비율', '사이징 모드', options=['자본 비율', '고정 금액 (USD)', '고정 계약', '리스크 기반'], group=GRP_RISK, inline='SIZING_MODE')
+advancedPercent   = input.float(25.0, '고급 비율 %', minval=0.0, group=GRP_RISK, inline='SIZ_ADV1')
+fixedUsdAmount    = input.float(100.0, '고정 USD', minval=0.0, group=GRP_RISK, inline='SIZ_ADV1')
+fixedContractSize = input.float(1.0, '고정 계약 수량', minval=0.0, group=GRP_RISK, inline='SIZ_ADV2')
+riskSizingType    = input.string('손절 기반 %', '리스크 사이징 타입', options=['손절 기반 %', '고정 계약'], group=GRP_RISK, inline='RISK_SIZE')
+baseRiskPct       = input.float(0.6, '기본 리스크 %', minval=0.0, group=GRP_RISK, inline='RISK_SIZE_VAL')
+riskContractSize  = input.float(1.0, '리스크 고정 계약', minval=0.0, group=GRP_RISK, inline='RISK_SIZE_VAL')
+useWallet         = input.bool(false, '월렛 사용', group=GRP_RISK, inline='WALLET_FLAG')
+profitReservePct  = input.float(20.0, '적립 비율 %', minval=0.0, maxval=100.0, group=GRP_RISK, inline='WALLET_CONF') * 0.01
+applyReserveToSizing = input.bool(true, '적립 반영', group=GRP_RISK, inline='WALLET_CONF')
+minTradableCapital = input.float(250.0, '최소 거래 자본', minval=0.0, group=GRP_RISK, inline='DRAWDOWN_BASE')
+useDrawdownScaling = input.bool(false, '드로우다운 축소', group=GRP_RISK, inline='DRAWDOWN_BASE')
+drawdownTriggerPct = input.float(7.0, '드로우다운 트리거 %', minval=0.0, group=GRP_RISK, inline='DRAWDOWN_CTRL')
+drawdownRiskScale  = input.float(0.5, '드로우다운 리스크 배율', minval=0.0, group=GRP_RISK, inline='DRAWDOWN_CTRL')
+
+usePerfAdaptiveRisk = input.bool(false, '성과 적응 리스크', group=GRP_RISK, inline='PAR_FLAG')
+parLookback         = input.int(6, 'PAR 룩백 거래 수', minval=1, group=GRP_RISK, inline='PAR_FLAG')
+parMinTrades        = input.int(3, 'PAR 최소 거래', minval=1, group=GRP_RISK, inline='PAR_CORE')
+parHotWinRate       = input.float(65.0, '핫 승률 %', minval=0.0, maxval=100.0, group=GRP_RISK, inline='PAR_CORE')
+parColdWinRate      = input.float(35.0, '콜드 승률 %', minval=0.0, maxval=100.0, group=GRP_RISK, inline='PAR_WIN')
+parHotMult          = input.float(1.25, '핫 배율', minval=0.0, group=GRP_RISK, inline='PAR_WIN')
+parColdMult         = input.float(0.35, '콜드 배율', minval=0.0, group=GRP_RISK, inline='PAR_POST')
+parPauseOnCold      = input.bool(true, '콜드시 중지', group=GRP_RISK, inline='PAR_POST')
+
+startYear         = input.int(2024, '시작 연도', group=GRP_MISC, inline='START_DATE')
+startMonth        = input.int(1, '시작 월', group=GRP_MISC, inline='START_DATE')
+startDay          = input.int(1, '시작 일', group=GRP_MISC, inline='START_DATE')
+startTime         = timestamp(syminfo.timezone, startYear, startMonth, startDay, 0, 0)
+
+allowLongEntry    = input.bool(true, '롱 허용', group=GRP_MISC, inline='ENTRY_FLAG')
+allowShortEntry   = input.bool(true, '숏 허용', group=GRP_MISC, inline='ENTRY_FLAG')
+reentryBars       = input.int(0, '재진입 제한 봉수', minval=0, group=GRP_MISC, inline='ENTRY_CTRL')
+
+debugForceLong    = input.bool(false, '디버그 강제 롱', group=GRP_MISC, inline='DEBUG_FLAG')
+debugForceShort   = input.bool(false, '디버그 강제 숏', group=GRP_MISC, inline='DEBUG_FLAG')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 가드 입력
+dailyLossGuard      = input.bool(false, '일일 손실 가드', group=GRP_GUARD, inline='DAILY_FLAG')
+dailyLossLimit      = input.float(80.0, '일일 손실 한도', group=GRP_GUARD, inline='DAILY_FLAG')
+dailyProfitLock     = input.bool(false, '일일 이익 잠금', group=GRP_GUARD, inline='DAILY_PROF')
+dailyProfitTarget   = input.float(120.0, '일일 이익 목표', group=GRP_GUARD, inline='DAILY_PROF')
+weeklyProfitLock    = input.bool(false, '주간 이익 잠금', group=GRP_GUARD, inline='WEEKLY_FLAG')
+weeklyProfitTarget  = input.float(250.0, '주간 이익 목표', group=GRP_GUARD, inline='WEEKLY_FLAG')
+lossStreakGuard     = input.bool(false, '연패 가드', group=GRP_GUARD, inline='STREAK_FLAG')
+maxConsecutiveLoss  = input.int(3, '최대 연패', minval=0, group=GRP_GUARD, inline='STREAK_FLAG')
+capitalGuard        = input.bool(false, '자본 가드', group=GRP_GUARD, inline='CAPITAL_FLAG')
+capitalGuardPct     = input.float(20.0, '자본 가드 %', minval=0.0, group=GRP_GUARD, inline='CAPITAL_FLAG')
+maxDailyLosses      = input.int(0, '일일 최대 손실 거래', minval=0, group=GRP_GUARD, inline='LIMITS_COUNT')
+maxWeeklyDD         = input.float(0.0, '주간 최대 DD%', minval=0.0, group=GRP_GUARD, inline='LIMITS_DRAW')
+maxGuardFires       = input.int(0, '가드 최대 발동', minval=0, group=GRP_GUARD, inline='LIMITS_DRAW')
+useGuardExit        = input.bool(false, '선제 청산 가드', group=GRP_GUARD, inline='PREEMPT_FLAG')
+preemptTicks        = input.int(8, '선제 틱', minval=0, group=GRP_GUARD, inline='PREEMPT_FLAG')
+liqBufferPctInput   = input.float(0.0, '청산 버퍼 %', minval=0.0, group=GRP_GUARD, inline='PREEMPT_BUF')
+
+useVolatilityGuard  = input.bool(false, '변동성 가드', group=GRP_GUARD, inline='VOL_FLAG')
+volatilityLookback  = input.int(50, 'ATR% 룩백', minval=1, group=GRP_GUARD, inline='VOL_FLAG')
+volatilityLowerPct  = input.float(0.15, 'ATR% 하한', minval=0.0, group=GRP_GUARD, inline='VOL_RANGE')
+volatilityUpperPct  = input.float(2.5, 'ATR% 상한', minval=0.0, group=GRP_GUARD, inline='VOL_RANGE')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 출구 입력
+exitOpposite      = input.bool(true, '반대 신호 청산', group=GRP_EXIT, inline='EXIT_BASE')
+useMomFade        = input.bool(false, '모멘텀 페이드', group=GRP_EXIT, inline='EXIT_BASE')
+momFadeBars       = input.int(1, '페이드 최소 봉', minval=1, group=GRP_EXIT, inline='FADE_CORE')
+momFadeRegLen     = input.int(20, '페이드 회귀 길이', minval=1, group=GRP_EXIT, inline='FADE_CORE')
+momFadeBbLen      = input.int(20, '페이드 BB 길이', minval=1, group=GRP_EXIT, inline='FADE_BAND')
+momFadeKcLen      = input.int(20, '페이드 KC 길이', minval=1, group=GRP_EXIT, inline='FADE_BAND')
+momFadeBbMult     = input.float(2.0, '페이드 BB 배수', minval=0.1, group=GRP_EXIT, inline='FADE_MULT')
+momFadeKcMult     = input.float(1.5, '페이드 KC 배수', minval=0.1, group=GRP_EXIT, inline='FADE_MULT')
+momFadeUseTrueRange = input.bool(true, '페이드 TR 사용', group=GRP_EXIT, inline='FADE_FLAG')
+momFadeZeroDelay    = input.int(0, '페이드 제로 딜레이', minval=0, group=GRP_EXIT, inline='FADE_FLAG')
+momFadeMinAbs       = input.float(0.0, '페이드 최소 절대값', minval=0.0, group=GRP_EXIT, inline='FADE_FLAG2')
+momFadeReleaseOnly  = input.bool(true, '해제 후 페이드', group=GRP_EXIT, inline='FADE_FLAG2')
+momFadeMinBarsAfterRel = input.int(1, '해제 후 최소 봉', minval=0, group=GRP_EXIT, inline='FADE_POST')
+momFadeWindowBars   = input.int(6, '페이드 윈도우', minval=1, group=GRP_EXIT, inline='FADE_POST')
+momFadeRequireTwo   = input.bool(false, '2봉 확인', group=GRP_EXIT, inline='FADE_POST')
+
+useStopLoss       = input.bool(false, '기본 손절', group=GRP_EXIT, inline='STOP_BASE')
+stopLookback      = input.int(5, '스윙 손절 룩백', minval=1, group=GRP_EXIT, inline='STOP_BASE')
+useAtrTrail       = input.bool(false, 'ATR 트레일', group=GRP_EXIT, inline='ATRL_BASE')
+atrTrailLen       = input.int(7, 'ATR 트레일 길이', minval=1, group=GRP_EXIT, inline='ATRL_BASE')
+atrTrailMult      = input.float(2.5, 'ATR 트레일 배수', minval=0.0, group=GRP_EXIT, inline='ATRL_TUNE')
+useBreakevenStop  = input.bool(false, '브레이크이븐', group=GRP_EXIT, inline='BREAKEVEN_BASE')
+breakevenMult     = input.float(1.0, '브레이크이븐 배수', minval=0.0, group=GRP_EXIT, inline='BREAKEVEN_BASE')
+useFixedStop      = input.bool(false, '고정 수치 손절 사용', group=GRP_EXIT, inline='FIXSTOP_FLAG')
+fixedStopUseTicksLong  = input.bool(true, '롱 틱 단위', group=GRP_EXIT, inline='FIXSTOP_LONG')
+fixedStopValueLong     = input.float(20.0, '롱 손절 값', minval=0.0, group=GRP_EXIT, inline='FIXSTOP_LONG')
+fixedStopUseTicksShort = input.bool(true, '숏 틱 단위', group=GRP_EXIT, inline='FIXSTOP_SHORT')
+fixedStopValueShort    = input.float(20.0, '숏 손절 값', minval=0.0, group=GRP_EXIT, inline='FIXSTOP_SHORT')
+useAtrProfit      = input.bool(false, 'ATR 이익 목표', group=GRP_EXIT, inline='ATR_PROFIT')
+atrProfitMult     = input.float(2.0, 'ATR 이익 배수', minval=0.0, group=GRP_EXIT, inline='ATR_PROFIT')
+useDynVol         = input.bool(false, '동적 변동 배율', group=GRP_EXIT, inline='EXIT_GUARD')
+useStopDistanceGuard = input.bool(false, '손절 거리 가드', group=GRP_EXIT, inline='EXIT_GUARD')
+maxStopAtrMult    = input.float(2.8, '최대 손절 ATR배수', minval=0.0, group=GRP_EXIT, inline='EXIT_GUARD_VAL')
+useTimeStop       = input.bool(false, '시간 손절', group=GRP_EXIT, inline='HOLD_FLAG')
+maxHoldBars       = input.int(45, '최대 보유 봉', minval=1, group=GRP_EXIT, inline='HOLD_CONF')
+minHoldBarsInput  = input.int(0, '최소 보유 봉', minval=0, group=GRP_EXIT, inline='HOLD_CONF')
+useKasa           = input.bool(false, 'KASA RSI 출구', group=GRP_EXIT, inline='KASA_FLAG')
+kasaRsiLen        = input.int(14, 'KASA RSI 길이', minval=1, group=GRP_EXIT, inline='KASA_FLAG')
+kasaRsiOB         = input.float(72.0, 'KASA RSI OB', minval=0.0, maxval=100.0, group=GRP_EXIT, inline='KASA_RANGE')
+kasaRsiOS         = input.float(28.0, 'KASA RSI OS', minval=0.0, maxval=100.0, group=GRP_EXIT, inline='KASA_RANGE')
+useBeTiers        = input.bool(false, '브레이크이븐 티어', group=GRP_EXIT, inline='KASA_EXTRA')
+
+useShock          = input.bool(false, '쇼크 모드', group=GRP_EXIT, inline='SHOCK_FLAG')
+atrFastLen        = input.int(5, '쇼크 ATR 빠른선', minval=1, group=GRP_EXIT, inline='SHOCK_FLAG')
+atrSlowLen        = input.int(20, '쇼크 ATR 느린선', minval=1, group=GRP_EXIT, inline='SHOCK_CTRL')
+shockMult         = input.float(2.5, '쇼크 배수', minval=0.0, group=GRP_EXIT, inline='SHOCK_CTRL')
+shockAction       = input.string('손절 타이트닝', '쇼크 행동', options=['손절 타이트닝', '즉시 청산'], group=GRP_EXIT, inline='SHOCK_ACTION')
+
+simpleMetricsOnly   = input.bool(false, '심플 메트릭 (Python)', group=GRP_MISC)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 시각화 & HUD 입력
+showHudTable           = input.bool(true, '상태 HUD 표시', group=GRP_UI)
+hudTablePositionInput  = input.string('우상단', '상태 HUD 위치', options=['좌상단', '우상단', '좌하단', '우하단'], group=GRP_UI)
+hudTableTextSizeInput  = input.string('보통', 'HUD 글자 크기', options=['작게', '보통', '크게'], group=GRP_UI)
+showPriceHud           = input.bool(true, '가격 HUD 라벨 표시', group=GRP_UI)
+priceHudAnchorInput    = input.string('위쪽', '가격 HUD 기준', options=['위쪽', '아래쪽'], group=GRP_UI)
+priceHudAtrOffset      = input.float(1.0, '가격 HUD ATR 배수', minval=0.0, step=0.25, group=GRP_UI)
+hudBgColorInput        = input.color(color.new(color.black, 70), 'HUD 배경색', group=GRP_UI)
+hudTextColorInput      = input.color(color.white, 'HUD 글자색', group=GRP_UI)
+showSqueezeHighlight   = input.bool(true, '스퀴즈 하이라이트', group=GRP_UI)
+showSignalMarkers      = input.bool(true, '신호 마커 표시', group=GRP_UI)
+showMomentumDecorators = input.bool(true, '모멘텀 임계값 시각화', group=GRP_UI)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 내부 유틸 함수 (Python 헬퍼 포팅, v5 규격)
+clamp(x, lo, hi) =>
+    x < lo ? lo : x > hi ? hi : x
+
+nzf(value, replacement) =>
+    na(value) ? replacement : value
+
+maxIgnoreNaN(a, b) =>
+    na(a) ? b : na(b) ? a : math.max(a, b)
+
+minIgnoreNaN(a, b) =>
+    na(a) ? b : na(b) ? a : math.min(a, b)
+
+trueRange() =>
+    math.max(math.max(high - low, math.abs(high - close[1])), math.abs(low - close[1]))
+
+boolText(flag) =>
+    flag ? '예' : '아니오'
+
+atrSeries(len) =>
+    ta.rma(trueRange(), len)
+
+stdSeries(src, len) =>
+    ta.stdev(src, len)
+
+disparityIndex(src, len) =>
+    emaBase = ta.ema(src, len)
+    diff    = ta.wma(math.abs(src - emaBase), len)
+    denom   = math.abs(emaBase)
+    denom == 0 or na(denom) ? 0.0 : diff / denom * 100.0
+
+isHigherTimeframe(tf) =>
+    tf != '' and timeframe.in_seconds(tf) > timeframe.in_seconds(timeframe.period)
+
+// requestNoRepaint: (이전 버전 호환용) 확정봉 값으로 보정
+requestNoRepaint(tf, source) =>
+    hasValidTf = tf != ''
+    resolvedTf = hasValidTf ? tf : timeframe.period
+    secSeries = request.security(syminfo.tickerid, resolvedTf, source, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+    if hasValidTf and isHigherTimeframe(resolvedTf)
+        nz(secSeries[1], secSeries)
+    else
+        secSeries
+
+securitySeries(tf, source) =>
+    requestNoRepaint(tf, source)
+
+resolveTablePosition(posStr) =>
+    switch posStr
+        '좌상단' => position.top_left
+        '좌하단' => position.bottom_left
+        '우하단' => position.bottom_right
+        => position.top_right
+
+resolveTextSize(sizeStr) =>
+    sizeStr == '작게' ? size.small : sizeStr == '크게' ? size.large : size.normal
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Heikin-Ashi 로컬 계산 (security() 미사용: 경고 감소)
+var float haOpen = na
+haClose = (open + high + low + close) / 4.0
+haOpen  := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+haHigh  = math.max(high, math.max(haOpen, haClose))
+haLow   = math.min(low,  math.min(haOpen, haClose))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ [수정됨] HTF 안전 래퍼: request.security 에러를 해결하기 위해 구조 변경
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ [최종 수정] HTF 안전 래퍼: request.security가 조건문 내부에 있지 않도록 구조 변경
+f_htf(tf, indicatorType, len) =>
+    // 1. 어떤 데이터를 계산할지 먼저 결정 (이 부분은 조건문 안에 있어도 OK)
+    float src_series = switch indicatorType
+        'dmi_adx' =>
+            [_, _, adx] = ta.dmi(len, len)
+            adx
+        'atr' => atrSeries(len)
+        'ema' => ta.ema(close, len)
+        'highest' => ta.highest(high, len)
+        'lowest' => ta.lowest(low, len)
+        'close' => close
+        => na
+
+    // 2. request.security를 조건문 밖에서 "무조건" 호출
+    // 만약 tf가 비어있으면 에러가 나므로, 현재 타임프레임으로 대체해서 안전하게 호출
+    string safe_tf = tf == '' ? timeframe.period : tf
+    // lookahead=barmerge.lookahead_off를 사용하므로, 상위 봉이 확정된 값만 반환됩니다.
+    htf_series = request.security(syminfo.tickerid, safe_tf, src_series, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+    // 3. 이제 조건에 따라 어떤 값을 "반환"할지 결정
+    // 상위 타임프레임이 유효할 때만 security 결과값을 사용하고, 아닐 경우 현재 봉의 계산값을 사용
+    bool useHtf = tf != '' and isHigherTimeframe(safe_tf)
+
+    // 📌 실시간(barstate.isrealtime)에서 상위 타임프레임 값은 아직 확정되지 않은 값이 들어와 경고의 원인이 된다.
+    //    실시간 구간에서는 이전 확정 값(htf_series[1])을 사용하고, 히스토리/확정 구간에서는 최신 값을 사용해 지연을 최소화한다.
+    float confirmedHtf = htf_series
+    if useHtf
+        float fallbackHtf = nz(htf_series[1], src_series)
+        confirmedHtf := barstate.isrealtime ? fallbackHtf : htf_series
+
+    final_series = useHtf ? confirmedHtf : src_series
+    final_series
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 플럭스 지표들 (HA는 로컬 시리즈 활용)
+directionalFlux(useHa, len, smoothLen) =>
+    srcH = useHa ? haHigh : high
+    srcL = useHa ? haLow  : low
+    upMove  = math.max(srcH - nz(srcH[1]), 0)
+    dnMove  = math.max(nz(srcL[1]) - srcL, 0)
+    tr      = atrSeries(len)
+    up      = tr != 0 ? ta.rma(upMove, len) / tr : 0
+    dn      = tr != 0 ? ta.rma(dnMove, len) / tr : 0
+    denom   = up + dn
+    ratio   = denom != 0 ? (up - dn) / denom : 0
+    core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
+    smoothLen > 1 ? ta.sma(core, smoothLen) : core
+
+modDirectionalFlux(len, smoothLen) =>
+    upMove  = math.max(high - nz(high[1]), 0)
+    dnMove  = math.max(nz(low[1]) - low, 0)
+    plusDM  = upMove > dnMove and upMove > 0 ? upMove : 0
+    minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0
+    plusR   = ta.rma(plusDM, len)
+    minusR  = ta.rma(minusDM, len)
+    tr      = atrSeries(len)
+    up      = tr != 0 ? plusR / tr : 0
+    dn      = tr != 0 ? minusR / tr : 0
+    denom   = up + dn
+    ratio   = denom != 0 ? (up - dn) / denom : 0
+    core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
+    smoothLen > 1 ? ta.sma(core, smoothLen) : core
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 기본 파생값 계산
+bbLenEff = useSameLen ? oscLen : bbLen
+kcLenEff = useSameLen ? oscLen : kcLen
+tickSize = syminfo.mintick
+slipValue = tickSize * slipTicks
+fixedStopOffsetLong  = useFixedStop ? (fixedStopUseTicksLong ? fixedStopValueLong * tickSize : fixedStopValueLong) : 0.0
+fixedStopOffsetShort = useFixedStop ? (fixedStopUseTicksShort ? fixedStopValueShort * tickSize : fixedStopValueShort) : 0.0
+
+calcFixedStopPriceLong(entryPrice) =>
+    useFixedStop and fixedStopOffsetLong > 0 ? math.max(entryPrice - fixedStopOffsetLong, tickSize) : na
+
+calcFixedStopPriceShort(entryPrice) =>
+    useFixedStop and fixedStopOffsetShort > 0 ? entryPrice + fixedStopOffsetShort : na
+
+calcProspectiveStopLong(entryPrice, atrTrailSeries, dynFactor, swingLowForStop) =>
+    float stop = na
+    if useAtrTrail and not na(atrTrailSeries)
+        stop := maxIgnoreNaN(stop, entryPrice - atrTrailSeries * atrTrailMult * dynFactor)
+    if useStopLoss
+        if not na(swingLowForStop) and swingLowForStop < entryPrice
+            stop := maxIgnoreNaN(stop, swingLowForStop)
+    float fsLong = calcFixedStopPriceLong(entryPrice)
+    if not na(fsLong)
+        stop := maxIgnoreNaN(stop, fsLong)
+    if not na(stop)
+        float cap = entryPrice - tickSize
+        if cap > tickSize
+            stop := math.min(stop, cap)
+        stop := math.max(stop, tickSize)
+    stop
+
+calcProspectiveStopShort(entryPrice, atrTrailSeries, dynFactor, swingHighForStop) =>
+    float stop = na
+    if useAtrTrail and not na(atrTrailSeries)
+        stop := minIgnoreNaN(stop, entryPrice + atrTrailSeries * atrTrailMult * dynFactor)
+    if useStopLoss
+        if not na(swingHighForStop) and swingHighForStop > entryPrice
+            stop := minIgnoreNaN(stop, swingHighForStop)
+    float fsShort = calcFixedStopPriceShort(entryPrice)
+    if not na(fsShort)
+        stop := minIgnoreNaN(stop, fsShort)
+    if not na(stop)
+        float cap = entryPrice + tickSize
+        stop := math.max(stop, cap)
+    stop
+
+atrPrimary = atrSeries(kcLenEff)
+atrOsc = atrSeries(oscLen)
+
+hl2x = (high + low) / 2.0
+highestHigh = ta.highest(high, kcLenEff)
+lowestLow = ta.lowest(low, kcLenEff)
+meanKc = (highestHigh + lowestLow) / 2.0
+bbBasisClose = ta.sma(close, bbLenEff)
+kcBasis = ta.sma(hl2x, kcLenEff)
+kcRangeSeries = atrPrimary * kcMult
+kcUpper = kcBasis + kcRangeSeries
+kcLower = kcBasis - kcRangeSeries
+kcAverage = (kcUpper + kcLower) / 2.0
+midline = (hl2x + kcAverage) / 2.0
+avgLineAvg = (bbBasisClose + meanKc) / 2.0
+bbMidHl2 = ta.sma(hl2x, bbLenEff)
+avgLineDeluxe = (meanKc + bbMidHl2) / 2.0
+
+momStyle = switch str.lower(momStyleInput)
+    'avg' => 'avg'
+    'deluxe' => 'deluxe'
+    'mod' => 'mod'
+    => 'kc'
+
+// ✅ [수정됨] 'deluxe' 및 'kc' 스타일에 ATR 정규화 로직 추가하여 모든 스타일의 값을 일관되게 만듦
+normRaw = switch momStyle
+    'avg'    => (close - avgLineAvg) / nz(atrPrimary, 1)
+    'deluxe' => (close - avgLineDeluxe) / nz(atrPrimary, 1)
+    'mod'    => (close - midline) / nz(atrPrimary, 1)
+    => (close - meanKc) / nz(atrPrimary, 1)
+
+normSeries = nz(normRaw) * 100.0
+momentum = ta.linreg(normSeries, oscLen, 0)
+momSignal = switch str.lower(maTypeInput)
+    'ema' => ta.ema(momentum, signalLen)
+    'hma' => ta.hma(momentum, signalLen)
+    => ta.sma(momentum, signalLen)
+
+crossUp = ta.crossover(momentum, momSignal)
+crossDown = ta.crossunder(momentum, momSignal)
+
+fluxHist = useModFlux ? modDirectionalFlux(fluxLen, fluxSmoothLen) : directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
+
+momFadeSource = (high + low + close) / 3.0
+momFadeBasis = ta.sma(momFadeSource, momFadeBbLen)
+momFadeTr = momFadeUseTrueRange ? ta.rma(trueRange(), momFadeKcLen) : ta.sma(math.abs(high - low), momFadeKcLen)
+momFadeHist = ta.linreg(momFadeSource - momFadeBasis, momFadeRegLen, 0)
+momFadeAbs = math.abs(momFadeHist)
+
+bbDev = stdSeries(close, bbLenEff) * bbMult
+gateSqOn = bbDev < kcRangeSeries ? 1 : 0
+gateSqPrev = gateSqOn[1] == 1
+gateSqRelease = gateSqPrev and gateSqOn == 0
+var int gateRelCounter = na
+if gateSqRelease
+    gateRelCounter := 0
+else if not na(gateRelCounter)
+    gateRelCounter += 1
+
+var float buyThresh = na
+var float sellThresh = na
+if useDynamicThresh
+    dynStd = ta.stdev(momentum, dynLen) * dynMult
+    fallback = statThreshold != 0 ? math.abs(statThreshold) : nz(ta.sma(dynStd, dynLen), 1.0)
+    dynStd := na(dynStd) or dynStd == 0 ? fallback : math.abs(dynStd)
+    buyThresh := -dynStd
+    sellThresh := dynStd
+else
+    if useSymThreshold
+        buyThresh := -math.abs(statThreshold)
+        sellThresh := math.abs(statThreshold)
+    else
+        buyThresh := -math.abs(buyThreshold)
+        sellThresh := math.abs(sellThreshold)
+
+float volGuardAtrPct = na
+if useVolatilityGuard
+    atrVal = atrSeries(volatilityLookback)
+    volGuardAtrPct := atrVal / close * 100
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ [수정됨] HTF 시리즈: 수정한 f_htf 함수 호출 방식으로 변경
+adxHtfSeries = f_htf(adxAtrTf, 'dmi_adx', adxLen)
+atrHtfSeries = f_htf(adxAtrTf, 'atr', adxLen)
+
+float adxSeries = 0.0
+float atrDiff = 0.0
+if useAdx or useAtrDiff
+    adxSeries := nz(adxHtfSeries)
+    if useAtrDiff
+        atrDiff := nz(atrHtfSeries - ta.sma(atrHtfSeries, adxLen))
+
+var float obvAccum = 0.0
+float obvSlopeVal = 0.0
+if useObv
+    direction = math.sign(close - close[1])
+    obvAccum := nz(obvAccum[1]) + direction * nz(volume, 0)
+    obvSlopeVal := ta.ema(ta.change(obvAccum), math.max(obvSmoothLen, 1))
+
+htfMaSeries = f_htf(htfTrendTf, 'ema', htfMaLen)
+htfMa = useHtfTrend ? htfMaSeries : close
+htfTrendUp = not useHtfTrend or (close > htfMa)
+htfTrendDown = not useHtfTrend or (close < htfMa)
+
+hmaValue = useHmaFilter ? ta.hma(close, hmaLen) : close
+
+rangeHighSeries = f_htf(rangeTf, 'highest', rangeBars)
+rangeLowSeries  = f_htf(rangeTf, 'lowest', rangeBars)
+inRangeBox = false
+if useRangeFilter
+    rangeHighVal = rangeHighSeries
+    rangeLowVal  = rangeLowSeries
+    inRangeBox   := not na(rangeHighVal) and not na(rangeLowVal) and rangeLowVal != 0 ? ((rangeHighVal - rangeLowVal) / math.abs(rangeLowVal) * 100) <= rangePercent : false
+
+disparityPct = useDisparityGuard ? disparityIndex(close, disparityLen) : 0.0
+disparityOk = not useDisparityGuard or disparityPct <= disparityMaxPct
+
+kasaRsiVal = useKasa ? ta.rsi(close, kasaRsiLen) : 50
+
+// ✅ [수정됨] 레짐 필터용 상위 타임프레임 호출 방식 변경
+ctxCloseSeries = f_htf(ctxHtfTf, 'close', 0) // 길이는 불필요하므로 0
+ctxEmaSeries   = f_htf(ctxHtfTf, 'ema', ctxHtfEmaLen)
+ctxAdxSeries   = f_htf(ctxHtfTf, 'dmi_adx', ctxHtfAdxLen)
+regimeLongOk = true
+regimeShortOk = true
+if useRegimeFilter
+    regimeLongOk  := not na(ctxCloseSeries) and not na(ctxEmaSeries) and not na(ctxAdxSeries) and (ctxCloseSeries > ctxEmaSeries and ctxAdxSeries > ctxHtfAdxTh)
+    regimeShortOk := not na(ctxCloseSeries) and not na(ctxEmaSeries) and not na(ctxAdxSeries) and (ctxCloseSeries < ctxEmaSeries and ctxAdxSeries > ctxHtfAdxTh)
+
+gateSqValid = not useSqzGate ? true : (not na(gateRelCounter) and gateRelCounter <= sqzReleaseBars and gateSqOn == 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 상태 변수 초기화
+var bool guardFrozen = false
+var int guardFiredTotal = 0
+var int lossStreak = 0
+var int dailyLosses = 0
+var int reentryCountdown = 0
+var int reversalCountdown = 0
+var int lastDir = 0
+var float tradableCapital = strategy.initial_capital
+var float peakEquity = strategy.initial_capital
+var float dailyStartCapital = strategy.initial_capital
+var float dailyPeakCapital = strategy.initial_capital
+var float weekStartEquity = strategy.initial_capital
+var float weekPeakEquity = strategy.initial_capital
+var float withdrawable = 0.0
+var float lastEntryPrice = na
+var float lastEntryQty = 0.0
+var int lastPositionDir = 0
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var float fixedStopPriceLong = na
+var float fixedStopPriceShort = na
+var int barsHeld = 0
+var float liqBufferPct = liqBufferPctInput * 0.01
+var array<float> recentPnls = array.new_float()
+var table statusTable = na
+var string statusTablePosCache = ''
+var label priceHudLabel = na
+
+newDay = dayofmonth != dayofmonth[1]
+newWeek = weekofyear != weekofyear[1]
+
+if barstate.isconfirmed
+    profitDelta = strategy.netprofit - nz(strategy.netprofit[1])
+    if useWallet and profitDelta > 0
+        withdrawable += profitDelta * profitReservePct
+
+equity = strategy.equity
+effectiveEquity = useWallet and applyReserveToSizing ? equity - withdrawable : equity
+tradableCapital := math.max(effectiveEquity, strategy.initial_capital * 0.01)
+
+peakEquity := math.max(peakEquity, equity)
+dailyPeakCapital := math.max(dailyPeakCapital, tradableCapital)
+weekPeakEquity := math.max(weekPeakEquity, equity)
+
+if newDay
+    dailyStartCapital := tradableCapital
+    dailyPeakCapital := tradableCapital
+    dailyLosses := 0
+    guardFrozen := false
+if newWeek
+    weekStartEquity := equity
+    weekPeakEquity := equity
+
+dailyPnl = tradableCapital - dailyStartCapital
+weeklyPnl = equity - weekStartEquity
+weeklyDD = weekPeakEquity > 0 ? (weekPeakEquity - equity) / weekPeakEquity * 100 : 0
+totalWithdrawable = math.max(useWallet ? withdrawable : strategy.netprofit, 0.0)
+
+dailyLossBreached = dailyLossGuard and dailyPnl <= -math.abs(dailyLossLimit)
+dailyProfitReached = dailyProfitLock and dailyPnl >= math.abs(dailyProfitTarget)
+weeklyProfitReached = weeklyProfitLock and weeklyPnl >= math.abs(weeklyProfitTarget)
+lossStreakBreached = lossStreakGuard and lossStreak >= maxConsecutiveLoss
+capitalBreached = capitalGuard and equity <= strategy.initial_capital * (1 - capitalGuardPct / 100.0)
+weeklyDdBreached = maxWeeklyDD > 0 and weeklyDD >= maxWeeklyDD
+lossCountBreached = maxDailyLosses > 0 and dailyLosses >= maxDailyLosses
+guardFireLimit = maxGuardFires > 0 and guardFiredTotal >= maxGuardFires
+atrPctVal = useVolatilityGuard ? nz(volGuardAtrPct, 0) : 0
+volatilityOk = not useVolatilityGuard or (atrPctVal >= volatilityLowerPct and atrPctVal <= volatilityUpperPct)
+
+performancePause = false
+if usePerfAdaptiveRisk and array.size(recentPnls) >= parMinTrades
+    wins = 0
+    for i = 0 to array.size(recentPnls) - 1
+        if array.get(recentPnls, i) > 0
+            wins += 1
+    winRate = array.size(recentPnls) > 0 ? wins / array.size(recentPnls) * 100 : 0
+    if winRate <= parColdWinRate and parPauseOnCold
+        performancePause := true
+
+performancePauseActivated = performancePause and not nz(performancePause[1], false)
+
+shouldFreeze = dailyLossBreached or dailyProfitReached or weeklyProfitReached or lossStreakBreached or capitalBreached or weeklyDdBreached or lossCountBreached or guardFireLimit or performancePause or tradableCapital < minTradableCapital
+wasFrozen = guardFrozen
+if shouldFreeze
+    guardFrozen := true
+
+guardActivated = guardFrozen and not wasFrozen
+if guardActivated and strategy.position_size != 0
+    lastDir := strategy.position_size > 0 ? 1 : -1
+    strategy.close('포지션', comment='Guard Halt')
+    guardFiredTotal += 1
+
+alertcondition(guardActivated, title='리스크 가드 발동', message='매직1분VN: 가드 발동으로 거래 중지')
+alertcondition(performancePauseActivated, title='성과 기반 중지', message='매직1분VN: 성과 기반 거래 일시 중지')
+
+if useGuardExit and strategy.position_size != 0 and not guardActivated
+    entryP = strategy.position_avg_price
+    leveragePct = leverage > 0 ? 1.0 / leverage : 0.0
+    if entryP > 0 and leveragePct > 0
+        priceOffset = entryP * leveragePct
+        liqPrice = strategy.position_size > 0 ? entryP - priceOffset : entryP + priceOffset
+        if liqBufferPct > 0
+            buffer = entryP * liqBufferPct
+            liqPrice += strategy.position_size > 0 ? -buffer : buffer
+        liqPrice := strategy.position_size > 0 ? math.max(liqPrice, tickSize) : liqPrice
+        preemptPrice = strategy.position_size > 0 ? liqPrice + preemptTicks * tickSize : liqPrice - preemptTicks * tickSize
+        hitGuard = strategy.position_size > 0 ? low <= preemptPrice : high >= preemptPrice
+        if hitGuard
+            lastDir := strategy.position_size > 0 ? 1 : -1
+            strategy.close('포지션', comment='Guard Exit')
+            guardFrozen := true
+            guardFiredTotal += 1
+
+canTrade = not guardFrozen and volatilityOk
+if time < startTime
+    canTrade := false
+
+if reentryCountdown > 0 and strategy.position_size == 0
+    reentryCountdown -= 1
+if reversalCountdown > 0 and strategy.position_size == 0
+    reversalCountdown -= 1
+
+if barstate.islast
+    if showHudTable
+        hudPosition = resolveTablePosition(hudTablePositionInput)
+        if statusTablePosCache != hudTablePositionInput or na(statusTable)
+            if not na(statusTable)
+                table.delete(statusTable)
+            statusTable := table.new(hudPosition, 2, 11, border_width=1)
+        statusTablePosCache := hudTablePositionInput
+
+        hudTextSize = resolveTextSize(hudTableTextSizeInput)
+        hudHeaderSize = hudTableTextSizeInput == '작게' ? size.normal : hudTableTextSizeInput == '크게' ? size.huge : size.large
+
+        headerBg = color.new(hudBgColorInput, 0)
+        labelBg = color.new(hudBgColorInput, 35)
+        neutralBg = color.new(color.gray, 85)
+
+        capColor = tradableCapital < minTradableCapital or guardFrozen ? color.new(color.red, 55) : color.new(color.green, 65)
+        dailyColor = dailyPnl > 0 ? color.new(color.green, 60) : dailyPnl < 0 ? color.new(color.red, 55) : neutralBg
+        withdrawColor = totalWithdrawable > 0 ? color.new(color.green, 60) : totalWithdrawable < 0 ? color.new(color.red, 55) : neutralBg
+        weeklyColor = weeklyPnl > 0 ? color.new(color.green, 60) : weeklyPnl < 0 ? color.new(color.red, 55) : neutralBg
+        lossColor = lossStreak > 0 ? color.new(color.orange, 55) : color.new(color.green, 65)
+        guardColor = guardFrozen ? color.new(color.red, 55) : color.new(color.green, 60)
+        volColor = volatilityOk ? color.new(color.green, 60) : color.new(color.red, 55)
+        perfColor = performancePause ? color.new(color.orange, 55) : color.new(color.green, 60)
+        squeezeStateText = gateSqOn == 1 ? '압축 진행' : gateSqRelease ? '해제 신호' : '대기'
+        squeezeColor = gateSqOn == 1 ? color.new(color.blue, 70) : gateSqRelease ? color.new(color.purple, 65) : neutralBg
+        roundedBuy = math.round(buyThresh * 100.0) / 100.0
+        roundedSell = math.round(sellThresh * 100.0) / 100.0
+        roundedMomentum = math.round(momentum * 100.0) / 100.0
+        thresholdInfo = '매수 ' + str.tostring(roundedBuy) + ' / 매도 ' + str.tostring(roundedSell) + '\n모멘텀 ' + str.tostring(roundedMomentum)
+
+        table.cell(statusTable, 0, 0, '📊 매직1분VN 상태 HUD', text_color=hudTextColorInput, text_size=hudHeaderSize)
+        table.cell(statusTable, 1, 0, '', text_color=hudTextColorInput)
+        table.merge_cells(statusTable, 0, 0, 1, 0)
+        table.cell_set_bgcolor(statusTable, 0, 0, headerBg)
+        table.cell_set_bgcolor(statusTable, 1, 0, headerBg)
+
+        table.cell(statusTable, 0, 1, '거래 가능 자본', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 1, labelBg)
+        table.cell(statusTable, 1, 1, str.tostring(tradableCapital, format.mintick), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 1, capColor)
+
+        table.cell(statusTable, 0, 2, '출금 가능 금액', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 2, labelBg)
+        table.cell(statusTable, 1, 2, str.tostring(totalWithdrawable, format.mintick), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 2, withdrawColor)
+
+        table.cell(statusTable, 0, 3, '일 손익', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 3, labelBg)
+        table.cell(statusTable, 1, 3, str.tostring(dailyPnl, format.mintick), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 3, dailyColor)
+
+        table.cell(statusTable, 0, 4, '주간 손익', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 4, labelBg)
+        table.cell(statusTable, 1, 4, str.tostring(weeklyPnl, format.mintick), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 4, weeklyColor)
+
+        table.cell(statusTable, 0, 5, '연속 손실', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 5, labelBg)
+        table.cell(statusTable, 1, 5, str.tostring(lossStreak), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 5, lossColor)
+
+        table.cell(statusTable, 0, 6, '가드 상태', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 6, labelBg)
+        table.cell(statusTable, 1, 6, boolText(guardFrozen), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 6, guardColor)
+
+        table.cell(statusTable, 0, 7, '변동성 조건', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 7, labelBg)
+        table.cell(statusTable, 1, 7, boolText(volatilityOk), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 7, volColor)
+
+        table.cell(statusTable, 0, 8, '성과 중지', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 8, labelBg)
+        table.cell(statusTable, 1, 8, boolText(performancePause), text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 8, perfColor)
+
+        table.cell(statusTable, 0, 9, '스퀴즈', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 9, labelBg)
+        table.cell(statusTable, 1, 9, squeezeStateText, text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 9, squeezeColor)
+
+        table.cell(statusTable, 0, 10, '임계·모멘텀', text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 0, 10, labelBg)
+        table.cell(statusTable, 1, 10, thresholdInfo, text_color=hudTextColorInput, text_size=hudTextSize)
+        table.cell_set_bgcolor(statusTable, 1, 10, labelBg)
+    else
+        if not na(statusTable)
+            table.delete(statusTable)
+        statusTable := na
+        statusTablePosCache := ''
+
+if strategy.position_size != 0
+    barsHeld += 1
+    if strategy.position_size > 0
+        highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
+        lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+    else
+        lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+        highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
+else
+    barsHeld := 0
+    highestSinceEntry := na
+    lowestSinceEntry := na
+
+if strategy.position_size == 0 or not useFixedStop
+    fixedStopPriceLong := na
+    fixedStopPriceShort := na
+
+positionSize = strategy.position_size
+avgPrice = strategy.position_avg_price
+positionDir = positionSize > 0 ? 1 : positionSize < 0 ? -1 : 0
+positionSizePrev = nz(strategy.position_size[1])
+
+openedLongThisBar = false
+openedShortThisBar = false
+
+if useFixedStop
+    openedLongThisBar := positionSize > 0 and positionSizePrev <= 0
+    openedShortThisBar := positionSize < 0 and positionSizePrev >= 0
+    if openedLongThisBar
+        float fsLong = calcFixedStopPriceLong(avgPrice)
+        if not na(fsLong)
+            fixedStopPriceLong := fsLong
+    if openedShortThisBar
+        float fsShort = calcFixedStopPriceShort(avgPrice)
+        if not na(fsShort)
+            fixedStopPriceShort := fsShort
+    // 중간 활성화 지원
+    if positionDir == 1 and na(fixedStopPriceLong)
+        float fsLong = calcFixedStopPriceLong(avgPrice)
+        if not na(fsLong)
+            fixedStopPriceLong := fsLong
+    if positionDir == -1 and na(fixedStopPriceShort)
+        float fsShort = calcFixedStopPriceShort(avgPrice)
+        if not na(fsShort)
+            fixedStopPriceShort := fsShort
+
+longCrossOk = requireCross ? crossUp : true
+shortCrossOk = requireCross ? crossDown : true
+baseLongTrigger = longCrossOk and momentum < buyThresh and fluxHist > 0
+baseShortTrigger = shortCrossOk and momentum > sellThresh and fluxHist < 0
+baseLongSignal = debugForceLong or baseLongTrigger
+baseShortSignal = debugForceShort or baseShortTrigger
+
+longOk = true
+shortOk = true
+if useAdx
+    longOk := longOk and adxSeries > adxThresh
+    shortOk := shortOk and adxSeries > adxThresh
+if useObv
+    longOk := longOk and obvSlopeVal > 0
+    shortOk := shortOk and obvSlopeVal < 0
+if useAtrDiff
+    longOk := longOk and atrDiff > 0
+    shortOk := shortOk and atrDiff < 0
+if useHtfTrend
+    longOk := longOk and htfTrendUp
+    shortOk := shortOk and htfTrendDown
+if useHmaFilter
+    longOk := longOk and close > hmaValue
+    shortOk := shortOk and close < hmaValue
+if useRangeFilter
+    longOk := longOk and not inRangeBox
+    shortOk := shortOk and not inRangeBox
+if useDistanceGuard
+    longOk := longOk and (atrSeries(distanceAtrLen) > 0) and ((math.abs(close - ta.sma(close, distanceAtrLen)) / atrSeries(distanceAtrLen)) <= distanceMaxAtr) and ((math.abs(close - ta.ema(close, distanceTrendLen)) / atrSeries(distanceAtrLen)) <= distanceMaxAtr)
+    shortOk := shortOk and (atrSeries(distanceAtrLen) > 0) and ((math.abs(close - ta.sma(close, distanceAtrLen)) / atrSeries(distanceAtrLen)) <= distanceMaxAtr) and ((math.abs(close - ta.ema(close, distanceTrendLen)) / atrSeries(distanceAtrLen)) <= distanceMaxAtr)
+if useDisparityGuard
+    longOk := longOk and disparityOk
+    shortOk := shortOk and disparityOk
+longOk := longOk and regimeLongOk
+shortOk := shortOk and regimeShortOk
+
+if useSqzGate
+    longOk := longOk and gateSqValid
+    shortOk := shortOk and gateSqValid
+
+enterLong = allowLongEntry and canTrade and baseLongSignal and longOk and positionDir == 0 and reentryCountdown == 0
+enterShort = allowShortEntry and canTrade and baseShortSignal and shortOk and positionDir == 0 and reentryCountdown == 0
+
+alertcondition(enterLong, title='롱 진입 신호', message='매직1분VN: 롱 진입 조건 충족')
+alertcondition(enterShort, title='숏 진입 신호', message='매직1분VN: 숏 진입 조건 충족')
+
+if not barstate.isconfirmed
+    enterLong := false
+    enterShort := false
+
+baseLongSignalConfirmed = barstate.isconfirmed ? baseLongSignal : false
+baseShortSignalConfirmed = barstate.isconfirmed ? baseShortSignal : false
+
+if useReversal and reversalCountdown == 0 and positionDir == 0 and lastDir != 0 and canTrade and barstate.isconfirmed
+    if lastDir == 1
+        enterShort := true
+    else if lastDir == -1
+        enterLong := true
+    lastDir := 0
+
+exitLong = false
+exitShort = false
+exitLongReason = ''
+exitShortReason = ''
+
+translateExitReason(reason, isLong) =>
+    dirLabel = isLong ? '롱' : '숏'
+    switch reason
+        'opposite' => '반대 신호 청산 (' + (isLong ? '숏 신호 감지' : '롱 신호 감지') + ')'
+        'mom_fade' => '모멘텀 약화 청산 (' + dirLabel + ')'
+        'time_stop' => '최대 보유 시간 초과 청산 (' + dirLabel + ')'
+        'kasa_exit' => 'KASA 조건 충족 청산 (' + dirLabel + ')'
+        'shock' => '변동성 쇼크 청산 (' + dirLabel + ')'
+        => '기타 청산 (' + dirLabel + ')'
+
+barsSinceMomFadeHistLong = ta.barssince(momFadeHist <= 0)
+barsSinceMomFadeHistShort = ta.barssince(momFadeHist >= 0)
+
+if positionDir > 0
+    if exitOpposite and baseShortSignalConfirmed and barsHeld >= minHoldBarsInput
+        exitLong := true
+        exitLongReason := 'opposite'
+    fadeAbsFalling = momFadeAbs < momFadeAbs[1]
+    fadeAbsTwo = not useMomFade or (momFadeAbs <= momFadeAbs[1] and momFadeAbs[1] <= momFadeAbs[2])
+    fadeDelayLong = momFadeZeroDelay <= 0 or barsSinceMomFadeHistLong > momFadeZeroDelay
+    fadeMinAbsOk = momFadeMinAbs <= 0 or momFadeAbs >= momFadeMinAbs
+    fadeReleaseOk = not useMomFade or not momFadeReleaseOnly or gateSqValid
+    if useMomFade and momFadeHist > 0 and fadeAbsFalling and fadeAbsTwo and fadeDelayLong and fadeMinAbsOk and fadeReleaseOk and barsHeld >= momFadeBars
+        exitLong := true
+        exitLongReason := 'mom_fade'
+    if useTimeStop and maxHoldBars > 0 and barsHeld >= maxHoldBars
+        exitLong := true
+        exitLongReason := 'time_stop'
+    if useKasa and kasaRsiVal < kasaRsiOB and kasaRsiVal[1] >= kasaRsiOB
+        exitLong := true
+        exitLongReason := 'kasa_exit'
+else if positionDir < 0
+    if exitOpposite and baseLongSignalConfirmed and barsHeld >= minHoldBarsInput
+        exitShort := true
+        exitShortReason := 'opposite'
+    fadeAbsFallingS = momFadeAbs < momFadeAbs[1]
+    fadeAbsTwoS = not useMomFade or (momFadeAbs <= momFadeAbs[1] and momFadeAbs[1] <= momFadeAbs[2])
+    fadeDelayShort = momFadeZeroDelay <= 0 or barsSinceMomFadeHistShort > momFadeZeroDelay
+    fadeMinAbsOkS = momFadeMinAbs <= 0 or momFadeAbs >= momFadeMinAbs
+    fadeReleaseOkS = not useMomFade or not momFadeReleaseOnly or gateSqValid
+    if useMomFade and momFadeHist < 0 and fadeAbsFallingS and fadeAbsTwoS and fadeDelayShort and fadeMinAbsOkS and fadeReleaseOkS and barsHeld >= momFadeBars
+        exitShort := true
+        exitShortReason := 'mom_fade'
+    if useTimeStop and maxHoldBars > 0 and barsHeld >= maxHoldBars
+        exitShort := true
+        exitShortReason := 'time_stop'
+    if useKasa and kasaRsiVal > kasaRsiOS and kasaRsiVal[1] <= kasaRsiOS
+        exitShort := true
+        exitShortReason := 'kasa_exit'
+
+isShock = false
+if useShock
+    atrFast = atrSeries(atrFastLen)
+    atrSlow = ta.sma(atrFast, atrSlowLen)
+    isShock := atrFast > atrSlow * shockMult
+if positionDir > 0 and isShock and shockAction == '즉시 청산'
+    exitLong := true
+    exitLongReason := 'shock'
+if positionDir < 0 and isShock and shockAction == '즉시 청산'
+    exitShort := true
+    exitShortReason := 'shock'
+
+longExitReasonLabel = exitLong ? translateExitReason(exitLongReason, true) : ''
+shortExitReasonLabel = exitShort ? translateExitReason(exitShortReason, false) : ''
+
+if positionDir > 0 and exitLong
+    strategy.close('포지션', comment=longExitReasonLabel)
+    lastDir := 1
+    reentryCountdown := reentryBars
+    reversalCountdown := int(reversalDelaySec / 60.0)
+if positionDir < 0 and exitShort
+    strategy.close('포지션', comment=shortExitReasonLabel)
+    lastDir := -1
+    reentryCountdown := reentryBars
+    reversalCountdown := int(reversalDelaySec / 60.0)
+
+float atrTrailSeries = atrSeries(atrTrailLen)
+float dynFactor = 1.0
+if useDynVol
+    dynFactor := clamp(((atrTrailSeries / close) + (ta.stdev(close, 20) * 2 / close) + (math.abs(close - ta.sma(close, 50)) / close)) / 3.0 + 1.0, 0.5, 3.0)
+
+float swingLowForStop = ta.lowest(low, stopLookback)
+float swingHighForStop = ta.highest(high, stopLookback)
+
+float stopLong = na
+float stopShort = na
+float targetLong = na
+float targetShort = na
+
+if positionDir > 0
+    if useAtrTrail and not na(atrTrailSeries)
+        stopLong := close - atrTrailSeries * atrTrailMult * dynFactor
+    if useStopLoss
+        stopLong := maxIgnoreNaN(stopLong, swingLowForStop)
+    if useFixedStop and not na(fixedStopPriceLong)
+        stopLong := maxIgnoreNaN(stopLong, fixedStopPriceLong)
+    if useBreakevenStop and not na(highestSinceEntry) and not na(atrTrailSeries)
+        move = highestSinceEntry - avgPrice
+        trigger = atrTrailSeries * breakevenMult * dynFactor
+        if move >= trigger
+            stopLong := maxIgnoreNaN(stopLong, avgPrice)
+    if useBeTiers and not na(highestSinceEntry)
+        atrSeed = atrOsc
+        if atrSeed > 0 and highestSinceEntry - avgPrice >= atrSeed
+            stopLong := maxIgnoreNaN(stopLong, avgPrice)
+    if useAtrProfit and not na(atrTrailSeries)
+        targetLong := avgPrice + atrTrailSeries * atrProfitMult * dynFactor
+else if positionDir < 0
+    if useAtrTrail and not na(atrTrailSeries)
+        stopShort := close + atrTrailSeries * atrTrailMult * dynFactor
+    if useStopLoss
+        stopShort := minIgnoreNaN(stopShort, swingHighForStop)
+    if useFixedStop and not na(fixedStopPriceShort)
+        stopShort := minIgnoreNaN(stopShort, fixedStopPriceShort)
+    if useBreakevenStop and not na(lowestSinceEntry) and not na(atrTrailSeries)
+        move = avgPrice - lowestSinceEntry
+        trigger = atrTrailSeries * breakevenMult * dynFactor
+        if move >= trigger
+            stopShort := minIgnoreNaN(stopShort, avgPrice)
+    if useBeTiers and not na(lowestSinceEntry)
+        atrSeed = atrOsc
+        if atrSeed > 0 and avgPrice - lowestSinceEntry >= atrSeed
+            stopShort := minIgnoreNaN(stopShort, avgPrice)
+    if useAtrProfit and not na(atrTrailSeries)
+        targetShort := avgPrice - atrTrailSeries * atrProfitMult * dynFactor
+
+if positionDir > 0
+    if not na(stopLong) and low <= stopLong
+        strategy.close('포지션', comment='손절가 청산 (롱)')
+    if not na(targetLong) and high >= targetLong
+        strategy.close('포지션', comment='ATR 목표 청산 (롱)')
+if positionDir < 0
+    if not na(stopShort) and high >= stopShort
+        strategy.close('포지션', comment='손절가 청산 (숏)')
+    if not na(targetShort) and low <= targetShort
+        strategy.close('포지션', comment='ATR 목표 청산 (숏)')
+
+if exitLong
+    label.new(bar_index, high, text=longExitReasonLabel, yloc=yloc.abovebar, color=color.new(color.maroon, 70), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if exitShort
+    label.new(bar_index, low, text=shortExitReasonLabel, yloc=yloc.belowbar, color=color.new(color.teal, 70), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// alertcondition을 위한 시리즈 변수
+exitLongReasonSeries = exitLong ? longExitReasonLabel : na
+exitShortReasonSeries = exitShort ? shortExitReasonLabel : na
+alertcondition(exitLong, title='롱 청산 신호', message='매직1분VN: 롱 청산 — 조건 충족')
+alertcondition(exitShort, title='숏 청산 신호', message='매직1분VN: 숏 청산 — 조건 충족')
+
+calcOrderSize(price, stopDistance, riskMult) =>
+    result = 0.0
+    if price > 0
+        effectiveScale = baseRiskPct
+        if useDrawdownScaling and peakEquity > 0
+            dd = (peakEquity - equity) / peakEquity * 100
+            if dd > drawdownTriggerPct
+                effectiveScale *= drawdownRiskScale
+        if usePerfAdaptiveRisk and array.size(recentPnls) >= parMinTrades
+            wins = 0
+            for i = 0 to array.size(recentPnls) - 1
+                if array.get(recentPnls, i) > 0
+                    wins += 1
+            winRate = array.size(recentPnls) > 0 ? wins / array.size(recentPnls) * 100 : 0
+            if winRate >= parHotWinRate
+                effectiveScale *= parHotMult
+            else if winRate <= parColdWinRate
+                effectiveScale *= parColdMult
+        mult = math.max(riskMult, 0.0)
+        if not useSizingOverride
+            pctToUse = math.max(baseQtyPercent * mult * (baseRiskPct > 0 ? effectiveScale / baseRiskPct : 1.0), 0.0)
+            capitalPortion = tradableCapital * pctToUse / 100.0
+            result := (capitalPortion * leverage) / price
+        else if sizingMode == '자본 비율'
+            pctToUse = math.max(advancedPercent * mult, 0.0)
+            capitalPortion = tradableCapital * pctToUse / 100.0
+            result := (capitalPortion * leverage) / price
+        else if sizingMode == '고정 금액 (USD)'
+            usdToUse = math.max(fixedUsdAmount * mult, 0.0)
+            result := (usdToUse * leverage) / price
+        else if sizingMode == '고정 계약'
+            result := math.max(fixedContractSize * mult, 0.0)
+        else if sizingMode == '리스크 기반'
+            if riskSizingType == '고정 계약'
+                result := math.max(riskContractSize * mult, 0.0)
+            else if stopDistance > 0 and not na(stopDistance)
+                riskPct = math.max(effectiveScale * mult, 0.0)
+                riskCapital = tradableCapital * riskPct / 100.0
+                result := riskCapital > 0 ? riskCapital / (stopDistance + slipValue) : 0.0
+    result
+
+if positionDir == 0
+    if enterLong
+        float entryPrice = close
+        float prospectiveStop = calcProspectiveStopLong(entryPrice, atrTrailSeries, dynFactor, swingLowForStop)
+        float stopDist = not na(prospectiveStop) ? entryPrice - prospectiveStop : na
+        if na(stopDist) or stopDist <= 0
+            stopDist := atrOsc
+        if na(stopDist) or stopDist <= 0
+            stopDist := tickSize
+        float stopForSize = math.max(stopDist, tickSize)
+        guardOk = not useStopDistanceGuard or na(atrOsc) or stopForSize <= atrOsc * maxStopAtrMult
+        float qty = calcOrderSize(entryPrice, stopForSize, 1.0)
+        if guardOk and qty > 0
+            strategy.entry('포지션', strategy.long, qty=qty)
+            float fsLong = calcFixedStopPriceLong(entryPrice)
+            if not na(fsLong)
+                fixedStopPriceLong := fsLong
+            lastEntryPrice := close
+            lastEntryQty := qty
+            lastPositionDir := 1
+            highestSinceEntry := high
+            lowestSinceEntry := low
+            reversalCountdown := int(reversalDelaySec / 60.0)
+            reentryCountdown := reentryBars
+    if enterShort
+        float entryPrice = close
+        float prospectiveStop = calcProspectiveStopShort(entryPrice, atrTrailSeries, dynFactor, swingHighForStop)
+        float stopDist = not na(prospectiveStop) ? prospectiveStop - entryPrice : na
+        if na(stopDist) or stopDist <= 0
+            stopDist := atrOsc
+        if na(stopDist) or stopDist <= 0
+            stopDist := tickSize
+        float stopForSize = math.max(stopDist, tickSize)
+        guardOk = not useStopDistanceGuard or na(atrOsc) or stopForSize <= atrOsc * maxStopAtrMult
+        float qty = calcOrderSize(entryPrice, stopForSize, 1.0)
+        if guardOk and qty > 0
+            strategy.entry('포지션', strategy.short, qty=qty)
+            float fsShort = calcFixedStopPriceShort(entryPrice)
+            if not na(fsShort)
+                fixedStopPriceShort := fsShort
+            lastEntryPrice := close
+            lastEntryQty := qty
+            lastPositionDir := -1
+            highestSinceEntry := high
+            lowestSinceEntry := low
+            reversalCountdown := int(reversalDelaySec / 60.0)
+            reentryCountdown := reentryBars
+
+var int prevClosedTrades = 0
+currentClosedTrades = strategy.closedtrades
+if currentClosedTrades > prevClosedTrades
+    for idx = prevClosedTrades to currentClosedTrades - 1
+        tradeProfit = strategy.closedtrades.profit(idx)
+        if tradeProfit < 0
+            lossStreak += 1
+            dailyLosses += 1
+        else if tradeProfit > 0
+            lossStreak := 0
+        if usePerfAdaptiveRisk
+            array.push(recentPnls, tradeProfit)
+            if array.size(recentPnls) > parLookback
+                array.shift(recentPnls)
+    prevClosedTrades := currentClosedTrades
+
+if positionDir == 0 and (exitLong or exitShort)
+    lastDir := lastPositionDir
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HUD 출력
+hudTitle = '📊 매직1분VN HUD'
+positionText = positionDir > 0 ? '롱 보유' : positionDir < 0 ? '숏 보유' : '포지션 없음'
+guardText = guardFrozen ? '중지' : '가동'
+canTradeText = canTrade ? '가능' : '중지'
+squeezeStateText = gateSqOn == 1 ? '압축 진행' : gateSqRelease ? '해제 신호' : '대기'
+roundedBuyHud = math.round(buyThresh * 100.0) / 100.0
+roundedSellHud = math.round(sellThresh * 100.0) / 100.0
+roundedMomentumHud = math.round(momentum * 100.0) / 100.0
+hudText = hudTitle + '\n'
+hudText += '포지션: ' + positionText + ' / 거래상태: ' + canTradeText + '\n'
+hudText += '스퀴즈: ' + squeezeStateText + ' / 모멘텀: ' + str.tostring(roundedMomentumHud) + '\n'
+hudText += '임계값 (매수/매도): ' + str.tostring(roundedBuyHud) + ' / ' + str.tostring(roundedSellHud) + '\n'
+hudText += '가드: ' + guardText + ' (발동 ' + str.tostring(guardFiredTotal) + ') / 연속손실 ' + str.tostring(lossStreak) + '\n'
+hudText += '출금 가능: ' + str.tostring(totalWithdrawable, format.mintick) + ' / 누적손익: ' + str.tostring(strategy.netprofit, format.mintick) + '\n'
+hudText += '일손익: ' + str.tostring(dailyPnl, format.mintick) + ' / 일손실횟수: ' + str.tostring(dailyLosses) + '\n'
+hudText += '가용자본: ' + str.tostring(tradableCapital, format.mintick) + '\n'
+if not na(lastEntryPrice)
+    hudText += '마지막 진입가: ' + str.tostring(lastEntryPrice, format.price) + ' / 수량: ' + str.tostring(lastEntryQty) + '\n'
+hudText += '레버리지: ' + str.tostring(leverage, format.mintick) + '배 / 선제틱: ' + str.tostring(preemptTicks)
+
+atrForHudBase = nz(atrOsc, atrSeries(oscLen))
+
+if barstate.islast and showPriceHud
+    atrForHud = atrForHudBase
+    basePrice = priceHudAnchorInput == '위쪽' ? high : low
+    offsetValue = nz(atrForHud, 0) * priceHudAtrOffset
+    hudY = priceHudAnchorInput == '위쪽' ? basePrice + offsetValue : basePrice - offsetValue
+    if na(hudY)
+        hudY := basePrice
+    labelSize = hudTableTextSizeInput == '작게' ? size.small : hudTableTextSizeInput == '크게' ? size.large : size.normal
+    if na(priceHudLabel)
+        priceHudLabel := label.new(bar_index, hudY, hudText, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=hudBgColorInput, textcolor=hudTextColorInput, size=labelSize)
+    else
+        label.set_xy(priceHudLabel, bar_index, hudY)
+        label.set_text(priceHudLabel, hudText)
+        label.set_color(priceHudLabel, hudBgColorInput)
+        label.set_textcolor(priceHudLabel, hudTextColorInput)
+        label.set_style(priceHudLabel, label.style_label_left)
+        label.set_size(priceHudLabel, labelSize)
+else if not barstate.islast or not showPriceHud
+    if not na(priceHudLabel)
+        label.delete(priceHudLabel)
+    priceHudLabel := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 시각화 플롯 & 하이라이트
+momentumPlotValue = barstate.isconfirmed ? momentum : nz(momentum[1], momentum)
+signalPlotValue = barstate.isconfirmed ? momSignal : nz(momSignal[1], momSignal)
+buyThreshPlotValue = barstate.isconfirmed ? buyThresh : nz(buyThresh[1], buyThresh)
+sellThreshPlotValue = barstate.isconfirmed ? sellThresh : nz(sellThresh[1], sellThresh)
+
+momentumPlotSeries = plot(showMomentumDecorators ? momentumPlotValue : na, title='Momentum (확정)', color=color.new(color.teal, 0), linewidth=2)
+signalPlotSeries = plot(showMomentumDecorators ? signalPlotValue : na, title='Signal (확정)', color=color.new(color.orange, 0), linewidth=1)
+buyThreshSeries = plot(showMomentumDecorators ? buyThreshPlotValue : na, title='Buy Threshold', color=color.new(color.green, 40), linewidth=1)
+sellThreshSeries = plot(showMomentumDecorators ? sellThreshPlotValue : na, title='Sell Threshold', color=color.new(color.red, 40), linewidth=1)
+hline(0, 'Momentum Zero', color=color.new(color.gray, 70))
+
+fill(momentumPlotSeries, signalPlotSeries, color=showMomentumDecorators ? color.new(color.teal, 88) : na)
+fill(buyThreshSeries, sellThreshSeries, color=showMomentumDecorators ? color.new(color.purple, 92) : na)
+
+longSignalMarker = showSignalMarkers and baseLongSignalConfirmed and longOk ? buyThreshPlotValue : na
+shortSignalMarker = showSignalMarkers and baseShortSignalConfirmed and shortOk ? sellThreshPlotValue : na
+plotshape(longSignalMarker, title='롱 조건 충족', style=shape.triangleup, location=location.absolute, color=color.new(color.lime, 0), size=size.tiny, text='롱', textcolor=color.white)
+plotshape(shortSignalMarker, title='숏 조건 충족', style=shape.triangledown, location=location.absolute, color=color.new(color.red, 0), size=size.tiny, text='숏', textcolor=color.white)
+
+plotshape(showSignalMarkers and openedLongThisBar, title='롱 진입', location=location.belowbar, style=shape.arrowup, color=color.new(color.lime, 0), text='롱', textcolor=color.white, size=size.small)
+plotshape(showSignalMarkers and openedShortThisBar, title='숏 진입', location=location.abovebar, style=shape.arrowdown, color=color.new(color.red, 0), text='숏', textcolor=color.white, size=size.small)
+
+sqzActiveBg = showSqueezeHighlight and gateSqOn == 1 ? color.new(color.blue, 90) : na
+sqzReleaseBg = showSqueezeHighlight and gateSqRelease ? color.new(color.purple, 88) : na
+bgcolor(sqzActiveBg, title='Squeeze Active BG')
+bgcolor(sqzReleaseBg, title='Squeeze Release BG')
+bgcolor(guardFrozen ? color.new(color.red, 90) : na, title='Guard Freeze BG')len          = input.int (12   , title="Momentum Length"       , group=gOsc, minval=5 , maxval=100)
 sig          = input.int (3    , title="Signal Length"         , group=gOsc, minval=1 , maxval=20)
 bbLen        = input.int (20   , title="BB Length"             , group=gOsc, minval=5 , maxval=200)
 bbMult       = input.float(1.4 , title="BB Multiplier"         , group=gOsc, minval=0.1, maxval=5.0 , step=0.1)
