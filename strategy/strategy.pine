@@ -344,26 +344,34 @@ f_htf(tf, indicatorType, len) =>
 directionalFlux(useHa, len, smoothLen) =>
     srcH = useHa ? haHigh : high
     srcL = useHa ? haLow  : low
+    srcC = useHa ? haClose : close
     upMove  = math.max(srcH - nz(srcH[1]), 0)
     dnMove  = math.max(nz(srcL[1]) - srcL, 0)
-    tr      = atrSeries(len)
-    up      = tr != 0 ? ta.rma(upMove, len) / tr : 0
-    dn      = tr != 0 ? ta.rma(dnMove, len) / tr : 0
+    prevClose = nz(srcC[1], srcC)
+    trRaw    = math.max(math.max(srcH - srcL, math.abs(srcH - prevClose)), math.abs(srcL - prevClose))
+    atrVal   = useHa ? ta.rma(trRaw, len) : atrSeries(len)
+    up      = atrVal != 0 ? ta.rma(upMove, len) / atrVal : 0
+    dn      = atrVal != 0 ? ta.rma(dnMove, len) / atrVal : 0
     denom   = up + dn
     ratio   = denom != 0 ? (up - dn) / denom : 0
     core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
     smoothLen > 1 ? ta.sma(core, smoothLen) : core
 
-modDirectionalFlux(len, smoothLen) =>
-    upMove  = math.max(high - nz(high[1]), 0)
-    dnMove  = math.max(nz(low[1]) - low, 0)
+modDirectionalFlux(useHa, len, smoothLen) =>
+    srcH = useHa ? haHigh : high
+    srcL = useHa ? haLow  : low
+    srcC = useHa ? haClose : close
+    upMove  = math.max(srcH - nz(srcH[1]), 0)
+    dnMove  = math.max(nz(srcL[1]) - srcL, 0)
     plusDM  = upMove > dnMove and upMove > 0 ? upMove : 0
     minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0
     plusR   = ta.rma(plusDM, len)
     minusR  = ta.rma(minusDM, len)
-    tr      = atrSeries(len)
-    up      = tr != 0 ? plusR / tr : 0
-    dn      = tr != 0 ? minusR / tr : 0
+    prevClose = nz(srcC[1], srcC)
+    trRaw    = math.max(math.max(srcH - srcL, math.abs(srcH - prevClose)), math.abs(srcL - prevClose))
+    atrVal   = useHa ? ta.rma(trRaw, len) : atrSeries(len)
+    up      = atrVal != 0 ? plusR / atrVal : 0
+    dn      = atrVal != 0 ? minusR / atrVal : 0
     denom   = up + dn
     ratio   = denom != 0 ? (up - dn) / denom : 0
     core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
@@ -459,7 +467,7 @@ crossDown = ta.crossunder(momentum, momSignal)
 
 float fluxHist = na
 if useModFlux
-    fluxHist := modDirectionalFlux(fluxLen, fluxSmoothLen)
+    fluxHist := modDirectionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
 else
     directionalFluxResult = directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
     fluxHist := fluxSmoothLen > 1 ? ta.sma(directionalFluxResult, fluxSmoothLen) : directionalFluxResult

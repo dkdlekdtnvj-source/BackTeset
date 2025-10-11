@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import pandas.testing as pdt
+import pytest
 from optimize import alternative_engine as alt
 from optimize.run import combine_metrics
 
@@ -124,7 +125,8 @@ def test_vectorbt_backtest_returns_trades_and_returns(monkeypatch):
     assert combined["NetProfit"] != 0.0
 
 
-def test_compute_indicators_with_mod_flux_matches_manual_calculation():
+@pytest.mark.parametrize("use_flux_heikin", [False, True])
+def test_compute_indicators_with_mod_flux_matches_manual_calculation(use_flux_heikin):
     index = pd.date_range("2024-01-01", periods=50, freq="1h", tz="UTC")
     base = np.linspace(100.0, 110.0, num=len(index))
     df = pd.DataFrame(
@@ -143,7 +145,7 @@ def test_compute_indicators_with_mod_flux_matches_manual_calculation():
         "signalLen": 3,
         "fluxLen": 8,
         "fluxSmoothLen": 3,
-        "useFluxHeikin": False,
+        "useFluxHeikin": use_flux_heikin,
         "useModFlux": True,
         "kcLen": 10,
         "kcMult": 1.0,
@@ -154,7 +156,7 @@ def test_compute_indicators_with_mod_flux_matches_manual_calculation():
 
     *_unused, flux_hist = alt._compute_indicators(df, params)
 
-    flux_df = alt._heikin_ashi(df) if params["useFluxHeikin"] else df
+    flux_df = alt._heikin_ashi(df) if use_flux_heikin else df
     plus_di, minus_di, _ = alt._dmi(flux_df, params["fluxLen"])
     flux_denom = (plus_di + minus_di).replace(0.0, np.nan)
     mod_flux_ratio = (plus_di - minus_di).divide(flux_denom)
@@ -168,7 +170,8 @@ def test_compute_indicators_with_mod_flux_matches_manual_calculation():
     pdt.assert_series_equal(flux_hist, expected, check_names=False, check_exact=False, rtol=1e-12, atol=1e-12)
 
 
-def test_compute_indicators_with_directional_flux_applies_additional_smoothing():
+@pytest.mark.parametrize("use_flux_heikin", [False, True])
+def test_compute_indicators_with_directional_flux_applies_additional_smoothing(use_flux_heikin):
     index = pd.date_range("2024-01-01", periods=60, freq="1h", tz="UTC")
     base = np.linspace(120.0, 135.0, num=len(index))
     df = pd.DataFrame(
@@ -187,7 +190,7 @@ def test_compute_indicators_with_directional_flux_applies_additional_smoothing()
         "signalLen": 4,
         "fluxLen": 9,
         "fluxSmoothLen": 4,
-        "useFluxHeikin": True,
+        "useFluxHeikin": use_flux_heikin,
         "useModFlux": False,
         "kcLen": 15,
         "kcMult": 1.1,
@@ -198,7 +201,7 @@ def test_compute_indicators_with_directional_flux_applies_additional_smoothing()
 
     *_unused, flux_hist = alt._compute_indicators(df, params)
 
-    flux_df = alt._heikin_ashi(df) if params["useFluxHeikin"] else df
+    flux_df = alt._heikin_ashi(df) if use_flux_heikin else df
     flux_raw = alt._directional_flux(flux_df, params["fluxLen"], params["fluxSmoothLen"])
     expected = flux_raw.rolling(params["fluxSmoothLen"], min_periods=params["fluxSmoothLen"]).mean()
 
