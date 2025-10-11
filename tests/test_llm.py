@@ -90,7 +90,8 @@ def test_generate_llm_candidates_switches_model_on_permission_error(monkeypatch)
 
         def generate_content(self, **kwargs):
             self.calls.append(kwargs)
-            if kwargs.get("model") == "gemini-2.5-flash":
+            model_name = kwargs.get("model")
+            if model_name in {"gemini-2.5-pro", "gemini-2.5-flash"}:
                 raise RuntimeError("PERMISSION_DENIED: model not available")
             return DummyResponse()
 
@@ -108,8 +109,8 @@ def test_generate_llm_candidates_switches_model_on_permission_error(monkeypatch)
     config = {
         "enabled": True,
         "api_key": "dummy",
-        "model": "gemini-2.5-flash",
-        "fallback_models": ["gemini-2.0-flash"],
+        "model": "gemini-2.5-pro",
+        "fallback_models": ["gemini-2.5-flash"],
         "count": 1,
         "top_n": 1,
     }
@@ -117,6 +118,7 @@ def test_generate_llm_candidates_switches_model_on_permission_error(monkeypatch)
     suggestions: LLMSuggestions = generate_llm_candidates(space, [trial], config)
 
     assert suggestions.candidates == [{"x": 1}]
-    assert len(dummy_models.calls) == 2
-    assert dummy_models.calls[0]["model"] == "gemini-2.5-flash"
-    assert dummy_models.calls[1]["model"] == "gemini-2.0-flash"
+    assert len(dummy_models.calls) == 3
+    assert dummy_models.calls[0]["model"] == "gemini-2.5-pro"
+    assert dummy_models.calls[1]["model"] == "gemini-2.5-flash"
+    assert dummy_models.calls[2]["model"] == "gemini-2.0-flash"
