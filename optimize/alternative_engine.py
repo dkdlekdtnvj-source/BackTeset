@@ -841,6 +841,7 @@ def _vectorbt_backtest(
         fees=parsed.commission_pct,
         size=trade_value,
         size_type="value",
+        execute_on_close=True,
         # rely on vectorbt defaults for direction and opposite entry handling
         upon_opposite_entry="close",
     )

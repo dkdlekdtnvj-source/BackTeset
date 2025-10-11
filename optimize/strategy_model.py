@@ -2499,6 +2499,66 @@ def run_backtest(
                 enter_long = True
             last_position_dir = 0
 
+        if position.direction == 0:
+            if enter_long:
+                stop_hint = atr_len_val
+                if use_stop_loss:
+                    if not np.isnan(swing_low_val):
+                        stop_hint = max(stop_hint, close_price - swing_low_val) if not np.isnan(stop_hint) else close_price - swing_low_val
+                    if use_pivot_stop:
+                        pivot_ref = pivot_low_htf_val if use_pivot_htf else pivot_low_val
+                        if not np.isnan(pivot_ref):
+                            dist_pivot = close_price - pivot_ref
+                            stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
+                if use_atr_trail and not np.isnan(atr_trail_val):
+                    atr_dist = atr_trail_val * atr_trail_mult
+                    stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
+                if np.isnan(stop_hint) or stop_hint <= 0:
+                    stop_hint = tick_size
+                stop_for_size = max(stop_hint, tick_size)
+                guard_ok = (
+                    (not use_stop_distance_guard)
+                    or np.isnan(atr_len_val)
+                    or stop_for_size <= atr_len_val * max_stop_atr_mult
+                )
+                qty = calc_order_size(close_price, stop_for_size, 1.0)
+                if guard_ok and qty > 0:
+                    position = Position(direction=1, qty=qty, avg_price=close_price, entry_time=ts)
+                    highest_since_entry = high_price
+                    lowest_since_entry = low_price
+                    pos_bars = 0
+                    reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
+                    continue
+            elif enter_short:
+                stop_hint = atr_len_val
+                if use_stop_loss:
+                    if not np.isnan(swing_high_val):
+                        stop_hint = max(stop_hint, swing_high_val - close_price) if not np.isnan(stop_hint) else swing_high_val - close_price
+                    if use_pivot_stop:
+                        pivot_ref = pivot_high_htf_val if use_pivot_htf else pivot_high_val
+                        if not np.isnan(pivot_ref):
+                            dist_pivot = pivot_ref - close_price
+                            stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
+                if use_atr_trail and not np.isnan(atr_trail_val):
+                    atr_dist = atr_trail_val * atr_trail_mult
+                    stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
+                if np.isnan(stop_hint) or stop_hint <= 0:
+                    stop_hint = tick_size
+                stop_for_size = max(stop_hint, tick_size)
+                guard_ok = (
+                    (not use_stop_distance_guard)
+                    or np.isnan(atr_len_val)
+                    or stop_for_size <= atr_len_val * max_stop_atr_mult
+                )
+                qty = calc_order_size(close_price, stop_for_size, 1.0)
+                if guard_ok and qty > 0:
+                    position = Position(direction=-1, qty=qty, avg_price=close_price, entry_time=ts)
+                    highest_since_entry = high_price
+                    lowest_since_entry = low_price
+                    pos_bars = 0
+                    reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
+                    continue
+
         exit_long = False
         exit_short = False
         exit_long_reason: Optional[str] = None
@@ -2660,64 +2720,6 @@ def run_backtest(
                 if low_price <= target:
                     close_position(ts, target, "ATR Profit Short")
                     continue
-
-        if position.direction == 0:
-            if enter_long:
-                stop_hint = atr_len_val
-                if use_stop_loss:
-                    if not np.isnan(swing_low_val):
-                        stop_hint = max(stop_hint, close_price - swing_low_val) if not np.isnan(stop_hint) else close_price - swing_low_val
-                    if use_pivot_stop:
-                        pivot_ref = pivot_low_htf_val if use_pivot_htf else pivot_low_val
-                        if not np.isnan(pivot_ref):
-                            dist_pivot = close_price - pivot_ref
-                            stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
-                if use_atr_trail and not np.isnan(atr_trail_val):
-                    atr_dist = atr_trail_val * atr_trail_mult
-                    stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
-                if np.isnan(stop_hint) or stop_hint <= 0:
-                    stop_hint = tick_size
-                stop_for_size = max(stop_hint, tick_size)
-                guard_ok = (
-                    (not use_stop_distance_guard)
-                    or np.isnan(atr_len_val)
-                    or stop_for_size <= atr_len_val * max_stop_atr_mult
-                )
-                qty = calc_order_size(close_price, stop_for_size, 1.0)
-                if guard_ok and qty > 0:
-                    position = Position(direction=1, qty=qty, avg_price=close_price, entry_time=ts)
-                    highest_since_entry = high_price
-                    lowest_since_entry = low_price
-                    pos_bars = 0
-                    reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
-            elif enter_short:
-                stop_hint = atr_len_val
-                if use_stop_loss:
-                    if not np.isnan(swing_high_val):
-                        stop_hint = max(stop_hint, swing_high_val - close_price) if not np.isnan(stop_hint) else swing_high_val - close_price
-                    if use_pivot_stop:
-                        pivot_ref = pivot_high_htf_val if use_pivot_htf else pivot_high_val
-                        if not np.isnan(pivot_ref):
-                            dist_pivot = pivot_ref - close_price
-                            stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
-                if use_atr_trail and not np.isnan(atr_trail_val):
-                    atr_dist = atr_trail_val * atr_trail_mult
-                    stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
-                if np.isnan(stop_hint) or stop_hint <= 0:
-                    stop_hint = tick_size
-                stop_for_size = max(stop_hint, tick_size)
-                guard_ok = (
-                    (not use_stop_distance_guard)
-                    or np.isnan(atr_len_val)
-                    or stop_for_size <= atr_len_val * max_stop_atr_mult
-                )
-                qty = calc_order_size(close_price, stop_for_size, 1.0)
-                if guard_ok and qty > 0:
-                    position = Position(direction=-1, qty=qty, avg_price=close_price, entry_time=ts)
-                    highest_since_entry = high_price
-                    lowest_since_entry = low_price
-                    pos_bars = 0
-                    reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
 
     if position.direction != 0 and position.entry_time is not None:
         close_position(df.index[-1], close_vals[-1], "EndOfData")

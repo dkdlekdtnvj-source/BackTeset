@@ -42,6 +42,7 @@ class DummyPortfolio:
         fees: float,
         size: float,
         size_type: str,
+        execute_on_close: bool,
         upon_opposite_entry: str,
     ) -> "DummyPortfolio":
         returns = np.array([0.02, -0.01, 0.03], dtype=float)
