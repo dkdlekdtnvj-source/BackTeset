@@ -253,11 +253,18 @@ minIgnoreNaN(a, b) =>
 trueRange() =>
     math.max(math.max(high - low, math.abs(high - close[1])), math.abs(low - close[1]))
 
+trueRangeHa() =>
+    float prevHaClose = nz(haClose[1], haClose)
+    math.max(math.max(haHigh - haLow, math.abs(haHigh - prevHaClose)), math.abs(haLow - prevHaClose))
+
 boolText(flag) =>
     flag ? '예' : '아니오'
 
 atrSeries(len) =>
     ta.rma(trueRange(), len)
+
+atrSeriesHa(len) =>
+    ta.rma(trueRangeHa(), len)
 
 stdSeries(src, len) =>
     ta.stdev(src, len)
@@ -346,7 +353,7 @@ directionalFlux(useHa, len, smoothLen) =>
     srcL = useHa ? haLow  : low
     upMove  = math.max(srcH - nz(srcH[1]), 0)
     dnMove  = math.max(nz(srcL[1]) - srcL, 0)
-    tr      = atrSeries(len)
+    tr      = useHa ? atrSeriesHa(len) : atrSeries(len)
     up      = tr != 0 ? ta.rma(upMove, len) / tr : 0
     dn      = tr != 0 ? ta.rma(dnMove, len) / tr : 0
     denom   = up + dn
@@ -354,14 +361,16 @@ directionalFlux(useHa, len, smoothLen) =>
     core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
     smoothLen > 1 ? ta.sma(core, smoothLen) : core
 
-modDirectionalFlux(len, smoothLen) =>
-    upMove  = math.max(high - nz(high[1]), 0)
-    dnMove  = math.max(nz(low[1]) - low, 0)
+modDirectionalFlux(useHa, len, smoothLen) =>
+    srcH = useHa ? haHigh : high
+    srcL = useHa ? haLow : low
+    upMove  = math.max(srcH - nz(srcH[1]), 0)
+    dnMove  = math.max(nz(srcL[1]) - srcL, 0)
     plusDM  = upMove > dnMove and upMove > 0 ? upMove : 0
     minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0
     plusR   = ta.rma(plusDM, len)
     minusR  = ta.rma(minusDM, len)
-    tr      = atrSeries(len)
+    tr      = useHa ? atrSeriesHa(len) : atrSeries(len)
     up      = tr != 0 ? plusR / tr : 0
     dn      = tr != 0 ? minusR / tr : 0
     denom   = up + dn
@@ -459,7 +468,7 @@ crossDown = ta.crossunder(momentum, momSignal)
 
 float fluxHist = na
 if useModFlux
-    fluxHist := modDirectionalFlux(fluxLen, fluxSmoothLen)
+    fluxHist := modDirectionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
 else
     directionalFluxResult = directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
     fluxHist := fluxSmoothLen > 1 ? ta.sma(directionalFluxResult, fluxSmoothLen) : directionalFluxResult
