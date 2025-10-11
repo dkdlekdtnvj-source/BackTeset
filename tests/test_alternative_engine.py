@@ -5,6 +5,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import pandas.testing as pdt
+import pytest
+
 from optimize import alternative_engine as alt
 from optimize.run import combine_metrics
 
@@ -124,7 +126,8 @@ def test_vectorbt_backtest_returns_trades_and_returns(monkeypatch):
     assert combined["NetProfit"] != 0.0
 
 
-def test_compute_indicators_with_mod_flux_matches_manual_calculation():
+@pytest.mark.parametrize("use_heikin", [False, True])
+def test_compute_indicators_with_mod_flux_matches_manual_calculation(use_heikin):
     index = pd.date_range("2024-01-01", periods=50, freq="1h", tz="UTC")
     base = np.linspace(100.0, 110.0, num=len(index))
     df = pd.DataFrame(
@@ -143,7 +146,7 @@ def test_compute_indicators_with_mod_flux_matches_manual_calculation():
         "signalLen": 3,
         "fluxLen": 8,
         "fluxSmoothLen": 3,
-        "useFluxHeikin": False,
+        "useFluxHeikin": use_heikin,
         "useModFlux": True,
         "kcLen": 10,
         "kcMult": 1.0,

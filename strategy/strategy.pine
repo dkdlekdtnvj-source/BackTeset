@@ -344,9 +344,13 @@ f_htf(tf, indicatorType, len) =>
 directionalFlux(useHa, len, smoothLen) =>
     srcH = useHa ? haHigh : high
     srcL = useHa ? haLow  : low
-    upMove  = math.max(srcH - nz(srcH[1]), 0)
-    dnMove  = math.max(nz(srcL[1]) - srcL, 0)
-    tr      = atrSeries(len)
+    prevH = useHa ? nz(haHigh[1]) : nz(high[1])
+    prevL = useHa ? nz(haLow[1])  : nz(low[1])
+    prevClose = useHa ? haClose[1] : close[1]
+    upMove  = math.max(srcH - prevH, 0)
+    dnMove  = math.max(prevL - srcL, 0)
+    trBase  = math.max(math.max(srcH - srcL, math.abs(srcH - prevClose)), math.abs(srcL - prevClose))
+    tr      = useHa ? ta.rma(trBase, len) : atrSeries(len)
     up      = tr != 0 ? ta.rma(upMove, len) / tr : 0
     dn      = tr != 0 ? ta.rma(dnMove, len) / tr : 0
     denom   = up + dn
@@ -354,14 +358,20 @@ directionalFlux(useHa, len, smoothLen) =>
     core    = ta.rma(ratio, math.max(math.round(len / 2.0), 1)) * 100
     smoothLen > 1 ? ta.sma(core, smoothLen) : core
 
-modDirectionalFlux(len, smoothLen) =>
-    upMove  = math.max(high - nz(high[1]), 0)
-    dnMove  = math.max(nz(low[1]) - low, 0)
+modDirectionalFlux(useHa, len, smoothLen) =>
+    srcH = useHa ? haHigh : high
+    srcL = useHa ? haLow  : low
+    prevH = useHa ? nz(haHigh[1]) : nz(high[1])
+    prevL = useHa ? nz(haLow[1])  : nz(low[1])
+    prevClose = useHa ? haClose[1] : close[1]
+    upMove  = math.max(srcH - prevH, 0)
+    dnMove  = math.max(prevL - srcL, 0)
     plusDM  = upMove > dnMove and upMove > 0 ? upMove : 0
     minusDM = dnMove > upMove and dnMove > 0 ? dnMove : 0
     plusR   = ta.rma(plusDM, len)
     minusR  = ta.rma(minusDM, len)
-    tr      = atrSeries(len)
+    trBase  = math.max(math.max(srcH - srcL, math.abs(srcH - prevClose)), math.abs(srcL - prevClose))
+    tr      = useHa ? ta.rma(trBase, len) : atrSeries(len)
     up      = tr != 0 ? plusR / tr : 0
     dn      = tr != 0 ? minusR / tr : 0
     denom   = up + dn
@@ -457,7 +467,7 @@ momSignal = switch str.lower(maTypeInput)
 crossUp = ta.crossover(momentum, momSignal)
 crossDown = ta.crossunder(momentum, momSignal)
 
-fluxHist = useModFlux ? modDirectionalFlux(fluxLen, fluxSmoothLen) : directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
+fluxHist = useModFlux ? modDirectionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen) : directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
 
 momFadeSource = (high + low + close) / 3.0
 momFadeBasis = ta.sma(momFadeSource, momFadeBbLen)

@@ -3,12 +3,16 @@ import math
 import numpy as np
 
 import pandas as pd
+import pandas.testing as pdt
 import pytest
 
 from optimize.strategy_model import (
     _bars_since_mask,
     _rolling_rma_last,
     _security_series,
+    _directional_flux,
+    _heikin_ashi,
+    _rma,
     _true_range,
     run_backtest,
 )
@@ -275,3 +279,75 @@ def test_rolling_rma_last_matches_recursive_formula():
 
     zero_length = _rolling_rma_last(values, 0)
     assert np.isnan(zero_length).all()
+
+
+@pytest.mark.parametrize("use_heikin", [False, True])
+def test_directional_flux_matches_manual_reference(use_heikin: bool):
+    index = pd.date_range("2024-06-01", periods=40, freq="15min", tz="UTC")
+    base = np.linspace(100.0, 105.0, num=len(index))
+    noise = np.sin(np.linspace(0, 4 * np.pi, num=len(index))) * 0.4
+    close = pd.Series(base + noise, index=index)
+    df = pd.DataFrame(
+        {
+            "open": close.shift(1).fillna(close.iloc[0]) + 0.1,
+            "high": close + 0.8,
+            "low": close - 0.9,
+            "close": close,
+            "volume": 1.0,
+        },
+        index=index,
+    )
+
+    flux_len = 7
+    smooth_len = 3
+    flux_df = _heikin_ashi(df) if use_heikin else df
+    result = _directional_flux(flux_df, flux_len, smooth_len)
+
+    high = flux_df["high"]
+    low = flux_df["low"]
+    close_vals = flux_df["close"]
+
+    prev_high = high.shift(1).fillna(high)
+    prev_low = low.shift(1).fillna(low)
+    prev_close = close_vals.shift(1).fillna(close_vals)
+
+    up_move = (high - prev_high).clip(lower=0.0)
+    down_move = (prev_low - low).clip(lower=0.0)
+
+    tr_components = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    tr = _rma(tr_components.max(axis=1), flux_len)
+    atr_safe = tr.replace(0.0, np.nan)
+
+    up_rma = _rma(up_move, flux_len)
+    down_rma = _rma(down_move, flux_len)
+
+    up = up_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+    dn = down_rma.divide(atr_safe).replace([np.inf, -np.inf], np.nan)
+
+    flux_denom = (up + dn).replace(0.0, np.nan)
+    flux_ratio = (up - dn).divide(flux_denom)
+    flux_ratio = flux_ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    flux_half = max(int(np.round(flux_len / 2.0)), 1)
+    flux_core = _rma(flux_ratio, flux_half) * 100.0
+    expected = (
+        flux_core.rolling(smooth_len, min_periods=smooth_len).mean()
+        if smooth_len > 1
+        else flux_core
+    )
+
+    pdt.assert_series_equal(
+        result,
+        expected.fillna(0.0),
+        check_names=False,
+        check_exact=False,
+        rtol=1e-12,
+        atol=1e-12,
+    )
