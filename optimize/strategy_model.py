@@ -2690,6 +2690,7 @@ def run_backtest(
                     lowest_since_entry = low_price
                     pos_bars = 0
                     reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
+                    continue
             elif enter_short:
                 stop_hint = atr_len_val
                 if use_stop_loss:
@@ -2718,6 +2719,7 @@ def run_backtest(
                     lowest_since_entry = low_price
                     pos_bars = 0
                     reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
+                    continue
 
     if position.direction != 0 and position.entry_time is not None:
         close_position(df.index[-1], close_vals[-1], "EndOfData")
