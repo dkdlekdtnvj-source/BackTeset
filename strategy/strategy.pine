@@ -440,12 +440,12 @@ momStyle = switch str.lower(momStyleInput)
     'mod' => 'mod'
     => 'kc'
 
-// ✅ [수정됨] 'deluxe' 및 'kc' 스타일에 ATR 정규화 로직 추가하여 모든 스타일의 값을 일관되게 만듦
+// ✅ [2025-02-15] ATR 정규화 조건 재조정: 'avg'와 'mod'만 ATR로 나누고 나머지는 원시 차이값을 사용
 normRaw = switch momStyle
     'avg'    => (close - avgLineAvg) / nz(atrPrimary, 1)
-    'deluxe' => (close - avgLineDeluxe) / nz(atrPrimary, 1)
+    'deluxe' => (close - avgLineDeluxe)
     'mod'    => (close - midline) / nz(atrPrimary, 1)
-    => (close - meanKc) / nz(atrPrimary, 1)
+    => (close - meanKc)
 
 normSeries = nz(normRaw) * 100.0
 momentum = ta.linreg(normSeries, oscLen, 0)
