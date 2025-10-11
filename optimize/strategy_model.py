@@ -2177,11 +2177,63 @@ def run_backtest(
 
     prev_guard_state = guard_frozen
 
+    close_vals = df["close"].to_numpy()
+    high_vals = df["high"].to_numpy()
+    low_vals = df["low"].to_numpy()
+    momentum_vals = momentum.to_numpy()
+    mom_signal_vals = mom_signal.to_numpy()
+    flux_hist_vals = flux_hist.to_numpy()
+    buy_thresh_vals = buy_thresh_series.to_numpy()
+    sell_thresh_vals = sell_thresh_series.to_numpy()
+    cross_up_vals = _cross_up_series.to_numpy()
+    cross_down_vals = _cross_dn_series.to_numpy()
+    adx_vals = adx_series.to_numpy() if use_adx else None
+    ema_fast_vals = ema_fast.to_numpy() if use_ema else None
+    ema_slow_vals = ema_slow.to_numpy() if use_ema else None
+    bb_filter_basis_vals = bb_filter_basis.to_numpy() if use_bb_filter else None
+    bb_filter_lower_vals = bb_filter_lower.to_numpy() if use_bb_filter else None
+    bb_filter_upper_vals = bb_filter_upper.to_numpy() if use_bb_filter else None
+    stoch_rsi_vals = stoch_rsi_val.to_numpy() if use_stoch_rsi else None
+    obv_slope_vals = obv_slope.to_numpy() if use_obv else None
+    atr_diff_vals = atr_diff.to_numpy() if use_atr_diff else None
+    htf_trend_up_vals = htf_trend_up.to_numpy() if use_htf_trend else None
+    htf_trend_down_vals = htf_trend_down.to_numpy() if use_htf_trend else None
+    hma_vals = hma_value.to_numpy() if use_hma_filter else None
+    in_range_box_vals = in_range_box.to_numpy() if use_range_filter else None
+    event_mask_vals = event_mask.to_numpy() if use_event_filter else None
+    slope_ok_long_vals = slope_ok_long.to_numpy() if use_slope_filter else None
+    slope_ok_short_vals = slope_ok_short.to_numpy() if use_slope_filter else None
+    distance_ok_vals = distance_ok.to_numpy() if use_distance_guard else None
+    regime_long_ok_vals = regime_long_ok.to_numpy()
+    regime_short_ok_vals = regime_short_ok.to_numpy()
+    gate_bars_since_release_vals = gate_bars_since_release.to_numpy()
+    gate_sq_on_vals = gate_sq_on.to_numpy()
+    bos_long_state_vals = bos_long_state.to_numpy()
+    bos_short_state_vals = bos_short_state.to_numpy()
+    choch_long_state_vals = choch_long_state.to_numpy()
+    choch_short_state_vals = choch_short_state.to_numpy()
+    mom_fade_abs_vals = mom_fade_abs.to_numpy()
+    mom_fade_abs_prev_vals = mom_fade_abs_prev.to_numpy()
+    mom_fade_abs_prev2_vals = mom_fade_abs_prev2.to_numpy()
+    mom_fade_since_nonpos_vals = mom_fade_since_nonpos.to_numpy()
+    mom_fade_since_nonneg_vals = mom_fade_since_nonneg.to_numpy()
+    mom_fade_hist_vals = mom_fade_hist.to_numpy()
+    kasa_rsi_vals = kasa_rsi.to_numpy() if use_kasa else None
+    atr_trail_vals = atr_trail_series.to_numpy()
+    dyn_factor_vals = dyn_factor_series.to_numpy()
+    swing_low_vals = swing_low_series.to_numpy()
+    swing_high_vals = swing_high_series.to_numpy()
+    pivot_low_htf_vals = pivot_low_htf.to_numpy()
+    pivot_high_htf_vals = pivot_high_htf.to_numpy()
+    pivot_low_vals = pivot_low_series.to_numpy()
+    pivot_high_vals = pivot_high_series.to_numpy()
+    atr_len_vals = atr_len_series.to_numpy()
+    shock_vals = shock_series.to_numpy() if use_shock else None
+    vol_guard_vals = vol_guard_atr_pct.to_numpy() if use_volatility_guard else None
+
     for idx, ts in enumerate(df.index):
         if ts < start_ts:
             continue
-
-        row = df.iloc[idx]
 
         if idx > 0:
             prev_day = df.index[idx - 1].date()
@@ -2220,7 +2272,10 @@ def run_backtest(
         loss_count_breached = max_daily_losses > 0 and daily_losses >= max_daily_losses
         guard_fire_limit = max_guard_fires > 0 and guard_fired_total >= max_guard_fires
 
-        atr_pct_val = vol_guard_atr_pct.iloc[idx] if use_volatility_guard else 0.0
+        close_price = close_vals[idx]
+        high_price = high_vals[idx]
+        low_price = low_vals[idx]
+        atr_pct_val = vol_guard_vals[idx] if use_volatility_guard and vol_guard_vals is not None else 0.0
         is_vol_ok = (not use_volatility_guard) or (
             volatility_lower_pct <= atr_pct_val <= volatility_upper_pct
         )
@@ -2251,7 +2306,7 @@ def run_backtest(
         prev_guard_state = guard_frozen
 
         if guard_activated and position.direction != 0:
-            close_position(ts, row["close"], "Guard Halt")
+            close_position(ts, close_price, "Guard Halt")
             guard_fired_total += 1
 
         if use_guard_exit and position.direction != 0 and not guard_activated:
@@ -2269,9 +2324,9 @@ def run_backtest(
                     else:
                         liq_price += buffer
                 preempt_price = liq_price + preempt_ticks * tick_size if position.direction > 0 else liq_price - preempt_ticks * tick_size
-                hit_guard = row["low"] <= preempt_price if position.direction > 0 else row["high"] >= preempt_price
+                hit_guard = low_price <= preempt_price if position.direction > 0 else high_price >= preempt_price
                 if hit_guard:
-                    close_position(ts, row["close"], "Guard Exit")
+                    close_position(ts, close_price, "Guard Exit")
                     guard_frozen = True
                     guard_fired_total += 1
 
@@ -2285,25 +2340,35 @@ def run_backtest(
         if position.direction != 0:
             pos_bars += 1
             if position.direction > 0:
-                highest_since_entry = row["high"] if np.isnan(highest_since_entry) else max(highest_since_entry, row["high"])
-                lowest_since_entry = row["low"] if np.isnan(lowest_since_entry) else min(lowest_since_entry, row["low"])
+                highest_since_entry = high_price if np.isnan(highest_since_entry) else max(highest_since_entry, high_price)
+                lowest_since_entry = low_price if np.isnan(lowest_since_entry) else min(lowest_since_entry, low_price)
             else:
-                lowest_since_entry = row["low"] if np.isnan(lowest_since_entry) else min(lowest_since_entry, row["low"])
-                highest_since_entry = row["high"] if np.isnan(highest_since_entry) else max(highest_since_entry, row["high"])
+                lowest_since_entry = low_price if np.isnan(lowest_since_entry) else min(lowest_since_entry, low_price)
+                highest_since_entry = high_price if np.isnan(highest_since_entry) else max(highest_since_entry, high_price)
             position.bars_held += 1
 
         prev_idx = max(idx - 1, 0)
-        prev_momentum = momentum.iloc[prev_idx]
-        prev_signal = mom_signal.iloc[prev_idx]
-        mom_val = momentum.iloc[idx]
-        sig_val = mom_signal.iloc[idx]
-        flux_val = flux_hist.iloc[idx]
-        buy_thresh_val = buy_thresh_series.iloc[idx]
-        sell_thresh_val = sell_thresh_series.iloc[idx]
+        prev_momentum = momentum_vals[prev_idx]
+        prev_signal = mom_signal_vals[prev_idx]
+        mom_val = momentum_vals[idx]
+        sig_val = mom_signal_vals[idx]
+        flux_val = flux_hist_vals[idx]
+        buy_thresh_val = buy_thresh_vals[idx]
+        sell_thresh_val = sell_thresh_vals[idx]
 
         # Determine cross-over and cross-under signals from the precomputed series.
-        cross_up = bool(_cross_up_series.iloc[idx])
-        cross_down = bool(_cross_dn_series.iloc[idx])
+        cross_up = bool(cross_up_vals[idx])
+        cross_down = bool(cross_down_vals[idx])
+
+        atr_trail_val = atr_trail_vals[idx]
+        dyn_factor_val = dyn_factor_vals[idx]
+        atr_len_val = atr_len_vals[idx]
+        swing_low_val = swing_low_vals[idx]
+        swing_high_val = swing_high_vals[idx]
+        pivot_low_val = pivot_low_vals[idx]
+        pivot_high_val = pivot_high_vals[idx]
+        pivot_low_htf_val = pivot_low_htf_vals[idx]
+        pivot_high_htf_val = pivot_high_htf_vals[idx]
 
         long_cross_ok = cross_up or not require_momentum_cross
         short_cross_ok = cross_down or not require_momentum_cross
@@ -2315,81 +2380,93 @@ def run_backtest(
         long_ok = True
         short_ok = True
 
-        if use_adx:
-            long_ok &= adx_series.iloc[idx] > adx_thresh
-            short_ok &= adx_series.iloc[idx] > adx_thresh
-        if use_ema:
-            if ema_mode == "Crossover":
-                long_ok &= ema_fast.iloc[idx] > ema_slow.iloc[idx]
-                short_ok &= ema_fast.iloc[idx] < ema_slow.iloc[idx]
+        if use_adx and adx_vals is not None:
+            adx_val = adx_vals[idx]
+            long_ok &= adx_val > adx_thresh
+            short_ok &= adx_val > adx_thresh
+        if use_ema and ema_slow_vals is not None:
+            if ema_mode == "Crossover" and ema_fast_vals is not None:
+                long_ok &= ema_fast_vals[idx] > ema_slow_vals[idx]
+                short_ok &= ema_fast_vals[idx] < ema_slow_vals[idx]
             else:
-                long_ok &= row["close"] > ema_slow.iloc[idx]
-                short_ok &= row["close"] < ema_slow.iloc[idx]
-        if use_bb_filter:
-            long_ok &= (row["close"] <= bb_filter_basis.iloc[idx]) or (row["close"] < bb_filter_lower.iloc[idx])
-            short_ok &= (row["close"] >= bb_filter_basis.iloc[idx]) or (row["close"] > bb_filter_upper.iloc[idx])
-        if use_stoch_rsi:
-            long_ok &= stoch_rsi_val.iloc[idx] <= stoch_os
-            short_ok &= stoch_rsi_val.iloc[idx] >= stoch_ob
-        if use_obv:
-            long_ok &= obv_slope.iloc[idx] > 0
-            short_ok &= obv_slope.iloc[idx] < 0
-        if use_atr_diff:
-            long_ok &= atr_diff.iloc[idx] > 0
-            short_ok &= atr_diff.iloc[idx] > 0
-        if use_htf_trend:
-            long_ok &= bool(htf_trend_up.iloc[idx])
-            short_ok &= bool(htf_trend_down.iloc[idx])
-        if use_hma_filter:
-            long_ok &= row["close"] > hma_value.iloc[idx]
-            short_ok &= row["close"] < hma_value.iloc[idx]
-        if use_range_filter:
-            long_ok &= not bool(in_range_box.iloc[idx])
-            short_ok &= not bool(in_range_box.iloc[idx])
-        if use_event_filter:
-            long_ok &= not bool(event_mask.iloc[idx])
-            short_ok &= not bool(event_mask.iloc[idx])
-        if use_slope_filter:
-            long_ok &= bool(slope_ok_long.iloc[idx])
-            short_ok &= bool(slope_ok_short.iloc[idx])
-        if use_distance_guard:
-            long_ok &= bool(distance_ok.iloc[idx])
-            short_ok &= bool(distance_ok.iloc[idx])
+                long_ok &= close_price > ema_slow_vals[idx]
+                short_ok &= close_price < ema_slow_vals[idx]
+        if use_bb_filter and bb_filter_basis_vals is not None:
+            long_ok &= (close_price <= bb_filter_basis_vals[idx]) or (close_price < bb_filter_lower_vals[idx])
+            short_ok &= (close_price >= bb_filter_basis_vals[idx]) or (close_price > bb_filter_upper_vals[idx])
+        if use_stoch_rsi and stoch_rsi_vals is not None:
+            stoch_val = stoch_rsi_vals[idx]
+            long_ok &= stoch_val <= stoch_os
+            short_ok &= stoch_val >= stoch_ob
+        if use_obv and obv_slope_vals is not None:
+            obv_val = obv_slope_vals[idx]
+            long_ok &= obv_val > 0
+            short_ok &= obv_val < 0
+        if use_atr_diff and atr_diff_vals is not None:
+            atr_diff_val = atr_diff_vals[idx]
+            long_ok &= atr_diff_val > 0
+            short_ok &= atr_diff_val > 0
+        if use_htf_trend and htf_trend_up_vals is not None and htf_trend_down_vals is not None:
+            long_ok &= bool(htf_trend_up_vals[idx])
+            short_ok &= bool(htf_trend_down_vals[idx])
+        if use_hma_filter and hma_vals is not None:
+            hma_val = hma_vals[idx]
+            long_ok &= close_price > hma_val
+            short_ok &= close_price < hma_val
+        if use_range_filter and in_range_box_vals is not None:
+            in_range = bool(in_range_box_vals[idx])
+            long_ok &= not in_range
+            short_ok &= not in_range
+        if use_event_filter and event_mask_vals is not None:
+            event_flag = bool(event_mask_vals[idx])
+            long_ok &= not event_flag
+            short_ok &= not event_flag
+        if use_slope_filter and slope_ok_long_vals is not None and slope_ok_short_vals is not None:
+            long_ok &= bool(slope_ok_long_vals[idx])
+            short_ok &= bool(slope_ok_short_vals[idx])
+        if use_distance_guard and distance_ok_vals is not None:
+            distance_flag = bool(distance_ok_vals[idx])
+            long_ok &= distance_flag
+            short_ok &= distance_flag
         if use_equity_slope_filter and len(equity_trace) >= eq_slope_len:
             equity_window = pd.Series(equity_trace[-eq_slope_len:])
             eq_slope = _linreg(equity_window, min(eq_slope_len, len(equity_window))).iloc[-1]
             long_ok &= eq_slope >= 0
             short_ok &= eq_slope <= 0
-        long_ok &= bool(regime_long_ok.iloc[idx])
-        short_ok &= bool(regime_short_ok.iloc[idx])
+        long_ok &= bool(regime_long_ok_vals[idx])
+        short_ok &= bool(regime_short_ok_vals[idx])
 
         structure_require_all = structure_gate_mode == "모두 충족"
         structure_long_pass = True
         structure_short_pass = True
         if use_structure_gate:
             if structure_require_all:
-                structure_long_pass = (not use_bos or bool(bos_long_state.iloc[idx])) and (
-                    not use_choch or bool(choch_long_state.iloc[idx])
+                structure_long_pass = (not use_bos or bool(bos_long_state_vals[idx])) and (
+                    not use_choch or bool(choch_long_state_vals[idx])
                 )
-                structure_short_pass = (not use_bos or bool(bos_short_state.iloc[idx])) and (
-                    not use_choch or bool(choch_short_state.iloc[idx])
+                structure_short_pass = (not use_bos or bool(bos_short_state_vals[idx])) and (
+                    not use_choch or bool(choch_short_state_vals[idx])
                 )
             else:
                 structure_long_pass = (
-                    (use_bos and bool(bos_long_state.iloc[idx]))
-                    or (use_choch and bool(choch_long_state.iloc[idx]))
+                    (use_bos and bool(bos_long_state_vals[idx]))
+                    or (use_choch and bool(choch_long_state_vals[idx]))
                     or (not use_bos and not use_choch)
                 )
                 structure_short_pass = (
-                    (use_bos and bool(bos_short_state.iloc[idx]))
-                    or (use_choch and bool(choch_short_state.iloc[idx]))
+                    (use_bos and bool(bos_short_state_vals[idx]))
+                    or (use_choch and bool(choch_short_state_vals[idx]))
                     or (not use_bos and not use_choch)
                 )
             long_ok &= structure_long_pass
             short_ok &= structure_short_pass
 
-        gate_release_seen = gate_bars_since_release.iloc[idx] != np.inf
-        gate_sq_valid = gate_release_seen and gate_bars_since_release.iloc[idx] <= sqz_release_bars and not gate_sq_on.iloc[idx]
+        gate_release_seen = gate_bars_since_release_vals[idx] != np.inf
+        gate_sq_valid = (
+            gate_release_seen
+            and gate_bars_since_release_vals[idx] <= sqz_release_bars
+            and not bool(gate_sq_on_vals[idx])
+        )
         if use_sqz_gate:
             long_ok &= gate_sq_valid
             short_ok &= gate_sq_valid
@@ -2431,20 +2508,25 @@ def run_backtest(
             if exit_opposite and base_short_signal and position.bars_held >= min_hold_bars_param:
                 exit_long = True
                 exit_long_reason = exit_long_reason or "opposite_signal"
-            fade_abs_falling = mom_fade_abs.iloc[idx] < mom_fade_abs_prev.iloc[idx] if mom_fade_bars <= 1 else mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
+            fade_abs = mom_fade_abs_vals[idx]
+            fade_abs_prev = mom_fade_abs_prev_vals[idx]
+            fade_abs_prev2 = mom_fade_abs_prev2_vals[idx]
+            fade_hist = mom_fade_hist_vals[idx]
+            fade_since_nonpos = mom_fade_since_nonpos_vals[idx]
+            fade_abs_falling = fade_abs < fade_abs_prev if mom_fade_bars <= 1 else fade_abs <= fade_abs_prev
             fade_abs_two = (not mom_fade_require_two) or (
-                mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
-                and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
+                fade_abs <= fade_abs_prev
+                and fade_abs_prev <= fade_abs_prev2
             )
             fade_delay_long = (
                 mom_fade_zero_delay <= 0
-                or mom_fade_since_nonpos.iloc[idx] > mom_fade_zero_delay
+                or fade_since_nonpos > mom_fade_zero_delay
             )
-            fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
+            fade_min_abs_ok = mom_fade_min_abs <= 0 or fade_abs >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (
                 use_mom_fade
-                and mom_fade_hist.iloc[idx] > 0
+                and fade_hist > 0
                 and fade_abs_falling
                 and fade_abs_two
                 and fade_delay_long
@@ -2457,27 +2539,37 @@ def run_backtest(
             if use_time_stop and max_hold_bars > 0 and position.bars_held >= max_hold_bars:
                 exit_long = True
                 exit_long_reason = exit_long_reason or "time_stop"
-            if use_kasa and kasa_rsi.iloc[idx] < kasa_rsi_ob and kasa_rsi.iloc[max(idx - 1, 0)] >= kasa_rsi_ob:
+            if (
+                use_kasa
+                and kasa_rsi_vals is not None
+                and kasa_rsi_vals[idx] < kasa_rsi_ob
+                and kasa_rsi_vals[prev_idx] >= kasa_rsi_ob
+            ):
                 exit_long = True
                 exit_long_reason = exit_long_reason or "kasa_exit"
         elif position.direction < 0:
             if exit_opposite and base_long_signal and position.bars_held >= min_hold_bars_param:
                 exit_short = True
                 exit_short_reason = exit_short_reason or "opposite_signal"
-            fade_abs_falling = mom_fade_abs.iloc[idx] < mom_fade_abs_prev.iloc[idx] if mom_fade_bars <= 1 else mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
+            fade_abs = mom_fade_abs_vals[idx]
+            fade_abs_prev = mom_fade_abs_prev_vals[idx]
+            fade_abs_prev2 = mom_fade_abs_prev2_vals[idx]
+            fade_hist = mom_fade_hist_vals[idx]
+            fade_since_nonneg = mom_fade_since_nonneg_vals[idx]
+            fade_abs_falling = fade_abs < fade_abs_prev if mom_fade_bars <= 1 else fade_abs <= fade_abs_prev
             fade_abs_two = (not mom_fade_require_two) or (
-                mom_fade_abs.iloc[idx] <= mom_fade_abs_prev.iloc[idx]
-                and mom_fade_abs_prev.iloc[idx] <= mom_fade_abs_prev2.iloc[idx]
+                fade_abs <= fade_abs_prev
+                and fade_abs_prev <= fade_abs_prev2
             )
             fade_delay_short = (
                 mom_fade_zero_delay <= 0
-                or mom_fade_since_nonneg.iloc[idx] > mom_fade_zero_delay
+                or fade_since_nonneg > mom_fade_zero_delay
             )
-            fade_min_abs_ok = mom_fade_min_abs <= 0 or mom_fade_abs.iloc[idx] >= mom_fade_min_abs
+            fade_min_abs_ok = mom_fade_min_abs <= 0 or fade_abs >= mom_fade_min_abs
             fade_release_ok = (not mom_fade_release_only) or gate_sq_valid
             if (
                 use_mom_fade
-                and mom_fade_hist.iloc[idx] < 0
+                and fade_hist < 0
                 and fade_abs_falling
                 and fade_abs_two
                 and fade_delay_short
@@ -2490,144 +2582,145 @@ def run_backtest(
             if use_time_stop and max_hold_bars > 0 and position.bars_held >= max_hold_bars:
                 exit_short = True
                 exit_short_reason = exit_short_reason or "time_stop"
-            if use_kasa and kasa_rsi.iloc[idx] > kasa_rsi_os and kasa_rsi.iloc[max(idx - 1, 0)] <= kasa_rsi_os:
+            if (
+                use_kasa
+                and kasa_rsi_vals is not None
+                and kasa_rsi_vals[idx] > kasa_rsi_os
+                and kasa_rsi_vals[prev_idx] <= kasa_rsi_os
+            ):
                 exit_short = True
                 exit_short_reason = exit_short_reason or "kasa_exit"
 
-        is_shock = use_shock and bool(shock_series.iloc[idx])
+        is_shock = use_shock and shock_vals is not None and bool(shock_vals[idx])
         if position.direction > 0 and is_shock and shock_action == "즉시 청산":
-            close_position(ts, row["close"], "Volatility Shock")
+            close_position(ts, close_price, "Volatility Shock")
             continue
         if position.direction < 0 and is_shock and shock_action == "즉시 청산":
-            close_position(ts, row["close"], "Volatility Shock")
+            close_position(ts, close_price, "Volatility Shock")
             continue
 
         if position.direction > 0 and (exit_long or (is_shock and shock_action == "손절 타이트닝")):
             if exit_long:
-                close_position(ts, row["close"], exit_long_reason or "Exit Long")
+                close_position(ts, close_price, exit_long_reason or "Exit Long")
                 continue
         if position.direction < 0 and (exit_short or (is_shock and shock_action == "손절 타이트닝")):
             if exit_short:
-                close_position(ts, row["close"], exit_short_reason or "Exit Short")
+                close_position(ts, close_price, exit_short_reason or "Exit Short")
                 continue
 
         if position.direction > 0:
             stop_long = np.nan
-            if use_atr_trail and not np.isnan(atr_trail_series.iloc[idx]):
-                stop_long = row["close"] - atr_trail_series.iloc[idx] * atr_trail_mult * dyn_factor_series.iloc[idx]
+            if use_atr_trail and not np.isnan(atr_trail_val):
+                stop_long = close_price - atr_trail_val * atr_trail_mult * dyn_factor_val
             if use_stop_loss:
-                swing_low = swing_low_series.iloc[idx]
-                stop_long = _max_ignore_nan(stop_long, swing_low)
+                stop_long = _max_ignore_nan(stop_long, swing_low_val)
                 if use_pivot_stop:
-                    pivot_ref = pivot_low_htf.iloc[idx] if use_pivot_htf else pivot_low_series.iloc[idx]
+                    pivot_ref = pivot_low_htf_val if use_pivot_htf else pivot_low_val
                     stop_long = _max_ignore_nan(stop_long, pivot_ref)
-            if use_breakeven_stop and not np.isnan(highest_since_entry) and not np.isnan(atr_trail_series.iloc[idx]):
+            if use_breakeven_stop and not np.isnan(highest_since_entry) and not np.isnan(atr_trail_val):
                 move = highest_since_entry - position.avg_price
-                trigger = atr_trail_series.iloc[idx] * breakeven_mult * dyn_factor_series.iloc[idx]
+                trigger = atr_trail_val * breakeven_mult * dyn_factor_val
                 if move >= trigger:
                     stop_long = _max_ignore_nan(stop_long, position.avg_price)
             if use_be_tiers and not np.isnan(highest_since_entry):
-                atr_seed = atr_len_series.iloc[idx]
+                atr_seed = atr_len_val
                 if atr_seed > 0 and (highest_since_entry - position.avg_price) >= atr_seed:
                     stop_long = _max_ignore_nan(stop_long, position.avg_price)
-            if not np.isnan(stop_long) and row["low"] <= stop_long:
+            if not np.isnan(stop_long) and low_price <= stop_long:
                 close_position(ts, stop_long, "Stop Long")
                 continue
-            if use_atr_profit and not np.isnan(atr_trail_series.iloc[idx]):
-                target = position.avg_price + atr_trail_series.iloc[idx] * atr_profit_mult * dyn_factor_series.iloc[idx]
-                if row["high"] >= target:
+            if use_atr_profit and not np.isnan(atr_trail_val):
+                target = position.avg_price + atr_trail_val * atr_profit_mult * dyn_factor_val
+                if high_price >= target:
                     close_position(ts, target, "ATR Profit Long")
                     continue
         elif position.direction < 0:
             stop_short = np.nan
-            if use_atr_trail and not np.isnan(atr_trail_series.iloc[idx]):
-                stop_short = row["close"] + atr_trail_series.iloc[idx] * atr_trail_mult * dyn_factor_series.iloc[idx]
+            if use_atr_trail and not np.isnan(atr_trail_val):
+                stop_short = close_price + atr_trail_val * atr_trail_mult * dyn_factor_val
             if use_stop_loss:
-                swing_high = swing_high_series.iloc[idx]
-                stop_short = _min_ignore_nan(stop_short, swing_high)
+                stop_short = _min_ignore_nan(stop_short, swing_high_val)
                 if use_pivot_stop:
-                    pivot_ref = pivot_high_htf.iloc[idx] if use_pivot_htf else pivot_high_series.iloc[idx]
+                    pivot_ref = pivot_high_htf_val if use_pivot_htf else pivot_high_val
                     stop_short = _min_ignore_nan(stop_short, pivot_ref)
-            if use_breakeven_stop and not np.isnan(lowest_since_entry) and not np.isnan(atr_trail_series.iloc[idx]):
+            if use_breakeven_stop and not np.isnan(lowest_since_entry) and not np.isnan(atr_trail_val):
                 move = position.avg_price - lowest_since_entry
-                trigger = atr_trail_series.iloc[idx] * breakeven_mult * dyn_factor_series.iloc[idx]
+                trigger = atr_trail_val * breakeven_mult * dyn_factor_val
                 if move >= trigger:
                     stop_short = _min_ignore_nan(stop_short, position.avg_price)
             if use_be_tiers and not np.isnan(lowest_since_entry):
-                atr_seed = atr_len_series.iloc[idx]
+                atr_seed = atr_len_val
                 if atr_seed > 0 and (position.avg_price - lowest_since_entry) >= atr_seed:
                     stop_short = _min_ignore_nan(stop_short, position.avg_price)
-            if not np.isnan(stop_short) and row["high"] >= stop_short:
+            if not np.isnan(stop_short) and high_price >= stop_short:
                 close_position(ts, stop_short, "Stop Short")
                 continue
-            if use_atr_profit and not np.isnan(atr_trail_series.iloc[idx]):
-                target = position.avg_price - atr_trail_series.iloc[idx] * atr_profit_mult * dyn_factor_series.iloc[idx]
-                if row["low"] <= target:
+            if use_atr_profit and not np.isnan(atr_trail_val):
+                target = position.avg_price - atr_trail_val * atr_profit_mult * dyn_factor_val
+                if low_price <= target:
                     close_position(ts, target, "ATR Profit Short")
                     continue
 
         if position.direction == 0:
             if enter_long:
-                stop_hint = atr_len_series.iloc[idx]
+                stop_hint = atr_len_val
                 if use_stop_loss:
-                    swing_low = swing_low_series.iloc[idx]
-                    if not np.isnan(swing_low):
-                        stop_hint = max(stop_hint, row["close"] - swing_low) if not np.isnan(stop_hint) else row["close"] - swing_low
+                    if not np.isnan(swing_low_val):
+                        stop_hint = max(stop_hint, close_price - swing_low_val) if not np.isnan(stop_hint) else close_price - swing_low_val
                     if use_pivot_stop:
-                        pivot_ref = pivot_low_htf.iloc[idx] if use_pivot_htf else pivot_low_series.iloc[idx]
+                        pivot_ref = pivot_low_htf_val if use_pivot_htf else pivot_low_val
                         if not np.isnan(pivot_ref):
-                            dist_pivot = row["close"] - pivot_ref
+                            dist_pivot = close_price - pivot_ref
                             stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
-                if use_atr_trail and not np.isnan(atr_trail_series.iloc[idx]):
-                    atr_dist = atr_trail_series.iloc[idx] * atr_trail_mult
+                if use_atr_trail and not np.isnan(atr_trail_val):
+                    atr_dist = atr_trail_val * atr_trail_mult
                     stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
                 if np.isnan(stop_hint) or stop_hint <= 0:
                     stop_hint = tick_size
                 stop_for_size = max(stop_hint, tick_size)
                 guard_ok = (
                     (not use_stop_distance_guard)
-                    or np.isnan(atr_len_series.iloc[idx])
-                    or stop_for_size <= atr_len_series.iloc[idx] * max_stop_atr_mult
+                    or np.isnan(atr_len_val)
+                    or stop_for_size <= atr_len_val * max_stop_atr_mult
                 )
-                qty = calc_order_size(row["close"], stop_for_size, 1.0)
+                qty = calc_order_size(close_price, stop_for_size, 1.0)
                 if guard_ok and qty > 0:
-                    position = Position(direction=1, qty=qty, avg_price=row["close"], entry_time=ts)
-                    highest_since_entry = row["high"]
-                    lowest_since_entry = row["low"]
+                    position = Position(direction=1, qty=qty, avg_price=close_price, entry_time=ts)
+                    highest_since_entry = high_price
+                    lowest_since_entry = low_price
                     pos_bars = 0
                     reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
             elif enter_short:
-                stop_hint = atr_len_series.iloc[idx]
+                stop_hint = atr_len_val
                 if use_stop_loss:
-                    swing_high = swing_high_series.iloc[idx]
-                    if not np.isnan(swing_high):
-                        stop_hint = max(stop_hint, swing_high - row["close"]) if not np.isnan(stop_hint) else swing_high - row["close"]
+                    if not np.isnan(swing_high_val):
+                        stop_hint = max(stop_hint, swing_high_val - close_price) if not np.isnan(stop_hint) else swing_high_val - close_price
                     if use_pivot_stop:
-                        pivot_ref = pivot_high_htf.iloc[idx] if use_pivot_htf else pivot_high_series.iloc[idx]
+                        pivot_ref = pivot_high_htf_val if use_pivot_htf else pivot_high_val
                         if not np.isnan(pivot_ref):
-                            dist_pivot = pivot_ref - row["close"]
+                            dist_pivot = pivot_ref - close_price
                             stop_hint = max(stop_hint, dist_pivot) if not np.isnan(stop_hint) else dist_pivot
-                if use_atr_trail and not np.isnan(atr_trail_series.iloc[idx]):
-                    atr_dist = atr_trail_series.iloc[idx] * atr_trail_mult
+                if use_atr_trail and not np.isnan(atr_trail_val):
+                    atr_dist = atr_trail_val * atr_trail_mult
                     stop_hint = max(stop_hint, atr_dist) if not np.isnan(stop_hint) else atr_dist
                 if np.isnan(stop_hint) or stop_hint <= 0:
                     stop_hint = tick_size
                 stop_for_size = max(stop_hint, tick_size)
                 guard_ok = (
                     (not use_stop_distance_guard)
-                    or np.isnan(atr_len_series.iloc[idx])
-                    or stop_for_size <= atr_len_series.iloc[idx] * max_stop_atr_mult
+                    or np.isnan(atr_len_val)
+                    or stop_for_size <= atr_len_val * max_stop_atr_mult
                 )
-                qty = calc_order_size(row["close"], stop_for_size, 1.0)
+                qty = calc_order_size(close_price, stop_for_size, 1.0)
                 if guard_ok and qty > 0:
-                    position = Position(direction=-1, qty=qty, avg_price=row["close"], entry_time=ts)
-                    highest_since_entry = row["high"]
-                    lowest_since_entry = row["low"]
+                    position = Position(direction=-1, qty=qty, avg_price=close_price, entry_time=ts)
+                    highest_since_entry = high_price
+                    lowest_since_entry = low_price
                     pos_bars = 0
                     reversal_countdown = int(reversal_delay_sec // 60) if reversal_delay_sec > 0 else 0
 
     if position.direction != 0 and position.entry_time is not None:
-        close_position(df.index[-1], df.iloc[-1]["close"], "EndOfData")
+        close_position(df.index[-1], close_vals[-1], "EndOfData")
 
     return _finalise_metrics_result(state, trades, returns_series, guard_frozen)
 
