@@ -457,7 +457,12 @@ momSignal = switch str.lower(maTypeInput)
 crossUp = ta.crossover(momentum, momSignal)
 crossDown = ta.crossunder(momentum, momSignal)
 
-fluxHist = useModFlux ? modDirectionalFlux(fluxLen, fluxSmoothLen) : directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
+float fluxHist = na
+if useModFlux
+    fluxHist := modDirectionalFlux(fluxLen, fluxSmoothLen)
+else
+    directionalFluxResult = directionalFlux(useFluxHeikin, fluxLen, fluxSmoothLen)
+    fluxHist := fluxSmoothLen > 1 ? ta.sma(directionalFluxResult, fluxSmoothLen) : directionalFluxResult
 
 momFadeSource = (high + low + close) / 3.0
 momFadeBasis = ta.sma(momFadeSource, momFadeBbLen)
