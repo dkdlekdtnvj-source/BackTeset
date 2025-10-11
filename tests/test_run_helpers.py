@@ -15,6 +15,7 @@ from optimize.run import (
     DatasetSpec,
     optimisation_loop,
     _configure_parallel_workers,
+    _ensure_timeframe_param,
     _apply_study_registry_defaults,
     _clean_metrics,
     _dataset_total_volume,
@@ -144,6 +145,18 @@ def _make_dataset(timeframe: str, htf: Optional[str]) -> DatasetSpec:
         htf_timeframe=htf,
         source_symbol="BINANCE:TESTUSDT",
     )
+
+
+def test_ensure_timeframe_param_infers_choices_when_missing():
+    datasets = [_make_dataset("1m", None), _make_dataset("3m", None)]
+    space: Dict[str, Dict[str, object]] = {}
+    search_cfg = {"diversify": {"timeframe_cycle": [{"timeframe": "1m"}, {"timeframe": "3m"}]}}
+
+    updated, added = _ensure_timeframe_param(space, datasets, search_cfg)
+
+    assert added is True
+    assert "timeframe" in updated
+    assert updated["timeframe"]["values"] == ["1m", "3m"]
 
 
 def test_dataset_total_volume_sums_numeric_values():

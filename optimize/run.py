@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from threading import Lock
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Literal
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Literal
 
 import numpy as np
 import optuna
@@ -535,6 +535,50 @@ def _restrict_to_basic_factors(
         if name in BASIC_FACTOR_KEYS:
             filtered[name] = dict(spec)
     return filtered
+
+
+def _collect_timeframe_choices(datasets: Sequence[DatasetSpec]) -> List[str]:
+    """Return sorted unique LTF values available across datasets."""
+
+    choices: Set[str] = set()
+    for dataset in datasets:
+        if dataset.timeframe:
+            choices.add(str(dataset.timeframe))
+    return sorted(choices)
+
+
+def _ensure_timeframe_param(
+    space: Dict[str, Dict[str, object]],
+    datasets: Sequence[DatasetSpec],
+    search_cfg: Mapping[str, object],
+) -> Tuple[Dict[str, Dict[str, object]], bool]:
+    """Ensure the optimisation space includes a timeframe/ltf choice.
+
+    Returns the potentially updated space along with a flag indicating whether
+    a new parameter was injected.  The helper preserves user-defined
+    ``timeframe``/``ltf`` distributions when present and only injects a new
+    categorical parameter if multiple datasets are available (or a
+    ``timeframe_cycle`` is configured) but the search space lacks an explicit
+    LTF selector.  This allows features such as the TrialDiversifier's
+    timeframe cycle to function even when the user forgets to list a
+    ``timeframe`` parameter in ``config/params.yaml``.
+    """
+
+    if any(key in space for key in ("timeframe", "ltf")):
+        return space, False
+
+    choices = _collect_timeframe_choices(datasets)
+    if not choices:
+        return space, False
+
+    diversify_cfg = search_cfg.get("diversify") if isinstance(search_cfg, Mapping) else {}
+    cycle_defined = bool(diversify_cfg.get("timeframe_cycle"))
+    if not cycle_defined and len(choices) <= 1:
+        return space, False
+
+    updated = dict(space)
+    updated["timeframe"] = {"type": "choice", "values": choices}
+    return updated, True
 
 
 def _filter_basic_factor_params(
@@ -2722,6 +2766,14 @@ def optimisation_loop(
             "기본 팩터 프로파일 비활성화: 전체 %d개 파라미터 탐색", len(space)
         )
 
+    space, timeframe_added = _ensure_timeframe_param(space, datasets, search_cfg)
+    if timeframe_added:
+        LOGGER.info(
+            "탐색 공간에 타임프레임 파라미터(timeframe=%s)를 자동 추가했습니다.",
+            ", ".join(space["timeframe"].get("values", [])),
+        )
+        param_order = list(space.keys())
+
     params_cfg["space"] = space
 
     dataset_groups, timeframe_groups, default_key = _group_datasets(datasets)
@@ -4357,6 +4409,8 @@ def _execute_single(
         params_cfg["timeframe"] = selected_timeframe
         backtest_cfg["timeframes"] = [selected_timeframe]
         _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
+        forced_params["timeframe"] = selected_timeframe
+        forced_params.setdefault("ltf", selected_timeframe)
     for key in ("htf", "htf_timeframe", "htf_timeframes"):
         params_cfg.pop(key, None)
         backtest_cfg.pop(key, None)
