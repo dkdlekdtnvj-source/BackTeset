@@ -20,6 +20,13 @@ from optimize.search_spaces import SpaceSpec
 
 LOGGER = logging.getLogger("optimize.llm")
 
+DEFAULT_GEMINI_MODEL_PRIORITY = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
 try:  # pragma: no cover - optional dependency
     from google import genai  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
@@ -639,7 +646,11 @@ def generate_llm_candidates(
     param_statistics = _compute_param_statistics(summary_trials, summary_scores)
 
     client = genai.Client(api_key=api_key)
-    model = str(config.get("model", "gemini-2.0-flash-exp"))
+    configured_model = config.get("model")
+    if configured_model in {None, ""}:
+        model = DEFAULT_GEMINI_MODEL_PRIORITY[0]
+    else:
+        model = str(configured_model)
     prompt_sections = [
         "You are assisting with hyper-parameter optimisation for a trading strategy.",
         "The search space is defined by the following JSON (types: int, float, bool, choice):",
@@ -760,10 +771,17 @@ def generate_llm_candidates(
                 fallback_models.append(candidate)
 
     model_candidates: List[str] = []
-    for candidate in [model, *fallback_models, "gemini-2.0-flash", "gemini-1.5-flash"]:
+
+    def _register_model(candidate: object) -> None:
         candidate_str = str(candidate or "").strip()
         if candidate_str and candidate_str not in model_candidates:
             model_candidates.append(candidate_str)
+
+    _register_model(model)
+    for candidate in fallback_models:
+        _register_model(candidate)
+    for default_model in DEFAULT_GEMINI_MODEL_PRIORITY:
+        _register_model(default_model)
 
     response = None
     last_error: Optional[Exception] = None

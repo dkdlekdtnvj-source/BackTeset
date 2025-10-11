@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence as AbcSequence
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -59,7 +59,13 @@ from optimize.metrics import (
     normalise_objectives,
 )
 from optimize.report import generate_reports, write_bank_file, write_trials_dataframe
-from optimize.search_spaces import build_space, grid_choices, mutate_around, sample_parameters
+from optimize.search_spaces import (
+    build_space,
+    grid_choices,
+    mutate_around,
+    random_parameters,
+    sample_parameters,
+)
 from optimize.strategy_model import run_backtest
 from optimize.wf import run_purged_kfold, run_walk_forward
 from optimize.regime import detect_regime_label, summarise_regime_performance
@@ -1348,6 +1354,276 @@ def _coerce_bool_or_none(value: object) -> Optional[bool]:
         if text in {"false", "f", "0", "no", "n", "off"}:
             return False
     return None
+
+
+class _TimeframeCycler:
+    """Rotate through pre-defined timeframe/HTF 조합."""
+
+    def __init__(self, entries: Sequence[Mapping[str, object]]):
+        self._entries: List[Dict[str, object]] = []
+        for entry in entries:
+            timeframe = str(entry.get("timeframe") or entry.get("tf") or "").strip()
+            if not timeframe:
+                continue
+            htf_value = entry.get("htf") or entry.get("htf_timeframe")
+            htf = str(htf_value).strip() if htf_value not in {None, ""} else None
+            repeat_raw = entry.get("repeat") or entry.get("count") or entry.get("times") or 1
+            try:
+                repeat = max(1, int(repeat_raw))
+            except (TypeError, ValueError):
+                repeat = 1
+            self._entries.append({
+                "timeframe": timeframe,
+                "htf_timeframe": htf,
+                "repeat": repeat,
+            })
+        self._index = 0
+        self._remaining = self._entries[0]["repeat"] if self._entries else 0
+
+    def next(self) -> Dict[str, Optional[str]]:
+        if not self._entries:
+            return {}
+        current = self._entries[self._index]
+        payload = {
+            "timeframe": current.get("timeframe"),
+            "htf_timeframe": current.get("htf_timeframe"),
+        }
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._index = (self._index + 1) % len(self._entries)
+            self._remaining = self._entries[self._index]["repeat"]
+        return payload
+
+    def empty(self) -> bool:
+        return not self._entries
+
+
+class TrialDiversifier:
+    """감시 콜백으로 동작하며, 탐색이 단조로울 때 강제 점프 시도를 주입합니다."""
+
+    def __init__(
+        self,
+        space: Dict[str, Dict[str, object]],
+        config: Mapping[str, object],
+        *,
+        forced_params: Optional[Mapping[str, object]] = None,
+        param_order: Optional[Sequence[str]] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.space = space
+        self.enabled = True
+        self.forced_params = dict(forced_params or {})
+        self.param_order = list(param_order) if param_order else list(space.keys())
+        self.similarity_threshold = float(config.get("similarity_threshold", 0.9))
+        self.float_tolerance = float(config.get("float_tolerance", 1e-3))
+        self.max_consecutive = max(2, int(config.get("max_consecutive", 6)))
+        cooldown_source = config.get("cooldown", self.max_consecutive)
+        try:
+            cooldown_default = max(0, int(cooldown_source))
+        except (TypeError, ValueError):
+            cooldown_default = self.max_consecutive
+        self.cooldown = cooldown_default
+        self.cooldown_remaining = 0
+        self.jump_trials = max(1, int(config.get("jump_trials", 2)))
+        self.jump_scale = float(config.get("jump_scale", 0.75))
+        try:
+            history_bias = float(config.get("history_bias", 0.5))
+        except (TypeError, ValueError):
+            history_bias = 0.5
+        self.history_bias = min(max(history_bias, 0.0), 1.0)
+        history_source = config.get("history", 20)
+        try:
+            history_limit = int(history_source)
+        except (TypeError, ValueError):
+            history_limit = 20
+        self.history_limit = max(self.max_consecutive + 1, history_limit)
+        try:
+            length_refresh_prob = float(config.get("length_refresh_prob", 0.75))
+        except (TypeError, ValueError):
+            length_refresh_prob = 0.75
+        self.length_refresh_prob = min(max(length_refresh_prob, 0.0), 1.0)
+        ignored = config.get("ignore_keys", [])
+        self.ignored_keys = {str(key) for key in ignored if str(key)}
+        rng_seed = seed if seed is not None else config.get("seed")
+        try:
+            self.rng = np.random.default_rng(None if rng_seed in {None, ""} else int(rng_seed))
+        except (TypeError, ValueError):
+            self.rng = np.random.default_rng()
+        timeframe_entries: List[Mapping[str, object]] = []
+        raw_cycle = config.get("timeframe_cycle")
+        if isinstance(raw_cycle, Mapping):
+            entries: List[Mapping[str, object]] = []
+            for key, repeat in raw_cycle.items():
+                entries.append({"timeframe": str(key), "repeat": repeat})
+            timeframe_entries = entries
+        elif isinstance(raw_cycle, Sequence) and not isinstance(raw_cycle, (str, bytes, bytearray)):
+            processed: List[Mapping[str, object]] = []
+            for entry in raw_cycle:
+                if isinstance(entry, Mapping):
+                    processed.append(dict(entry))
+                elif isinstance(entry, str):
+                    processed.append({"timeframe": str(entry)})
+            timeframe_entries = processed
+        else:
+            timeframe_entries = []
+        self.timeframe_cycler = _TimeframeCycler(timeframe_entries)
+        self.history: deque[Dict[str, object]] = deque(maxlen=self.history_limit)
+        self.last_params: Optional[Dict[str, object]] = None
+        self.similar_streak = 0
+        length_keys_cfg = config.get("length_keys")
+        if isinstance(length_keys_cfg, Sequence) and not isinstance(length_keys_cfg, (str, bytes, bytearray)):
+            self.length_keys = [str(key) for key in length_keys_cfg]
+        else:
+            self.length_keys = [
+                name
+                for name, spec in space.items()
+                if isinstance(spec, Mapping)
+                and spec.get("type") == "int"
+                and "len" in name.lower()
+                and name not in self.ignored_keys
+            ]
+        self.total_enqueued = 0
+
+    def __call__(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> None:
+        if not self.enabled or trial.state != TrialState.COMPLETE:
+            return
+        params = dict(trial.params)
+        for ignored_key in self.ignored_keys:
+            params.pop(ignored_key, None)
+        self.history.append(params)
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            self.last_params = params
+            return
+        if self.last_params is None:
+            self.last_params = params
+            self.similar_streak = 1
+            return
+        similarity = self._similarity(self.last_params, params)
+        if similarity >= self.similarity_threshold:
+            self.similar_streak += 1
+        else:
+            self.similar_streak = 1
+        self.last_params = params
+        if self.similar_streak < self.max_consecutive:
+            return
+        self.similar_streak = 0
+        self.cooldown_remaining = self.cooldown
+        injections = self._plan_injections()
+        if not injections:
+            return
+        accepted = 0
+        for candidate in injections:
+            enriched = dict(candidate)
+            enriched.update(self.forced_params)
+            try:
+                study.enqueue_trial(enriched, skip_if_exists=True)
+            except Exception as exc:
+                LOGGER.debug("분산 탐색 후보 등록 실패(%s): %s", enriched, exc)
+                continue
+            accepted += 1
+        if accepted:
+            self.total_enqueued += accepted
+            LOGGER.info("단조 탐색 감지 – 강제 점프 %d건을 큐에 추가했습니다.", accepted)
+
+    def _similarity(self, base: Mapping[str, object], other: Mapping[str, object]) -> float:
+        keys = [key for key in self.param_order if key not in self.ignored_keys]
+        if not keys:
+            return 0.0
+        matches = 0
+        total = 0
+        for key in keys:
+            a = base.get(key)
+            b = other.get(key)
+            if a is None and b is None:
+                continue
+            total += 1
+            if self._values_equal(a, b):
+                matches += 1
+        if not total:
+            return 0.0
+        return matches / total
+
+    def _values_equal(self, a: object, b: object) -> bool:
+        if isinstance(a, bool) or isinstance(b, bool):
+            return bool(a) == bool(b)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return abs(float(a) - float(b)) <= self.float_tolerance
+        return a == b
+
+    def _plan_injections(self) -> List[Dict[str, object]]:
+        candidates: List[Dict[str, object]] = []
+        history_list = list(self.history)
+        for index in range(self.jump_trials):
+            use_history = (
+                index > 0
+                and bool(history_list)
+                and self.rng.random() < self.history_bias
+            )
+            if use_history:
+                base = dict(self.rng.choice(history_list))
+            else:
+                base = random_parameters(self.space, rng=self.rng)
+            if self.length_keys and (not use_history or self.rng.random() < self.length_refresh_prob):
+                reference = random_parameters(self.space, rng=self.rng)
+                for key in self.length_keys:
+                    if key in reference:
+                        base[key] = reference[key]
+            scale = self.jump_scale
+            if scale > 0:
+                base = mutate_around(base, self.space, scale=scale, rng=self.rng)
+            base = self._apply_timeframe_cycle(base)
+            candidates.append(base)
+        return candidates
+
+    def _apply_timeframe_cycle(self, params: Dict[str, object]) -> Dict[str, object]:
+        if self.timeframe_cycler.empty():
+            return params
+        override = self.timeframe_cycler.next()
+        if not override:
+            return params
+        updated = dict(params)
+        timeframe = override.get("timeframe")
+        htf_value = override.get("htf_timeframe")
+        if timeframe is not None:
+            for key in ("timeframe", "ltf"):
+                if key in self.space:
+                    updated[key] = timeframe
+                    break
+        if htf_value is not None:
+            for key in ("htf", "htf_timeframe"):
+                if key in self.space:
+                    updated[key] = htf_value
+                    break
+        return updated
+
+
+def _build_trial_diversifier(
+    space: Dict[str, Dict[str, object]],
+    search_cfg: Mapping[str, object],
+    *,
+    forced_params: Optional[Mapping[str, object]] = None,
+    param_order: Optional[Sequence[str]] = None,
+    seed: Optional[int] = None,
+) -> Optional[TrialDiversifier]:
+    raw_cfg = search_cfg.get("diversify")
+    if isinstance(raw_cfg, Mapping):
+        config = dict(raw_cfg)
+    elif _coerce_bool_or_none(raw_cfg) is True:
+        config = {}
+    else:
+        return None
+    enabled_flag = _coerce_bool_or_none(config.get("enabled"))
+    if enabled_flag is False:
+        return None
+    LOGGER.info("탐색 다변화 보조 기능을 활성화합니다.")
+    return TrialDiversifier(
+        space,
+        config,
+        forced_params=forced_params,
+        param_order=param_order,
+        seed=seed,
+    )
 
 
 def _collect_tokens(items: Iterable[str]) -> List[str]:
@@ -2961,6 +3237,16 @@ def optimisation_loop(
             with best_yaml_path.open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)
     callbacks: List = [_log_trial]
+
+    diversifier = _build_trial_diversifier(
+        space,
+        search_cfg,
+        forced_params=forced_params,
+        param_order=param_order,
+        seed=seed,
+    )
+    if diversifier is not None:
+        callbacks.append(diversifier)
 
     def objective(trial: optuna.Trial) -> float:
         params = _safe_sample_parameters(trial, space)
