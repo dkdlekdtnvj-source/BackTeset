@@ -571,7 +571,8 @@ def _ensure_timeframe_param(
     if not choices:
         return space, False
 
-    diversify_cfg = search_cfg.get("diversify") if isinstance(search_cfg, Mapping) else {}
+    raw_diversify_cfg = search_cfg.get("diversify") if isinstance(search_cfg, Mapping) else {}
+    diversify_cfg = raw_diversify_cfg if isinstance(raw_diversify_cfg, Mapping) else {}
     cycle_defined = bool(diversify_cfg.get("timeframe_cycle"))
     if not cycle_defined and len(choices) <= 1:
         return space, False
@@ -1380,6 +1381,59 @@ def _apply_ltf_override_to_datasets(backtest_cfg: Dict[str, object], timeframe: 
         entry["ltf"] = [timeframe]
         entry["ltfs"] = [timeframe]
         entry["timeframes"] = [timeframe]
+
+
+def _enforce_forced_timeframe_constraints(
+    params_cfg: Dict[str, object], search_cfg: Dict[str, object], timeframe: str
+) -> None:
+    """Restrict LTF 관련 탐색 요소를 강제된 타임프레임으로 고정합니다."""
+
+    if not timeframe:
+        return
+
+    space_cfg = params_cfg.get("space")
+    if isinstance(space_cfg, Mapping):
+        updated_space: Dict[str, Dict[str, object]] = {}
+        for name, spec in space_cfg.items():
+            if not isinstance(spec, Mapping):
+                if "timeframe" in str(name).lower() or str(name).lower() == "ltf":
+                    continue
+                updated_space[name] = spec  # type: ignore[assignment]
+                continue
+
+            needs_restriction = False
+            key_lower = str(name).lower()
+            if key_lower == "ltf" or "timeframe" in key_lower:
+                needs_restriction = True
+
+            new_spec = dict(spec)
+            if needs_restriction:
+                new_spec["type"] = "choice"
+                new_spec["values"] = [timeframe]
+                new_spec["choices"] = [timeframe]
+                new_spec["options"] = [timeframe]
+                new_spec["default"] = timeframe
+                for obsolete_key in ("min", "max", "step", "log", "log_base"):
+                    new_spec.pop(obsolete_key, None)
+            updated_space[name] = new_spec
+
+        params_cfg["space"] = updated_space
+
+    diversify_cfg: Dict[str, object]
+    raw_diversify = search_cfg.get("diversify")
+    if isinstance(raw_diversify, Mapping):
+        diversify_cfg = dict(raw_diversify)
+    else:
+        diversify_cfg = {}
+    if diversify_cfg.get("timeframe_cycle"):
+        diversify_cfg["timeframe_cycle"] = []
+    else:
+        diversify_cfg.setdefault("timeframe_cycle", [])
+    if "htf_timeframe" in diversify_cfg:
+        diversify_cfg["htf_timeframe"] = None
+    if "htf_timeframes" in diversify_cfg and diversify_cfg["htf_timeframes"]:
+        diversify_cfg["htf_timeframes"] = []
+    search_cfg["diversify"] = diversify_cfg
 
 
 def _coerce_bool_or_none(value: object) -> Optional[bool]:
@@ -4411,6 +4465,7 @@ def _execute_single(
         _apply_ltf_override_to_datasets(backtest_cfg, selected_timeframe)
         forced_params["timeframe"] = selected_timeframe
         forced_params.setdefault("ltf", selected_timeframe)
+        _enforce_forced_timeframe_constraints(params_cfg, search_cfg, selected_timeframe)
     for key in ("htf", "htf_timeframe", "htf_timeframes"):
         params_cfg.pop(key, None)
         backtest_cfg.pop(key, None)
