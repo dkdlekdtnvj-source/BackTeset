@@ -81,6 +81,7 @@ space:
   fluxSmoothLen:  { type: int,   min: 1,   max: 10,  step: 1 }
   useFluxHeikin:  { type: bool }
   useModFlux:     { type: bool }
+  # NOTE: 문자열 파라미터는 단일 값만 허용되며 리스트/튜플 형태 입력은 오류로 처리됩니다.
   momStyle:       { type: choice, values: [KC, AVG, Deluxe, Mod] }
   maType:         { type: choice, values: [SMA, EMA, HMA] }
 

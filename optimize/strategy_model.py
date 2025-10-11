@@ -1089,9 +1089,27 @@ def run_backtest(
             target[key] = float(max(0.0, resolved))
 
     def str_param(name: str, default: str, *, enabled: bool = True) -> str:
+        """문자열 파라미터를 안전하게 변환한다.
+
+        Pine/Optuna 설정이 잘못 직렬화되면 문자열 입력이 리스트/튜플로
+        들어오는 경우가 있는데, 이때는 첫 번째 요소만 허용하거나 명시적으로
+        오류를 발생시켜 잘못된 설정이 그대로 진행되지 않도록 한다.
+        """
+
         if not enabled:
             return str(default)
+
         value = params.get(name, default)
+        if isinstance(value, (list, tuple)):
+            if not value:
+                value = default
+            elif len(value) == 1:
+                value = value[0]
+            else:
+                raise TypeError(
+                    f"'{name}' 파라미터에 여러 개의 문자열이 전달되었습니다: {value!r}"
+                )
+
         return str(value) if value is not None else str(default)
 
     # Pine 입력 매핑 -----------------------------------------------------------------

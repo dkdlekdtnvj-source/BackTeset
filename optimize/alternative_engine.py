@@ -144,6 +144,26 @@ def _coerce_int(value: object, default: int) -> int:
         return int(default)
 
 
+def _coerce_str(value: object, default: str, *, name: str) -> str:
+    """문자열 파라미터를 엄격하게 변환한다."""
+
+    if value is None:
+        return str(default)
+
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return str(default)
+        if len(value) == 1:
+            value = value[0]
+        else:
+            raise TypeError(
+                f"'{name}' 파라미터에 여러 문자열이 전달되었습니다: {value!r}"
+            )
+
+    text = str(value)
+    return text if text else str(default)
+
+
 def _ensure_datetime_index(frame: pd.DataFrame, label: str) -> pd.DataFrame:
     """OHLCV 프레임이 UTC 기반 DatetimeIndex 를 갖도록 강제한다."""
 
@@ -325,8 +345,8 @@ def _compute_indicators(
     else:
         bb_len = max(_coerce_int(params.get("bbLen"), kc_len), 1)
     bb_mult = _coerce_float(params.get("bbMult"), kc_mult)
-    mom_style = str(params.get("momStyle", "KC") or "KC").strip().lower()
-    ma_type = str(params.get("maType", "SMA") or "SMA").strip().lower()
+    mom_style = _coerce_str(params.get("momStyle"), "KC", name="momStyle").strip().lower()
+    ma_type = _coerce_str(params.get("maType"), "SMA", name="maType").strip().lower()
 
     flux_len = max(_coerce_int(params.get("fluxLen"), 14), 1)
     flux_smooth_len = max(_coerce_int(params.get("fluxSmoothLen"), 1), 1)
