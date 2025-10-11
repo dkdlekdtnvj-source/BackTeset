@@ -16,6 +16,7 @@ from optimize.run import (
     optimisation_loop,
     _configure_parallel_workers,
     _ensure_timeframe_param,
+    _enforce_forced_timeframe_constraints,
     _apply_study_registry_defaults,
     _clean_metrics,
     _dataset_total_volume,
@@ -217,6 +218,66 @@ def test_select_datasets_falls_back_when_htf_disabled():
 
     assert key[0] == "1m"
     assert all(dataset.timeframe == "1m" for dataset in selection)
+
+
+def test_forced_timeframe_matches_trial_params_and_dataset_key(monkeypatch):
+    forced_tf = "3m"
+    params_cfg = {
+        "symbol": "BINANCE:TESTUSDT",
+        "timeframe": forced_tf,
+        "space": {
+            "oscLen": {"type": "int", "min": 1, "max": 1, "step": 1},
+            "timeframe": {"type": "choice", "values": ["1m", forced_tf]},
+            "ltf": {"type": "choice", "values": ["1m", forced_tf]},
+        },
+        "search": {
+            "n_trials": 1,
+            "n_jobs": 1,
+            "algo": "random",
+            "basic_factor_profile": False,
+            "diversify": {
+                "timeframe_cycle": [{"timeframe": "1m"}, {"timeframe": forced_tf}],
+                "htf_timeframe": "1h",
+            },
+        },
+    }
+
+    search_cfg = params_cfg["search"]
+    _enforce_forced_timeframe_constraints(params_cfg, search_cfg, forced_tf)
+
+    assert params_cfg["space"]["timeframe"]["values"] == [forced_tf]
+    assert params_cfg["space"]["ltf"]["values"] == [forced_tf]
+    assert search_cfg["diversify"].get("timeframe_cycle") == []
+
+    datasets = [_make_dataset("1m", None), _make_dataset(forced_tf, None)]
+
+    def fake_run_backtest(*_, **__):
+        return {
+            "NetProfit": 100.0,
+            "ProfitFactor": 1.5,
+            "Trades": 25,
+            "Valid": True,
+        }
+
+    monkeypatch.setattr("optimize.run.run_backtest", fake_run_backtest)
+    monkeypatch.setattr("optimize.run.backtest_cfg", {}, raising=False)
+
+    optimisation = optimisation_loop(
+        datasets,
+        params_cfg,
+        objectives=[{"name": "NetProfit"}],
+        fees={},
+        risk={},
+        forced_params={"timeframe": forced_tf, "ltf": forced_tf},
+    )
+
+    record = optimisation["results"][0]
+    dataset_key = record["dataset_key"]
+    trial_params = optimisation["study"].best_trial.params
+
+    assert dataset_key["timeframe"] == forced_tf
+    assert trial_params.get("timeframe") == forced_tf
+    assert trial_params.get("ltf") == forced_tf
 
 
 def test_run_dataset_backtest_task_falls_back_on_missing_alt_engine(monkeypatch):
