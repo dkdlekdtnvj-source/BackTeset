@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 import optuna
+import yaml
 
 from optimize.search_spaces import SpaceSpec
 
@@ -79,7 +81,143 @@ def _extract_json_payload(raw: str) -> Optional[object]:
     try:
         return json.loads(cleaned)
     except Exception:
-        return None
+        try:
+            parsed = yaml.safe_load(cleaned)
+        except Exception:
+            return None
+        else:
+            return parsed
+
+
+def _iter_balanced_segments(raw: str, opener: str, closer: str) -> Iterable[str]:
+    depth = 0
+    start = -1
+    for index, char in enumerate(raw):
+        if char == opener:
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == closer and depth:
+            depth -= 1
+            if depth == 0 and start != -1:
+                yield raw[start : index + 1]
+                start = -1
+
+
+def _flatten_structured_payload(payload: object, space: SpaceSpec) -> Iterable[Dict[str, object]]:
+    if isinstance(payload, dict):
+        keys = set(space.keys())
+        if keys and keys.issubset(payload.keys()):
+            non_mapping_values = sum(
+                1 for name in keys if not isinstance(payload.get(name), dict)
+            )
+            if non_mapping_values:
+                yield payload
+        for candidate_key in ("candidates", "Candidate", "params", "parameters"):
+            nested = payload.get(candidate_key)
+            if isinstance(nested, dict):
+                yield from _flatten_structured_payload(nested, space)
+            elif isinstance(nested, Sequence) and not isinstance(nested, (str, bytes, bytearray)):
+                for entry in nested:
+                    if isinstance(entry, dict):
+                        yield from _flatten_structured_payload(entry, space)
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for entry in payload:
+            if isinstance(entry, dict):
+                yield from _flatten_structured_payload(entry, space)
+
+
+def _looks_like_boundary(segment: str) -> bool:
+    if not segment:
+        return False
+    if ",," in segment:
+        return True
+    if segment.count("\n") >= 2:
+        return True
+    if any(token in segment for token in "]}"):
+        return True
+    if len(segment.strip()) == 0:
+        return False
+    return len(segment.strip()) > 120
+
+
+def _scan_key_value_candidates(raw: str, space: SpaceSpec) -> List[Dict[str, str]]:
+    if not raw or not space:
+        return []
+    param_names = sorted(space.keys(), key=len, reverse=True)
+    if not param_names:
+        return []
+    name_pattern = "|".join(re.escape(name) for name in param_names)
+    pair_pattern = re.compile(
+        rf"(?P<name>{name_pattern})\s*(?:[:=]|=>|->|→)?\s*(?P<value>[^,\n\r;]+)", re.IGNORECASE
+    )
+    candidates: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    last_end: Optional[int] = None
+    for match in pair_pattern.finditer(raw):
+        name = match.group("name")
+        value = match.group("value").strip()
+        value = value.strip("\"' ")
+        value = value.rstrip("]})")
+        value = value.rstrip(",; ")
+        if current and (name in current or (last_end is not None and _looks_like_boundary(raw[last_end: match.start()]))):
+            candidates.append(current)
+            current = {}
+        current[name] = value
+        last_end = match.end()
+    if current:
+        candidates.append(current)
+    return candidates
+
+
+def _extract_candidates_from_text(raw: str, space: SpaceSpec, limit: int) -> List[Dict[str, object]]:
+    if not raw or not space:
+        return []
+
+    validated: List[Dict[str, object]] = []
+    seen: Set[Tuple[Tuple[str, object], ...]] = set()
+
+    def _register(candidate: Dict[str, object]) -> None:
+        signature = tuple(sorted(candidate.items()))
+        if signature in seen:
+            return
+        seen.add(signature)
+        validated.append(candidate)
+
+    structured_blocks: List[object] = []
+    for segment in _iter_balanced_segments(raw, "[", "]"):
+        structured_blocks.append(segment)
+    for segment in _iter_balanced_segments(raw, "{", "}"):
+        structured_blocks.append(segment)
+
+    for block in structured_blocks:
+        text_block = block if isinstance(block, str) else str(block)
+        text_block = text_block.strip()
+        if not text_block:
+            continue
+        for loader in (json.loads, yaml.safe_load):
+            try:
+                parsed = loader(text_block)
+            except Exception:
+                continue
+            if parsed is None:
+                continue
+            for entry in _flatten_structured_payload(parsed, space):
+                checked = _validate_candidate(entry, space, require_complete=True)
+                if checked:
+                    _register(checked)
+                    if len(validated) >= limit:
+                        return validated
+            break
+
+    for kv_candidate in _scan_key_value_candidates(raw, space):
+        checked = _validate_candidate(kv_candidate, space, require_complete=True)
+        if checked:
+            _register(checked)
+            if len(validated) >= limit:
+                break
+
+    return validated
 
 
 def _coerce_numeric(value: object, *, to_int: bool = False) -> Optional[float]:
@@ -271,10 +409,14 @@ def _load_gemini_api_key(config: Dict[str, object]) -> Tuple[Optional[str], Opti
     return None, None
 
 
-def _validate_candidate(candidate: Dict[str, object], space: SpaceSpec) -> Optional[Dict[str, object]]:
+def _validate_candidate(
+    candidate: Dict[str, object], space: SpaceSpec, *, require_complete: bool = False
+) -> Optional[Dict[str, object]]:
     validated: Dict[str, object] = {}
+    missing: List[str] = []
     for name, spec in space.items():
         if name not in candidate:
+            missing.append(name)
             continue
         value = candidate[name]
         dtype = spec["type"]
@@ -330,6 +472,17 @@ def _validate_candidate(candidate: Dict[str, object], space: SpaceSpec) -> Optio
         else:
             # Unsupported type for LLM suggestions.
             return None
+    if require_complete and missing:
+        LOGGER.debug(
+            "Gemini 후보에서 YAML 파라미터가 누락되어 제외합니다: %s",
+            ", ".join(sorted(missing)),
+        )
+        return None
+    if missing:
+        LOGGER.debug(
+            "Gemini 후보에 YAML 파라미터 일부가 빠져 있습니다: %s",
+            ", ".join(sorted(missing)),
+        )
     return validated
 
 
@@ -657,20 +810,28 @@ def generate_llm_candidates(
                     if text:
                         insights.append(text)
 
-    if not isinstance(candidate_payload, list):
-        LOGGER.warning("Gemini 응답에서 후보 파라미터 배열을 찾지 못했습니다.")
-        return LLMSuggestions([], insights)
-
     accepted: List[Dict[str, object]] = []
-    for entry in candidate_payload:
-        if not isinstance(entry, dict):
-            continue
-        validated = _validate_candidate(entry, space)
-        if not validated:
-            continue
-        accepted.append(validated)
-        if len(accepted) >= count:
-            break
+    if isinstance(candidate_payload, list):
+        for entry in candidate_payload:
+            if not isinstance(entry, dict):
+                continue
+            validated = _validate_candidate(entry, space)
+            if not validated:
+                continue
+            accepted.append(validated)
+            if len(accepted) >= count:
+                break
+    else:
+        fallback_candidates = _extract_candidates_from_text(raw_text, space, count)
+        if fallback_candidates:
+            LOGGER.info(
+                "Gemini 자유 형식 응답에서 %d개 후보를 추출했습니다.",
+                len(fallback_candidates),
+            )
+            accepted.extend(fallback_candidates[:count])
+        else:
+            LOGGER.warning("Gemini 응답에서 후보 파라미터 배열을 찾지 못했습니다.")
+            return LLMSuggestions([], insights)
 
     if accepted:
         LOGGER.info("Gemini가 제안한 %d개의 후보를 큐에 추가합니다.", len(accepted))
